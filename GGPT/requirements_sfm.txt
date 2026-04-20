@@ -1,0 +1,15 @@
+Pillow 
+huggingface_hub
+einops
+safetensors
+opencv-python
+pycolmap==3.12.0
+git+https://github.com/cvg/LightGlue.git
+hydra-core
+h5py
+pyyaml
+scipy
+plyfile
+addict 
+timm 
+matplotlib
