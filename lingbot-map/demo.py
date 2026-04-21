@@ -19,7 +19,9 @@ Usage:
 """
 
 import argparse
+import contextlib
 import glob
+import json
 import os
 import time
 
@@ -222,6 +224,354 @@ def prepare_for_visualization(predictions, images=None):
 
 
 # =============================================================================
+# Offline export
+# =============================================================================
+
+def _to_numpy(value, dtype=None):
+    if isinstance(value, torch.Tensor):
+        value = value.detach().cpu().numpy()
+    else:
+        value = np.asarray(value)
+    if dtype is not None:
+        value = value.astype(dtype, copy=False)
+    return value
+
+
+def _to_4x4(transforms):
+    transforms = _to_numpy(transforms, dtype=np.float32)
+    if transforms.ndim == 2:
+        transforms = transforms[None]
+    if transforms.shape[-2:] == (4, 4):
+        return transforms
+    if transforms.shape[-2:] != (3, 4):
+        raise ValueError(f"Expected transforms with shape (..., 3, 4) or (..., 4, 4), got {transforms.shape}")
+
+    transforms_4x4 = np.zeros((*transforms.shape[:-2], 4, 4), dtype=np.float32)
+    transforms_4x4[..., :3, :4] = transforms
+    transforms_4x4[..., 3, 3] = 1.0
+    return transforms_4x4
+
+
+def save_preprocessed_images(images, output_dir):
+    images_np = _to_numpy(images, dtype=np.float32)
+    os.makedirs(output_dir, exist_ok=True)
+
+    image_paths = []
+    for i in range(images_np.shape[0]):
+        file_name = f"{i:06d}.png"
+        output_path = os.path.join(output_dir, file_name)
+        image_rgb = images_np[i].transpose(1, 2, 0)
+        image_u8 = np.clip(image_rgb * 255.0, 0, 255).astype(np.uint8)
+        cv2.imwrite(output_path, cv2.cvtColor(image_u8, cv2.COLOR_RGB2BGR))
+        image_paths.append(f"./images/{file_name}")
+    return image_paths
+
+
+def save_lingbot_transforms_json(output_path, c2w_opencv, intrinsics, image_paths, image_size):
+    """Save NeRF-style transforms.json using OpenGL c2w matrices.
+
+    The per-frame intrinsics are always written even when all Ks are equal,
+    because LingBot-MAP predicts intrinsics for each frame and later pipeline
+    stages need to inspect that variance explicitly.
+    """
+    c2w_opencv = _to_4x4(c2w_opencv)
+    intrinsics = _to_numpy(intrinsics, dtype=np.float32)
+    h, w = image_size
+
+    c2w_opengl = np.array(c2w_opencv, copy=True)
+    c2w_opengl[:, :3, 1:3] *= -1
+
+    frames = []
+    for i in range(c2w_opengl.shape[0]):
+        k = intrinsics[i]
+        frames.append(
+            {
+                "file_path": image_paths[i],
+                "transform_matrix": c2w_opengl[i].tolist(),
+                "w": int(w),
+                "h": int(h),
+                "fl_x": float(k[0, 0]),
+                "fl_y": float(k[1, 1]),
+                "cx": float(k[0, 2]),
+                "cy": float(k[1, 2]),
+                "intrinsic_matrix": k.tolist(),
+            }
+        )
+
+    data = {
+        "camera_model": "OpenGL",
+        "opencv_source": {
+            "c2w_path": "c2w.npy",
+            "w2c_path": "w2c.npy",
+            "intrinsics_path": "intrinsics.npy",
+        },
+        "frames": frames,
+    }
+
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=4)
+
+
+def write_dense_ply(output_path, world_points, images, conf=None, conf_percentile=1.5, downsample_factor=1):
+    world_points = _to_numpy(world_points, dtype=np.float32)
+    images_np = _to_numpy(images, dtype=np.float32)
+
+    if downsample_factor > 1:
+        world_points = world_points[:, ::downsample_factor, ::downsample_factor]
+        images_np = images_np[:, :, ::downsample_factor, ::downsample_factor]
+        if conf is not None:
+            conf = _to_numpy(conf, dtype=np.float32)[:, ::downsample_factor, ::downsample_factor]
+    elif conf is not None:
+        conf = _to_numpy(conf, dtype=np.float32)
+
+    points = world_points.reshape(-1, 3)
+    colors = np.transpose(images_np, (0, 2, 3, 1)).reshape(-1, 3)
+    colors = np.clip(colors * 255.0, 0, 255).astype(np.uint8)
+
+    valid = np.isfinite(points).all(axis=1)
+    conf_flat = None
+    frame_indices = None
+    if conf is not None:
+        conf_flat = conf.reshape(-1)
+        valid &= np.isfinite(conf_flat)
+        if conf_percentile is not None and conf_percentile > 0:
+            finite_conf = conf_flat[np.isfinite(conf_flat)]
+            if finite_conf.size > 0:
+                threshold = np.percentile(finite_conf, conf_percentile)
+                valid &= conf_flat >= threshold
+        valid &= conf_flat > 1e-5
+        frame_indices = np.repeat(
+            np.arange(world_points.shape[0], dtype=np.int32),
+            world_points.shape[1] * world_points.shape[2],
+        )
+
+    points = points[valid]
+    colors = colors[valid]
+    if conf_flat is not None:
+        conf_flat = conf_flat[valid].astype(np.float32, copy=False)
+        frame_indices = frame_indices[valid]
+
+    dtype = [
+        ("x", "<f4"),
+        ("y", "<f4"),
+        ("z", "<f4"),
+        ("red", "u1"),
+        ("green", "u1"),
+        ("blue", "u1"),
+    ]
+    if conf_flat is not None:
+        dtype.extend([("confidence", "<f4"), ("frame_index", "<i4")])
+
+    vertices = np.empty(points.shape[0], dtype=dtype)
+    vertices["x"] = points[:, 0]
+    vertices["y"] = points[:, 1]
+    vertices["z"] = points[:, 2]
+    vertices["red"] = colors[:, 0]
+    vertices["green"] = colors[:, 1]
+    vertices["blue"] = colors[:, 2]
+    if conf_flat is not None:
+        vertices["confidence"] = conf_flat
+        vertices["frame_index"] = frame_indices
+
+    header_lines = [
+        "ply",
+        "format binary_little_endian 1.0",
+        f"element vertex {vertices.shape[0]}",
+        "property float x",
+        "property float y",
+        "property float z",
+        "property uchar red",
+        "property uchar green",
+        "property uchar blue",
+    ]
+    if conf_flat is not None:
+        header_lines.extend(["property float confidence", "property int frame_index"])
+    header_lines.append("end_header")
+
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    with open(output_path, "wb") as f:
+        f.write(("\n".join(header_lines) + "\n").encode("ascii"))
+        vertices.tofile(f)
+
+    return int(vertices.shape[0])
+
+
+def compute_self_projection_report(world_points, w2c, intrinsics, max_samples=20000):
+    world_points = _to_numpy(world_points, dtype=np.float32)
+    w2c = _to_4x4(w2c)
+    intrinsics = _to_numpy(intrinsics, dtype=np.float32)
+
+    n, h, w = world_points.shape[:3]
+    total = n * h * w
+    sample_count = min(int(max_samples), total)
+    if sample_count <= 0:
+        return {"num_sampled": 0, "num_valid": 0}
+
+    rng = np.random.default_rng(0)
+    flat = rng.integers(0, total, size=sample_count)
+    frame_idx = flat // (h * w)
+    rem = flat % (h * w)
+    y = rem // w
+    x = rem % w
+
+    points = world_points[frame_idx, y, x]
+    valid = np.isfinite(points).all(axis=1)
+    if not np.any(valid):
+        return {"num_sampled": int(sample_count), "num_valid": 0}
+
+    frame_idx = frame_idx[valid]
+    x = x[valid].astype(np.float32, copy=False)
+    y = y[valid].astype(np.float32, copy=False)
+    points = points[valid]
+
+    points_h = np.concatenate([points, np.ones((points.shape[0], 1), dtype=np.float32)], axis=1)
+    cam_points = np.einsum("nij,nj->ni", w2c[frame_idx], points_h)[:, :3]
+    z = cam_points[:, 2]
+    valid_z = np.isfinite(z) & (z > 1e-6)
+    if not np.any(valid_z):
+        return {"num_sampled": int(sample_count), "num_valid": 0}
+
+    frame_idx = frame_idx[valid_z]
+    x = x[valid_z]
+    y = y[valid_z]
+    cam_points = cam_points[valid_z]
+    z = cam_points[:, 2]
+    k = intrinsics[frame_idx]
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        u = k[:, 0, 0] * (cam_points[:, 0] / z) + k[:, 0, 2]
+        v = k[:, 1, 1] * (cam_points[:, 1] / z) + k[:, 1, 2]
+
+    finite_uv = np.isfinite(u) & np.isfinite(v)
+    if not np.any(finite_uv):
+        return {"num_sampled": int(sample_count), "num_valid": 0}
+
+    u = u[finite_uv]
+    v = v[finite_uv]
+    x = x[finite_uv]
+    y = y[finite_uv]
+
+    err = np.sqrt((u - x) ** 2 + (v - y) ** 2)
+    err_half = np.sqrt((u - (x + 0.5)) ** 2 + (v - (y + 0.5)) ** 2)
+    return {
+        "num_sampled": int(sample_count),
+        "num_valid": int(err.shape[0]),
+        "mean_px": float(np.mean(err)),
+        "median_px": float(np.median(err)),
+        "p95_px": float(np.percentile(err, 95.0)),
+        "max_px": float(np.max(err)),
+        "median_px_with_half_pixel_shift": float(np.median(err_half)),
+    }
+
+
+def export_lingbot_outputs(args, predictions, images_cpu, source_paths):
+    output_dir = args.export_dir
+    if output_dir is None:
+        candidate_paths = [args.save_transforms, args.save_dense]
+        output_dir = next((os.path.dirname(p) for p in candidate_paths if p and os.path.dirname(p)), ".")
+
+    os.makedirs(output_dir, exist_ok=True)
+    images_dir = os.path.join(output_dir, "images")
+
+    c2w = _to_4x4(predictions["extrinsic"])
+    w2c = np.linalg.inv(c2w).astype(np.float32)
+    intrinsics = _to_numpy(predictions["intrinsic"], dtype=np.float32)
+    world_points = _to_numpy(predictions["world_points"], dtype=np.float32)
+    world_points_conf = predictions.get("world_points_conf")
+    if world_points_conf is not None:
+        world_points_conf = _to_numpy(world_points_conf, dtype=np.float32)
+
+    image_paths = save_preprocessed_images(images_cpu, images_dir)
+    h, w = images_cpu.shape[-2:]
+
+    np.save(os.path.join(output_dir, "intrinsics.npy"), intrinsics)
+    np.save(os.path.join(output_dir, "c2w.npy"), c2w.astype(np.float32, copy=False))
+    np.save(os.path.join(output_dir, "w2c.npy"), w2c)
+    np.save(os.path.join(output_dir, "world_points.npy"), world_points)
+    if world_points_conf is not None:
+        np.save(os.path.join(output_dir, "world_points_conf.npy"), world_points_conf)
+    if "depth" in predictions:
+        np.save(os.path.join(output_dir, "depth.npy"), _to_numpy(predictions["depth"], dtype=np.float32))
+
+    transforms_path = args.save_transforms or os.path.join(output_dir, "transforms.json")
+    save_lingbot_transforms_json(
+        output_path=transforms_path,
+        c2w_opencv=c2w,
+        intrinsics=intrinsics,
+        image_paths=image_paths,
+        image_size=(h, w),
+    )
+    transform_alias_path = None
+    if args.save_transforms is None:
+        transform_alias_path = os.path.join(output_dir, "transform.json")
+        save_lingbot_transforms_json(
+            output_path=transform_alias_path,
+            c2w_opencv=c2w,
+            intrinsics=intrinsics,
+            image_paths=image_paths,
+            image_size=(h, w),
+        )
+
+    dense_path = args.save_dense or os.path.join(output_dir, "dense.ply")
+    conf_percentile = args.export_conf_percentile
+    if conf_percentile is None:
+        conf_percentile = args.conf_threshold
+    num_dense_points = write_dense_ply(
+        output_path=dense_path,
+        world_points=world_points,
+        images=images_cpu,
+        conf=world_points_conf,
+        conf_percentile=conf_percentile,
+        downsample_factor=args.export_dense_downsample_factor,
+    )
+
+    eye_errors = np.linalg.norm(w2c @ c2w - np.eye(4, dtype=np.float32), axis=(-2, -1))
+    meta = {
+        "num_frames": int(c2w.shape[0]),
+        "image_size": {"height": int(h), "width": int(w)},
+        "source_images": [str(p) for p in source_paths],
+        "coordinate_convention": {
+            "intrinsics.npy": "OpenCV per-frame intrinsics in pixel coordinates",
+            "c2w.npy": "OpenCV camera-to-world, +x right, +y down, +z forward",
+            "w2c.npy": "OpenCV world-to-camera, inverse of c2w.npy",
+            "transforms.json": "OpenGL/Blender camera-to-world, generated by flipping OpenCV y/z axes",
+            "transform.json": "Alias of transforms.json when --save_transforms is not set",
+        },
+        "shapes": {
+            "intrinsics": list(intrinsics.shape),
+            "c2w": list(c2w.shape),
+            "w2c": list(w2c.shape),
+            "world_points": list(world_points.shape),
+            "world_points_conf": list(world_points_conf.shape) if world_points_conf is not None else None,
+        },
+        "dense_ply": {
+            "path": os.path.relpath(dense_path, output_dir),
+            "num_points": num_dense_points,
+            "confidence_percentile": float(conf_percentile) if conf_percentile is not None else None,
+            "downsample_factor": int(args.export_dense_downsample_factor),
+        },
+        "sanity": {
+            "max_w2c_c2w_identity_frobenius": float(np.max(eye_errors)),
+            "mean_w2c_c2w_identity_frobenius": float(np.mean(eye_errors)),
+            "self_projection": compute_self_projection_report(world_points, w2c, intrinsics),
+        },
+    }
+    with open(os.path.join(output_dir, "meta.json"), "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=4)
+
+    print("\n" + "=" * 60)
+    print(f"Exported LingBot outputs to: {output_dir}")
+    print(f"  images: {images_dir}")
+    print(f"  transforms: {transforms_path}")
+    if transform_alias_path is not None:
+        print(f"  transform alias: {transform_alias_path}")
+    print(f"  dense: {dense_path} ({num_dense_points} points)")
+    print(f"  max ||w2c @ c2w - I||_F: {meta['sanity']['max_w2c_c2w_identity_frobenius']:.3e}")
+    print("=" * 60 + "\n")
+
+
+# =============================================================================
 # Main
 # =============================================================================
 
@@ -276,10 +626,24 @@ def main():
                         help="Save sky mask visualizations (original | mask | overlay) to this directory")
     parser.add_argument("--export_preprocessed", type=str, default=None,
                         help="Export stride-sampled, resized/cropped images to this folder")
+    parser.add_argument("--export_dir", type=str, default=None,
+                        help="Optional directory to export LingBot poses, intrinsics, dense points, images, and metadata")
+    parser.add_argument("--save_transforms", type=str, default=None,
+                        help="Optional path to save transforms.json. Defaults to <export_dir>/transforms.json when exporting")
+    parser.add_argument("--save_dense", type=str, default=None,
+                        help="Optional path to save dense point cloud PLY. Defaults to <export_dir>/dense.ply when exporting")
+    parser.add_argument("--export_conf_percentile", type=float, default=None,
+                        help="Confidence percentile filtered out for dense.ply. Defaults to --conf_threshold")
+    parser.add_argument("--export_dense_downsample_factor", type=int, default=1,
+                        help="Spatial downsample factor for dense.ply only. NPY dense maps are always full resolution")
+    parser.add_argument("--skip_viewer", action="store_true",
+                        help="Skip the interactive viewer after inference/export")
 
     args = parser.parse_args()
     assert args.image_folder or args.video_path, \
         "Provide --image_folder or --video_path"
+    if args.export_dense_downsample_factor < 1:
+        raise ValueError("--export_dense_downsample_factor must be >= 1")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -321,11 +685,16 @@ def main():
         )
 
     # ── Inference ────────────────────────────────────────────────────────────
-    dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+    if device.type == "cuda":
+        dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+        autocast_context = torch.amp.autocast("cuda", dtype=dtype)
+    else:
+        dtype = torch.float32
+        autocast_context = contextlib.nullcontext()
     print(f"Running {args.mode} inference (dtype={dtype})...")
     t0 = time.time()
 
-    with torch.no_grad(), torch.amp.autocast("cuda", dtype=dtype):
+    with torch.no_grad(), autocast_context:
         if args.mode == "streaming":
             predictions = model.inference_streaming(
                 images,
@@ -344,6 +713,14 @@ def main():
 
     # ── Post-process ─────────────────────────────────────────────────────────
     predictions, images_cpu = postprocess(predictions, images)
+
+    # ── Offline export ───────────────────────────────────────────────────────
+    if args.export_dir or args.save_transforms or args.save_dense:
+        export_lingbot_outputs(args, predictions, images_cpu, paths)
+
+    if args.skip_viewer:
+        print("Skipping viewer (--skip_viewer).")
+        return
 
     # ── Visualize ────────────────────────────────────────────────────────────
     try:
