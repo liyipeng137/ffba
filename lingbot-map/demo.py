@@ -119,6 +119,7 @@ def load_model(args, device):
         kv_cache_cross_frame_special=True,
         kv_cache_include_scale_frames=True,
         use_sdpa=args.use_sdpa,
+        camera_num_iterations=args.camera_num_iterations,
     )
 
     if args.model_path:
@@ -171,7 +172,7 @@ def postprocess(predictions, images):
     extrinsic_4x4 = torch.zeros((*extrinsic.shape[:-2], 4, 4), device=extrinsic.device, dtype=extrinsic.dtype)
     extrinsic_4x4[..., :3, :4] = extrinsic
     extrinsic_4x4[..., 3, 3] = 1.0
-    extrinsic_4x4 = closed_form_inverse_se3_general(extrinsic_4x4)
+    extrinsic_4x4 = closed_form_inverse_se3_general(extrinsic_4x4) # inverse
     extrinsic = extrinsic_4x4[..., :3, :4]
 
     predictions["extrinsic"] = extrinsic
@@ -294,17 +295,11 @@ def save_lingbot_transforms_json(output_path, c2w_opencv, intrinsics, image_path
                 "fl_y": float(k[1, 1]),
                 "cx": float(k[0, 2]),
                 "cy": float(k[1, 2]),
-                "intrinsic_matrix": k.tolist(),
             }
         )
 
     data = {
         "camera_model": "OpenGL",
-        "opencv_source": {
-            "c2w_path": "c2w.npy",
-            "w2c_path": "w2c.npy",
-            "intrinsics_path": "intrinsics.npy",
-        },
         "frames": frames,
     }
 
@@ -474,8 +469,10 @@ def export_lingbot_outputs(args, predictions, images_cpu, source_paths):
     os.makedirs(output_dir, exist_ok=True)
     images_dir = os.path.join(output_dir, "images")
 
-    c2w = _to_4x4(predictions["extrinsic"])
-    w2c = np.linalg.inv(c2w).astype(np.float32)
+    # c2w = _to_4x4(predictions["extrinsic"])
+    w2c = _to_4x4(predictions["extrinsic"])
+    c2w = np.linalg.inv(w2c).astype(np.float32)
+    # w2c = np.linalg.inv(c2w).astype(np.float32)
     intrinsics = _to_numpy(predictions["intrinsic"], dtype=np.float32)
     world_points = _to_numpy(predictions["world_points"], dtype=np.float32)
     world_points_conf = predictions.get("world_points_conf")
@@ -502,16 +499,6 @@ def export_lingbot_outputs(args, predictions, images_cpu, source_paths):
         image_paths=image_paths,
         image_size=(h, w),
     )
-    transform_alias_path = None
-    if args.save_transforms is None:
-        transform_alias_path = os.path.join(output_dir, "transform.json")
-        save_lingbot_transforms_json(
-            output_path=transform_alias_path,
-            c2w_opencv=c2w,
-            intrinsics=intrinsics,
-            image_paths=image_paths,
-            image_size=(h, w),
-        )
 
     dense_path = args.save_dense or os.path.join(output_dir, "dense.ply")
     conf_percentile = args.export_conf_percentile
@@ -564,8 +551,6 @@ def export_lingbot_outputs(args, predictions, images_cpu, source_paths):
     print(f"Exported LingBot outputs to: {output_dir}")
     print(f"  images: {images_dir}")
     print(f"  transforms: {transforms_path}")
-    if transform_alias_path is not None:
-        print(f"  transform alias: {transform_alias_path}")
     print(f"  dense: {dense_path} ({num_dense_points} points)")
     print(f"  max ||w2c @ c2w - I||_F: {meta['sanity']['max_w2c_c2w_identity_frobenius']:.3e}")
     print("=" * 60 + "\n")
@@ -596,8 +581,8 @@ def main():
 
     # Streaming options
     parser.add_argument("--enable_3d_rope", action="store_true", default=True)
-    parser.add_argument("--max_frame_num", type=int, default=1024)
-    parser.add_argument("--num_scale_frames", type=int, default=8)
+    parser.add_argument("--max_frame_num", type=int, default=512)
+    parser.add_argument("--num_scale_frames", type=int, default=6)
     parser.add_argument(
         "--keyframe_interval",
         type=int,
@@ -605,9 +590,13 @@ def main():
         help="Streaming only. Every N-th frame after scale frames is kept as a keyframe. 1 = every frame.",
     )
     parser.add_argument("--kv_cache_sliding_window", type=int, default=16)
-    parser.add_argument("--kv_cache_scale_frames", type=int, default=8)
+    parser.add_argument("--kv_cache_scale_frames", type=int, default=6)
     parser.add_argument("--use_sdpa", action="store_true", default=False,
                         help="Use SDPA backend (no flashinfer needed). Default: FlashInfer")
+
+    parser.add_argument("--camera_num_iterations", type=int, default=6,
+                        help="Camera head iterative-refinement steps. Default 4; set 1 for faster inference "
+                             "(skips 3 refinement passes at a small accuracy cost).")
 
     # Windowed options
     parser.add_argument("--window_size", type=int, default=64, help="Frames per window (windowed mode)")
@@ -735,6 +724,7 @@ def main():
             image_folder=resolved_image_folder,
             sky_mask_dir=args.sky_mask_dir,
             sky_mask_visualization_dir=args.sky_mask_visualization_dir,
+            use_point_map=True
         )
         print(f"3D viewer at http://localhost:{args.port}")
         viewer.run()
