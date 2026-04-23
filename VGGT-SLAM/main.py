@@ -31,6 +31,7 @@ parser.add_argument("--max_loops", type=int, default=1, help="ONLY DEFAULT OF 1 
 parser.add_argument("--min_disparity", type=float, default=50, help="Minimum disparity to generate a new keyframe")
 parser.add_argument("--conf_threshold", type=float, default=25.0, help="Initial percentage of low-confidence points to filter out")
 parser.add_argument("--lc_thres", type=float, default=0.95, help="Threshold for image retrieval. Range: [0, 1.0]. Higher = more loop closures")
+parser.add_argument("--export_pcd", type=str, default=None, help="Path to export the final merged point cloud (.pcd or .ply). If not set, no export.")
 
 
 def main():
@@ -52,22 +53,22 @@ def main():
     print("Initializing and loading VGGT model...")
 
 
-    if args.run_os:
-        from sam3.model_builder import build_sam3_image_model
-        from sam3.model.sam3_image_processor import Sam3Processor
-        import core.vision_encoder.pe as pe
-        import core.vision_encoder.transforms as transforms
+    # if args.run_os:
+    #     from sam3.model_builder import build_sam3_image_model
+    #     from sam3.model.sam3_image_processor import Sam3Processor
+    #     import core.vision_encoder.pe as pe
+    #     import core.vision_encoder.transforms as transforms
 
-        sam3_model = build_sam3_image_model()
-        processor = Sam3Processor(sam3_model, confidence_threshold=0.50)
+    #     sam3_model = build_sam3_image_model()
+    #     processor = Sam3Processor(sam3_model, confidence_threshold=0.50)
 
-        clip_model = pe.CLIP.from_config("PE-Core-L14-336", pretrained=True)  # Downloads from HF
-        clip_model = clip_model.cuda()
-        clip_tokenizer = transforms.get_text_tokenizer(clip_model.context_length)
-        clip_preprocess = transforms.get_image_transform(clip_model.image_size)
-    else:
-        clip_model, clip_preprocess = None, None
-        clip_tokenizer = None
+    #     clip_model = pe.CLIP.from_config("PE-Core-L14-336", pretrained=True)  # Downloads from HF
+    #     clip_model = clip_model.cuda()
+    #     clip_tokenizer = transforms.get_text_tokenizer(clip_model.context_length)
+    #     clip_preprocess = transforms.get_image_transform(clip_model.image_size)
+    # else:
+    clip_model, clip_preprocess = None, None
+    clip_tokenizer = None
 
     model = VGGT()
     _URL = "https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt"
@@ -146,51 +147,51 @@ def main():
     print("Total number of loop closures in map", solver.graph.get_num_loops())
 
 
-    if args.run_os:
-        while True:
-            # Prompt user for text input
-            query = input("\nEnter text query or q to quit: ").strip()
-            if len(query) == 0:
-                print("Empty query. Exiting.")
-                return
+    # if args.run_os:
+    #     while True:
+    #         # Prompt user for text input
+    #         query = input("\nEnter text query or q to quit: ").strip()
+    #         if len(query) == 0:
+    #             print("Empty query. Exiting.")
+    #             return
             
-            if query == "q":
-                print("Exiting.")
-                return
+    #         if query == "q":
+    #             print("Exiting.")
+    #             return
             
-            start_time = time.time()
-            text_emb = utils.compute_text_embeddings(clip_model, clip_tokenizer, query)
-            overall_best_score, overall_best_submap_id, overall_best_frame_index = solver.map.retrieve_best_semantic_frame(text_emb)
+    #         start_time = time.time()
+    #         text_emb = utils.compute_text_embeddings(clip_model, clip_tokenizer, query)
+    #         overall_best_score, overall_best_submap_id, overall_best_frame_index = solver.map.retrieve_best_semantic_frame(text_emb)
 
-            found_submap = solver.map.get_submap(overall_best_submap_id)
+    #         found_submap = solver.map.get_submap(overall_best_submap_id)
 
-            # Display image
-            best_img = found_submap.get_frame_at_index(overall_best_frame_index)
-            print("Score:", overall_best_score)
-            with torch.no_grad():
-                # convert torch image to PIL
-                best_img = to_pil_image(best_img)
-                inference_state = processor.set_image(best_img)
-                output = processor.set_text_prompt(state=inference_state, prompt=query)
-                masks, boxes, scores = output["masks"], output["boxes"], output["scores"]
-                print(f"Found {masks.shape[0]} masks from SAM3 for the prompt '{query}'")
-                print("Scores:", scores.cpu().numpy())
+    #         # Display image
+    #         best_img = found_submap.get_frame_at_index(overall_best_frame_index)
+    #         print("Score:", overall_best_score)
+    #         with torch.no_grad():
+    #             # convert torch image to PIL
+    #             best_img = to_pil_image(best_img)
+    #             inference_state = processor.set_image(best_img)
+    #             output = processor.set_text_prompt(state=inference_state, prompt=query)
+    #             masks, boxes, scores = output["masks"], output["boxes"], output["scores"]
+    #             print(f"Found {masks.shape[0]} masks from SAM3 for the prompt '{query}'")
+    #             print("Scores:", scores.cpu().numpy())
 
-            print("Time taken for query:", time.time() - start_time)
+    #         print("Time taken for query:", time.time() - start_time)
 
-            masked_img = utils.overlay_masks(best_img, masks)
-            masked_img.show()
+    #         masked_img = utils.overlay_masks(best_img, masks)
+    #         masked_img.show()
 
-            for i in range(masks.shape[0]):
-                mask = masks[i].cpu().numpy()
-                obb_center, obb_extent, obb_rotation = utils.compute_obb_from_points(found_submap.get_points_in_mask(overall_best_frame_index, mask, solver.graph))
-                solver.viewer.visualize_obb(
-                    center=obb_center,
-                    extent=obb_extent,
-                    rotation=obb_rotation,
-                    color=(255, 0, 0),
-                    line_width=8.0,
-                )
+    #         for i in range(masks.shape[0]):
+    #             mask = masks[i].cpu().numpy()
+    #             obb_center, obb_extent, obb_rotation = utils.compute_obb_from_points(found_submap.get_points_in_mask(overall_best_frame_index, mask, solver.graph))
+    #             solver.viewer.visualize_obb(
+    #                 center=obb_center,
+    #                 extent=obb_extent,
+    #                 rotation=obb_rotation,
+    #                 color=(255, 0, 0),
+    #                 line_width=8.0,
+    #             )
 
     if not args.vis_map:
         # just show the map after all submaps have been processed
@@ -199,12 +200,14 @@ def main():
     if args.log_results:
         solver.map.write_poses_to_file(args.log_path, solver.graph, kitti_format=False)
 
-        # Log the full point cloud as one file, used for visualization.
-        # solver.map.write_points_to_file(solver.graph, args.log_path.replace(".txt", "_points.pcd"))
-
         if not args.skip_dense_log:
             # Log the dense point cloud for each submap.
             solver.map.save_framewise_pointclouds(solver.graph, args.log_path.replace(".txt", "_logs"))
+
+    if args.export_pcd is not None:
+        print(f"Exporting point cloud to {args.export_pcd} ...")
+        solver.map.write_points_to_file(solver.graph, args.export_pcd)
+        print("Point cloud exported.")
 
 
 if __name__ == "__main__":
