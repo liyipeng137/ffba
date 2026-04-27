@@ -97,13 +97,25 @@ def load_and_preprocess_images_square(image_path_list, target_size=1024):
     return images, original_coords
 
 
-def load_and_preprocess_images(image_path_list, fx=None, fy=None, cx=None, cy=None, mode="crop", image_size=512, patch_size=16):
+def load_and_preprocess_images(
+    image_path_list,
+    fx=None,
+    fy=None,
+    cx=None,
+    cy=None,
+    mode="crop",
+    image_size=512,
+    patch_size=16,
+    raw=False,
+):
     """
     A quick start function to load and preprocess images for model input.
     This assumes the images should have the same shape for easier batching, but our model can also work well with different shapes.
 
     Args:
         image_path_list (list): List of paths to image files
+        raw (bool): If True, only RGB + ToTensor [0,1]; no resize/crop/pad/patch align. All images
+            must share the same HxW. Intrinsics in pixel space use original image size.
         mode (str, optional): Preprocessing mode, either "crop" or "pad".
                              - "crop" (default): Sets width to 518px and center crops height if needed.
                              - "pad": Preserves all pixels by making the largest dimension 518px
@@ -140,12 +152,21 @@ def load_and_preprocess_images(image_path_list, fx=None, fy=None, cx=None, cy=No
     def _load_one(idx_path):
         i, image_path = idx_path
         img = Image.open(image_path)
-        if img.mode == "RGBA":
-            background = Image.new("RGBA", img.size, (255, 255, 255, 255))
-            img = Image.alpha_composite(background, img)
+        # if img.mode == "RGBA":
+        #     background = Image.new("RGBA", img.size, (255, 255, 255, 255))
+        #     img = Image.alpha_composite(background, img)
         img = img.convert("RGB")
 
         width, height = img.size
+
+        if raw:
+            t = to_tensor(img)
+            if fx is not None:
+                calib = (fx[i] * width, fy[i] * height, cx[i] * width, cy[i] * height)
+            else:
+                calib = (None, None, None, None)
+                print(f"Warning: No intrinsic calibration found for image {image_path}")
+            return i, t, calib
 
         fx_val = fy_val = cx_val = cy_val = None
         if fx is not None:
@@ -204,6 +225,11 @@ def load_and_preprocess_images(image_path_list, fx=None, fy=None, cx=None, cy=No
 
     images = results
     shapes = set((img.shape[1], img.shape[2]) for img in images)
+
+    if raw and len(shapes) > 1:
+        raise ValueError(
+            f"raw=True requires all images to have the same HxW; got {shapes}"
+        )
 
     # Check if we have different shapes
     # In theory our model can also work well with different shapes

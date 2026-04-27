@@ -91,6 +91,7 @@ def load_images(image_folder=None, video_path=None, fps=10, image_ext=".jpg,.png
         mode="crop",
         image_size=image_size,
         patch_size=patch_size,
+        raw=True,
     )
     h, w = images.shape[-2:]
     print(f"Preprocessed images to {w}x{h} using canonical crop mode")
@@ -253,13 +254,27 @@ def _to_4x4(transforms):
     return transforms_4x4
 
 
-def save_preprocessed_images(images, output_dir):
+def save_preprocessed_images(images, output_dir, source_paths=None):
     images_np = _to_numpy(images, dtype=np.float32)
     os.makedirs(output_dir, exist_ok=True)
 
+    output_names = None
+    if source_paths is not None:
+        output_names = [os.path.basename(path) for path in source_paths]
+        if len(output_names) != images_np.shape[0]:
+            raise ValueError(
+                "Number of source paths must match number of images. "
+                f"Got {len(output_names)} paths for {images_np.shape[0]} images."
+            )
+        if len(set(output_names)) != len(output_names):
+            raise ValueError(
+                "Source image basenames must be unique when exporting LingBot outputs. "
+                f"Got duplicates in: {output_names}"
+            )
+
     image_paths = []
     for i in range(images_np.shape[0]):
-        file_name = f"{i:06d}.png"
+        file_name = output_names[i] if output_names is not None else f"{i:06d}.png"
         output_path = os.path.join(output_dir, file_name)
         image_rgb = images_np[i].transpose(1, 2, 0)
         image_u8 = np.clip(image_rgb * 255.0, 0, 255).astype(np.uint8)
@@ -298,8 +313,13 @@ def save_lingbot_transforms_json(output_path, c2w_opencv, intrinsics, image_path
             }
         )
 
+    mean_k = np.mean(intrinsics, axis=0)
     data = {
         "camera_model": "OpenGL",
+        "fl_x": float(mean_k[0, 0]),
+        "fl_y": float(mean_k[1, 1]),
+        "cx": float(mean_k[0, 2]),
+        "cy": float(mean_k[1, 2]),
         "frames": frames,
     }
 
@@ -479,7 +499,7 @@ def export_lingbot_outputs(args, predictions, images_cpu, source_paths):
     if world_points_conf is not None:
         world_points_conf = _to_numpy(world_points_conf, dtype=np.float32)
 
-    image_paths = save_preprocessed_images(images_cpu, images_dir)
+    image_paths = save_preprocessed_images(images_cpu, images_dir, source_paths=source_paths)
     h, w = images_cpu.shape[-2:]
 
     np.save(os.path.join(output_dir, "intrinsics.npy"), intrinsics)

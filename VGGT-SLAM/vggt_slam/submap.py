@@ -209,6 +209,18 @@ class Submap:
 
         return points_all
 
+    def get_points_in_local_frame(self):
+        points_all = None
+        for index in range(len(self.pointclouds)):
+            points = self.pointclouds[index]
+            conf_mask = self.conf_masks[index] > self.conf_threshold
+            points = points[conf_mask]
+            if index == 0:
+                points_all = points
+            else:
+                points_all = np.vstack([points_all, points])
+        return points_all
+
     def get_voxel_points_in_world_frame(self, voxel_size, nb_points=8, factor_for_outlier_rejection=2.0):
         if self.voxelized_points is None:
             if voxel_size > 0.0:

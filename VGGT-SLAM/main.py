@@ -12,11 +12,13 @@ import matplotlib.pyplot as plt
 
 import vggt_slam.slam_utils as utils
 from vggt_slam.solver import Solver
+from vggt_slam.pi3_solver import Pi3Solver, load_pi3x_model
 from vggt_slam.submap import Submap
 
 from vggt.models.vggt import VGGT
 
 parser = argparse.ArgumentParser(description="VGGT-SLAM demo")
+parser.add_argument("--base_model", type=str, default="pi3x", choices=["vggt", "pi3x"], help="Base inference model to use")
 parser.add_argument("--image_folder", type=str, default="examples/kitchen/images/", help="Path to folder containing images")
 parser.add_argument("--vis_map", action="store_true", help="Visualize point cloud in viser as it is being build, otherwise only show the final map")
 parser.add_argument("--vis_voxel_size", type=float, default=None, help="Voxel size for downsampling the point cloud in the viewer (e.g. 0.05 for 5 cm). Default: no downsampling")
@@ -25,13 +27,23 @@ parser.add_argument("--vis_flow", action="store_true", help="Visualize optical f
 parser.add_argument("--log_results", action="store_true", help="save txt file with results")
 parser.add_argument("--skip_dense_log", action="store_true", help="by default, logging poses and logs dense point clouds. If this flag is set, dense logging is skipped")
 parser.add_argument("--log_path", type=str, default="poses.txt", help="Path to save the log file")
-parser.add_argument("--submap_size", type=int, default=16, help="Number of new frames per submap, does not include overlapping frames or loop closure frames")
-parser.add_argument("--overlapping_window_size", type=int, default=1, help="ONLY DEFAULT OF 1 SUPPORTED RIGHT NOW. Number of overlapping frames, which are used in SL(4) estimation")
+parser.add_argument("--submap_size", type=int, default=32, help="Number of new frames per submap, does not include overlapping frames or loop closure frames")
+parser.add_argument("--overlapping_window_size", type=int, default=3, help="ONLY DEFAULT OF 1 SUPPORTED RIGHT NOW. Number of overlapping frames, which are used in SL(4) estimation")
 parser.add_argument("--max_loops", type=int, default=1, help="ONLY DEFAULT OF 1 SUPPORTED RIGHT NOW or 0 to disable loop closures.")
 parser.add_argument("--min_disparity", type=float, default=50, help="Minimum disparity to generate a new keyframe")
 parser.add_argument("--conf_threshold", type=float, default=25.0, help="Initial percentage of low-confidence points to filter out")
 parser.add_argument("--lc_thres", type=float, default=0.95, help="Threshold for image retrieval. Range: [0, 1.0]. Higher = more loop closures")
 parser.add_argument("--export_pcd", type=str, default=None, help="Path to export the final merged point cloud (.pcd or .ply). If not set, no export.")
+parser.add_argument("--pi3_ckpt", type=str, default=None, help="Optional path to a Pi3X checkpoint. If not set, loads yyfz233/Pi3X")
+parser.add_argument("--lingbot_transforms_json", type=str, default=None, help="Optional LingBot transforms.json used as a coarse prior for Pi3 loop candidate detection")
+parser.add_argument("--loop_window_radius", type=int, default=2, help="Pi3 loop verification window radius around the candidate center frame")
+parser.add_argument("--min_loop_frame_gap", type=int, default=45, help="Minimum global frame index gap between current and historical frames to consider a loop candidate")
+parser.add_argument("--loop_translation_thresh", type=float, default=0.2, help="Maximum LingBot prior translation distance for loop candidate gating")
+parser.add_argument("--loop_rotation_thresh_deg", type=float, default=15.0, help="Maximum LingBot prior rotation difference in degrees for loop candidate gating")
+parser.add_argument("--fx", type=float, default=287.6131896972656, help="Shared Pi3X focal length fx in pixels for original images")
+parser.add_argument("--fy", type=float, default=422.9272766113281, help="Shared Pi3X focal length fy in pixels for original images")
+parser.add_argument("--cx", type=float, default=175.0, help="Shared Pi3X principal point cx in pixels for original images")
+parser.add_argument("--cy", type=float, default=238.0, help="Shared Pi3X principal point cy in pixels for original images")
 
 
 def main():
@@ -39,18 +51,45 @@ def main():
     Main function that wraps the entire pipeline of VGGT-SLAM.
     """
     args = parser.parse_args()
+    manual_intrinsics = [args.fx, args.fy, args.cx, args.cy]
+    has_partial_intrinsics = any(v is not None for v in manual_intrinsics) and not all(v is not None for v in manual_intrinsics)
+    if has_partial_intrinsics:
+        raise ValueError("If using manual intrinsics, provide all of --fx --fy --cx --cy.")
+    if args.base_model == "pi3x" and not all(v is not None for v in manual_intrinsics):
+        raise ValueError("Pi3X mode requires shared original-image intrinsics: --fx --fy --cx --cy.")
+    if args.min_loop_frame_gap is None:
+        args.min_loop_frame_gap = 2 * args.submap_size
+    if args.base_model == "pi3x" and args.max_loops > 0 and args.lingbot_transforms_json is None:
+        print("Pi3X loop closure requires --lingbot_transforms_json; forcing max_loops=0.")
+        args.max_loops = 0
 
     use_optical_flow_downsample = True
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
 
-    solver = Solver(
-        init_conf_threshold=args.conf_threshold,
-        lc_thres=args.lc_thres,
-        vis_voxel_size=args.vis_voxel_size
-    )
+    if args.base_model == "pi3x":
+        solver = Pi3Solver(
+            init_conf_threshold=args.conf_threshold,
+            fx=args.fx,
+            fy=args.fy,
+            cx=args.cx,
+            cy=args.cy,
+            lc_thres=args.lc_thres,
+            vis_voxel_size=args.vis_voxel_size,
+            lingbot_transforms_json=args.lingbot_transforms_json,
+            loop_window_radius=args.loop_window_radius,
+            min_loop_frame_gap=args.min_loop_frame_gap,
+            loop_translation_thresh=args.loop_translation_thresh,
+            loop_rotation_thresh_deg=args.loop_rotation_thresh_deg,
+        )
+    else:
+        solver = Solver(
+            init_conf_threshold=args.conf_threshold,
+            lc_thres=args.lc_thres,
+            vis_voxel_size=args.vis_voxel_size
+        )
 
-    print("Initializing and loading VGGT model...")
+    print(f"Initializing and loading {args.base_model} model...")
 
 
     # if args.run_os:
@@ -70,13 +109,16 @@ def main():
     clip_model, clip_preprocess = None, None
     clip_tokenizer = None
 
-    model = VGGT()
-    _URL = "https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt"
-    model.load_state_dict(torch.hub.load_state_dict_from_url(_URL))
+    if args.base_model == "pi3x":
+        model = load_pi3x_model(torch.device(device), args.pi3_ckpt)
+    else:
+        model = VGGT()
+        _URL = "https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt"
+        model.load_state_dict(torch.hub.load_state_dict_from_url(_URL))
 
-    model.eval()
-    model = model.to(torch.bfloat16)  # use half precision
-    model = model.to(device)
+        model.eval()
+        model = model.to(torch.bfloat16)  # use half precision
+        model = model.to(device)
 
     # Use the provided image folder path
     print(f"Loading images from {args.image_folder}...")
@@ -134,8 +176,9 @@ def main():
     average_fps = total_time / image_count
     print(image_count, "frames processed")
     print("Total time:", total_time)
-    print(f"Total time for VGGT calls: {solver.vggt_timer.total_time:.4f}s")
-    print("Average VGGT time per frame:", solver.vggt_timer.total_time / image_count)
+    model_label = "Pi3X" if args.base_model == "pi3x" else "VGGT"
+    print(f"Total time for {model_label} calls: {solver.vggt_timer.total_time:.4f}s")
+    print(f"Average {model_label} time per frame:", solver.vggt_timer.total_time / image_count)
     print("Average loop closure time per frame:", solver.loop_closure_timer.total_time / image_count)
     print("Average keyframe selection time per frame:", keyframe_time.total_time / image_count)
     print("Average backend time per frame:", backend_time.total_time / image_count)
@@ -146,52 +189,6 @@ def main():
     print("Total number of submaps in map", solver.map.get_num_submaps())
     print("Total number of loop closures in map", solver.graph.get_num_loops())
 
-
-    # if args.run_os:
-    #     while True:
-    #         # Prompt user for text input
-    #         query = input("\nEnter text query or q to quit: ").strip()
-    #         if len(query) == 0:
-    #             print("Empty query. Exiting.")
-    #             return
-            
-    #         if query == "q":
-    #             print("Exiting.")
-    #             return
-            
-    #         start_time = time.time()
-    #         text_emb = utils.compute_text_embeddings(clip_model, clip_tokenizer, query)
-    #         overall_best_score, overall_best_submap_id, overall_best_frame_index = solver.map.retrieve_best_semantic_frame(text_emb)
-
-    #         found_submap = solver.map.get_submap(overall_best_submap_id)
-
-    #         # Display image
-    #         best_img = found_submap.get_frame_at_index(overall_best_frame_index)
-    #         print("Score:", overall_best_score)
-    #         with torch.no_grad():
-    #             # convert torch image to PIL
-    #             best_img = to_pil_image(best_img)
-    #             inference_state = processor.set_image(best_img)
-    #             output = processor.set_text_prompt(state=inference_state, prompt=query)
-    #             masks, boxes, scores = output["masks"], output["boxes"], output["scores"]
-    #             print(f"Found {masks.shape[0]} masks from SAM3 for the prompt '{query}'")
-    #             print("Scores:", scores.cpu().numpy())
-
-    #         print("Time taken for query:", time.time() - start_time)
-
-    #         masked_img = utils.overlay_masks(best_img, masks)
-    #         masked_img.show()
-
-    #         for i in range(masks.shape[0]):
-    #             mask = masks[i].cpu().numpy()
-    #             obb_center, obb_extent, obb_rotation = utils.compute_obb_from_points(found_submap.get_points_in_mask(overall_best_frame_index, mask, solver.graph))
-    #             solver.viewer.visualize_obb(
-    #                 center=obb_center,
-    #                 extent=obb_extent,
-    #                 rotation=obb_rotation,
-    #                 color=(255, 0, 0),
-    #                 line_width=8.0,
-    #             )
 
     if not args.vis_map:
         # just show the map after all submaps have been processed
@@ -208,6 +205,27 @@ def main():
         print(f"Exporting point cloud to {args.export_pcd} ...")
         solver.map.write_points_to_file(solver.graph, args.export_pcd)
         print("Point cloud exported.")
+
+    export_submap_local_dir = "./local_dir"
+    if export_submap_local_dir is not None:
+        print(f"Exporting per-submap local point clouds to {export_submap_local_dir} ...")
+        exported_files = solver.map.write_submaps_to_dir(
+            solver.graph,
+            export_submap_local_dir,
+            coordinate_mode="local",
+        )
+        print(f"Exported {len(exported_files)} local submap point clouds.")
+
+    export_submap_world_dir = "./world_dir"
+    if export_submap_world_dir is not None:
+        print(f"Exporting per-submap world point clouds to {export_submap_world_dir} ...")
+        exported_files = solver.map.write_submaps_to_dir(
+            solver.graph,
+            export_submap_world_dir,
+            coordinate_mode="world",
+        )
+        print(f"Exported {len(exported_files)} world submap point clouds.")
+
 
 
 if __name__ == "__main__":

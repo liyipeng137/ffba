@@ -18,8 +18,10 @@ class PoseGraph:
         self.values = Values()
         inner_noise = 0.05*np.ones(15, dtype=float)
         intra_noise = 0.05*np.ones(15, dtype=float)
+        loop_noise = 0.10*np.ones(15, dtype=float)
         self.inner_submap_noise = noiseModel.Diagonal.Sigmas(inner_noise)
         self.intra_submap_noise = noiseModel.Diagonal.Sigmas(intra_noise)
+        self.loop_noise = noiseModel.Diagonal.Sigmas(loop_noise)
         self.anchor_noise = noiseModel.Diagonal.Sigmas([1e-6] * 15)
         self.initialized_nodes = set()
         self.num_loop_closures = 0 # Just used for debugging and analysis
@@ -74,7 +76,7 @@ class PoseGraph:
         """
         homography = self.get_homography(node_id)
         projection_matrix = np.linalg.inv(homography)
-        return projection_matri
+        return projection_matrix
 
     
     def optimize(self, verbose=False):

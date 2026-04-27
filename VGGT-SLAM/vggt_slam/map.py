@@ -190,3 +190,34 @@ class GraphMap:
         pcd_all = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(pcd_all))
         pcd_all.colors = o3d.utility.Vector3dVector(colors_all)
         o3d.io.write_point_cloud(file_name, pcd_all)
+
+    def write_submaps_to_dir(self, graph, output_dir, coordinate_mode="world"):
+        os.makedirs(output_dir, exist_ok=True)
+        exported_files = []
+
+        for submap in self.ordered_submaps_by_key():
+            if submap.get_lc_status():
+                continue
+
+            if coordinate_mode == "world":
+                pcd = submap.get_points_in_world_frame(graph)
+            elif coordinate_mode == "local":
+                pcd = submap.get_points_in_local_frame()
+            else:
+                raise ValueError(f"Unknown coordinate_mode '{coordinate_mode}'. Expected 'world' or 'local'.")
+
+            colors = submap.get_points_colors()
+            if pcd is None or len(pcd) == 0:
+                continue
+
+            if colors.max() > 1.0:
+                colors = colors / 255.0
+
+            pcd_o3d = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(pcd.reshape(-1, 3)))
+            pcd_o3d.colors = o3d.utility.Vector3dVector(colors.reshape(-1, 3))
+
+            file_name = os.path.join(output_dir, f"submap_{int(submap.get_id()):06d}_{coordinate_mode}.ply")
+            o3d.io.write_point_cloud(file_name, pcd_o3d)
+            exported_files.append(file_name)
+
+        return exported_files
