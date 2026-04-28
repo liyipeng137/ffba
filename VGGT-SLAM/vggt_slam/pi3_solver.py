@@ -635,17 +635,6 @@ class Pi3Solver(Solver):
                 overlap_count=overlap_count,
             )
 
-            # H_prior_from_current_submap = np.eye(4, dtype=np.float32)
-
-            # print(
-            #     colored("Pi3 overlap alignment disabled", "yellow"),
-            #     {
-            #         "overlap_count": overlap_count,
-            #         "prior_overlap_start": prior_overlap_start,
-            #     },
-            # )
-
-
             prior_anchor_index = prior_overlap_start
             prior_anchor_node_id = submap_id_prev + prior_anchor_index
             prior_anchor_homography = self.graph.get_homography(prior_anchor_node_id)
