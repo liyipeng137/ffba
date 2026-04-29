@@ -9,10 +9,16 @@ Provides streaming inference functionality:
 """
 
 import logging
+import os
 import torch
 import torch.nn as nn
 from typing import Optional, Dict, Any, List
 from tqdm.auto import tqdm
+
+# Debug switch: export LINGBOT_DEBUG_KV=1 to print per-frame KV cache stats in
+# windowed phase-2 loop.  Value can be 1 (every frame), or an integer N to print
+# every N frames.
+_KV_DEBUG = os.environ.get("LINGBOT_DEBUG_KV", "")
 
 from lingbot_map.utils.rotation import quat_to_mat, mat_to_quat
 
@@ -23,6 +29,63 @@ from lingbot_map.utils.pose_enc import pose_encoding_to_extri_intri
 from lingbot_map.utils.geometry import closed_form_inverse_se3
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_kv_debug_interval(val: str) -> int:
+    """Parse LINGBOT_DEBUG_KV env var into a print-every-N interval.
+
+    Accepts: "" (disabled) | "0" (disabled) | "1" (every frame)
+             | "N" (every N frames) | any other truthy string → every frame.
+    """
+    if not val:
+        return 0
+    try:
+        n = int(val)
+    except ValueError:
+        return 1
+    return max(0, n)
+
+
+@torch.no_grad()
+def _log_kv_stats(model, label: str = "") -> None:
+    """Dump a one-line summary of the aggregator's KV cache occupancy.
+
+    Prints FlashInfer manager stats (if present) and SDPA dict stats otherwise,
+    plus aggregator ``total_frames_processed``.  Camera head frame_idx is also
+    reported — it is unused when 3D RoPE is disabled but helps catch mismatches.
+    """
+    try:
+        parts = []
+        agg = getattr(model, "aggregator", None)
+        if agg is not None:
+            tfp = getattr(agg, "total_frames_processed", None)
+            if tfp is not None:
+                parts.append(f"tfp={tfp}")
+
+            mgr = getattr(agg, "kv_cache_manager", None)
+            if mgr is not None and hasattr(mgr, "get_cache_stats"):
+                s = mgr.get_cache_stats(block_idx=0)
+                parts.append(
+                    f"FI[blk0] frames={s['frame_count']} "
+                    f"scale_pg={s['scale_pages']} live_pg={s['live_pages']} "
+                    f"free_pg={s['free_pages']} special={s['special_tokens']}"
+                )
+            elif isinstance(getattr(agg, "kv_cache", None), dict):
+                kv = agg.kv_cache
+                k0 = kv.get("k_0")
+                if torch.is_tensor(k0):
+                    parts.append(f"SDPA[blk0] k_shape={tuple(k0.shape)}")
+                parts.append(f"skip_append={kv.get('_skip_append', False)}")
+
+        cam = getattr(model, "camera_head", None)
+        if cam is not None:
+            fi = getattr(cam, "frame_idx", None)
+            if fi is not None:
+                parts.append(f"cam.frame_idx={fi}")
+
+        tqdm.write(f"[KV] {label} | {' | '.join(parts)}")
+    except Exception as e:  # pragma: no cover — debug helper, never fatal
+        tqdm.write(f"[KV] {label} | stats error: {e}")
 
 
 @torch.no_grad()
@@ -507,10 +570,6 @@ class GCTStream(GCTBase):
             images = images.unsqueeze(0)
         B, S, C, H, W = images.shape
 
-        # Slice-then-move per iteration so `images` may live on CPU and we
-        # keep peak GPU memory at one frame.
-        _model_device = next(self.parameters()).device
-
         # Determine number of scale frames
         scale_frames = num_scale_frames if num_scale_frames is not None else self.num_frame_for_scale
         scale_frames = min(scale_frames, S)  # Cap to available frames
@@ -523,6 +582,10 @@ class GCTStream(GCTBase):
 
         # Clean KV caches before starting new sequence
         self.clean_kv_cache()
+
+        # Slice-then-move per iteration so `images` may live on CPU and we
+        # don't blow up GPU memory on tens-of-thousands-of-frame sequences.
+        _model_device = next(self.parameters()).device
 
         # Phase 1: Process scale frames together
         # These frames get bidirectional attention among themselves via scale token
@@ -810,12 +873,12 @@ class GCTStream(GCTBase):
             curr_depth_idx = torch.tensor([0], device=device, dtype=torch.long)
 
         # Decompose C2W: center ([:3]) + quaternion ([3:7])
-        Ra = quat_to_mat(pe_prev[:, idx_a, 3:7])   # (B, 3, 3)
-        ca = pe_prev[:, idx_a, :3]                  # (B, 3)
+        Ra = quat_to_mat(pe_prev[:, idx_a, 3:7])
+        ca = pe_prev[:, idx_a, :3]
         Rb = quat_to_mat(pe_curr[:, idx_b, 3:7])
         cb = pe_curr[:, idx_b, :3]
 
-        R_ab = torch.bmm(Ra, Rb.transpose(1, 2))    # Ra = R_ab @ Rb
+        R_ab = torch.bmm(Ra, Rb.transpose(1, 2))
 
         # Scale from depth — aggregate across all paired keyframes in overlap.
         s_ab = unit_s.clone()
@@ -996,8 +1059,7 @@ class GCTStream(GCTBase):
                 so the overlap region always spans at least that many keyframe
                 intervals and is large enough to host the next window's scale
                 phase.  Use this when ``keyframe_interval > 1`` to guarantee
-                the pairwise alignment has at least one paired keyframe and
-                that the depth-ratio scale is computed across keyframe pairs.
+                the pairwise alignment has at least one paired keyframe.
             num_scale_frames: Number of frames used as scale reference within
                 each window.  Defaults to ``self.num_frame_for_scale``.
             scale_mode: Scale estimation strategy for alignment.
@@ -1025,7 +1087,7 @@ class GCTStream(GCTBase):
         _model_device = next(self.parameters()).device
 
         ws = (num_scale_frames if num_scale_frames is not None
-              else self.num_frame_for_scale)
+            else self.num_frame_for_scale)
         ws = min(ws, S)
 
         # Resolve overlap in *actual frames*.  Priority:
@@ -1208,7 +1270,7 @@ class GCTStream(GCTBase):
             for start, end in tqdm(windows, desc='Windowed inference'):
                 # Slice on whichever device `images` lives on, then move just
                 # this window to the model device.  Keeps peak memory at one
-                # window instead of the full sequence.
+                # window (O(actual_window_frames)) instead of full sequence.
                 window_images = images[:, start:end].to(
                     _model_device, non_blocking=True
                 )
@@ -1232,6 +1294,10 @@ class GCTStream(GCTBase):
                 del scale_out
 
                 # ---------- Phase 2: stream remaining frames ----------
+                dbg_every = _parse_kv_debug_interval(_KV_DEBUG)
+                if dbg_every:
+                    _log_kv_stats(self, label=f"w{start}-{end} after phase-1 scale")
+
                 for i in range(window_scale, window_len):
                     is_keyframe = (
                         kf_int <= 1
@@ -1255,7 +1321,16 @@ class GCTStream(GCTBase):
                     w_lists['frame_type'].append(1 if is_keyframe else 2)
                     del frame_out
 
+                    if dbg_every and ((i - window_scale) % dbg_every == 0):
+                        _log_kv_stats(
+                            self,
+                            label=f"w{start}-{end} i={i} (global={start + i}) "
+                                f"{'KF' if is_keyframe else 'nkf'}",
+                        )
+
                 all_window_predictions.append(_make_window_pred(w_lists))
+                if dbg_every:
+                    _log_kv_stats(self, label=f"w{start}-{end} END")
 
         # Store for merge helpers
         self._last_window_size = eff_overlap  # not used directly, but kept for compat
