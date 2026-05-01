@@ -39,6 +39,16 @@ class NerfStudioDataset:
         if not frames:
             raise ValueError(f"No frames found in {self.transform_path}")
 
+        # get global intrinsics
+        global_fx = float(meta.get("fl_x", None))
+        global_fy = float(meta.get("fl_y", None))
+        global_cx = float(meta.get("cx", None))
+        global_cy = float(meta.get("cy", None))
+        has_global_intrinsics = False
+        if all(x is not None for x in [global_fx, global_fy, global_cx, global_cy]):
+            has_global_intrinsics = True
+            print(f"Using global intrinsics: fx={global_fx}, fy={global_fy}, cx={global_cx}, cy={global_cy}")
+
         cameras = []
         for frame in frames:
             image_rel = frame.get("file_path")
@@ -52,10 +62,18 @@ class NerfStudioDataset:
             image_height, image_width = image.shape[:2]
             width = int(_frame_value(frame, meta, "w", image_width))
             height = int(_frame_value(frame, meta, "h", image_height))
-            fx = float(_frame_value(frame, meta, "fl_x"))
-            fy = float(frame.get("fl_y", meta.get("fl_y", fx)))
-            cx = float(frame.get("cx", meta.get("cx", width / 2)))
-            cy = float(frame.get("cy", meta.get("cy", height / 2)))
+
+            if has_global_intrinsics:
+                fx = global_fx
+                fy = global_fy
+                cx = global_cx
+                cy = global_cy
+            else:
+                print(f"Using frame-specific intrinsics: fx={fx}, fy={fy}, cx={cx}, cy={cy}")
+                fx = float(_frame_value(frame, "fl_x"))
+                fy = float(_frame_value(frame, "fl_y"))
+                cx = float(_frame_value(frame, "cx"))
+                cy = float(_frame_value(frame, "cy"))
 
             c2w = np.array(frame["transform_matrix"], dtype=np.float64)
             c2w[:, 1:3] *= -1
