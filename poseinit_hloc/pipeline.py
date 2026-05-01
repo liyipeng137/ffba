@@ -154,8 +154,10 @@ def run_hloc(workspace_dir: Path, overlap: int = 5) -> None:
 
     write_pairs_from_poses(model_dir, sfm_pairs, overlap=overlap)
 
-    feature_conf = extract_features.confs["superpoint_aachen"]
-    matcher_conf = match_features.confs["superpoint+lightglue"]
+    # feature_conf = extract_features.confs["superpoint_aachen"]
+    # matcher_conf = match_features.confs["superpoint+lightglue"]
+    feature_conf = extract_features.confs["loma_aachen"]
+    matcher_conf = match_features.confs["loma"]
     features = extract_features.main(
         feature_conf,
         images_dir,
