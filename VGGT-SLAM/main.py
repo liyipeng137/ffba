@@ -239,27 +239,6 @@ def main():
         )
         print("Per-frame dense points exported.")
 
-    # export_submap_local_dir = "./local_dir"
-    # if export_submap_local_dir is not None:
-    #     print(f"Exporting per-submap local point clouds to {export_submap_local_dir} ...")
-    #     exported_files = solver.map.write_submaps_to_dir(
-    #         solver.graph,
-    #         export_submap_local_dir,
-    #         coordinate_mode="local",
-    #     )
-    #     print(f"Exported {len(exported_files)} local submap point clouds.")
-
-    # export_submap_world_dir = "./world_dir"
-    # if export_submap_world_dir is not None:
-    #     print(f"Exporting per-submap world point clouds to {export_submap_world_dir} ...")
-    #     exported_files = solver.map.write_submaps_to_dir(
-    #         solver.graph,
-    #         export_submap_world_dir,
-    #         coordinate_mode="world",
-    #     )
-    #     print(f"Exported {len(exported_files)} world submap point clouds.")
-
-
 
 if __name__ == "__main__":
     main()
