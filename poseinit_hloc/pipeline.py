@@ -57,8 +57,16 @@ def cache_dataset(dataset: NerfStudioDataset, workspace_dir: Path) -> None:
     dimensions = []
 
     print("Collecting dataset for HLOC pose initialization...")
-    for image_id, camera in enumerate(tqdm(dataset, desc="Collecting data")):
-        image_name = str(image_id).zfill(8)
+    seen_image_names = set()
+    for camera in tqdm(dataset, desc="Collecting data"):
+        image_name = Path(camera.image_name).name
+        if image_name in seen_image_names:
+            raise ValueError(
+                "Duplicate image basename detected while caching poseinit_hloc dataset: "
+                f"{image_name}. Use unique basenames before running this pipeline."
+            )
+        seen_image_names.add(image_name)
+
         image_np = camera.image.numpy() * 255
         images_data.append((image_name, image_np))
         pose_dict[image_name] = camera.extrinsics.inverse().numpy()
@@ -69,7 +77,7 @@ def cache_dataset(dataset: NerfStudioDataset, workspace_dir: Path) -> None:
 
     print("Saving cached images...")
     for image_name, image_np in tqdm(images_data, desc="Saving images"):
-        Image.fromarray(np.uint8(image_np)).save(images_dir / f"{image_name}.jpg", quality=95)
+        Image.fromarray(np.uint8(image_np)).save(images_dir / image_name, quality=95)
 
     create_cameras_and_points_bin(workspace_dir, _average_intrinsics(intrinsics, dimensions))
     create_images_from_pose_dict(workspace_dir, pose_dict)

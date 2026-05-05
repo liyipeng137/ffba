@@ -34,17 +34,30 @@ parser.add_argument("--min_disparity", type=float, default=50, help="Minimum dis
 parser.add_argument("--conf_threshold", type=float, default=25.0, help="Initial percentage of low-confidence points to filter out")
 parser.add_argument("--lc_thres", type=float, default=0.95, help="Threshold for image retrieval. Range: [0, 1.0]. Higher = more loop closures")
 parser.add_argument("--export_pcd", type=str, default=None, help="Path to export the final merged point cloud (.pcd or .ply). If not set, no export.")
+parser.add_argument("--export_transforms_json", type=str, default=None, help="Path to export LingBot-compatible transforms.json from optimized graph poses.")
+parser.add_argument(
+    "--export_transforms_path_mode",
+    type=str,
+    default="basename",
+    choices=["basename", "absolute"],
+    help="How image file_path is written in exported transforms.json.",
+)
+parser.add_argument("--export_dense_frames_dir", type=str, default=None, help="Directory to export graph-optimized dense points per unique image frame.")
+parser.add_argument(
+    "--export_dense_include_overlap_duplicates",
+    action="store_true",
+    help="Export duplicated overlap-frame dense nodes as separate .npz files. transforms.json still keeps unique images.",
+)
 parser.add_argument("--pi3_ckpt", type=str, default=None, help="Optional path to a Pi3X checkpoint. If not set, loads yyfz233/Pi3X")
 parser.add_argument("--lingbot_transforms_json", type=str, default=None, help="Optional LingBot transforms.json used as a coarse prior for Pi3 loop candidate detection")
 parser.add_argument("--loop_window_radius", type=int, default=2, help="Pi3 loop verification window radius around the candidate center frame")
 parser.add_argument("--min_loop_frame_gap", type=int, default=45, help="Minimum global frame index gap between current and historical frames to consider a loop candidate")
 parser.add_argument("--loop_translation_thresh", type=float, default=0.2, help="Maximum LingBot prior translation distance for loop candidate gating")
 parser.add_argument("--loop_rotation_thresh_deg", type=float, default=15.0, help="Maximum LingBot prior rotation difference in degrees for loop candidate gating")
-parser.add_argument("--fx", type=float, default=287.6131896972656, help="Shared Pi3X focal length fx in pixels for original images")
-parser.add_argument("--fy", type=float, default=422.9272766113281, help="Shared Pi3X focal length fy in pixels for original images")
+parser.add_argument("--fx", type=float, default=290.5493469238281, help="Shared Pi3X focal length fx in pixels for original images")
+parser.add_argument("--fy", type=float, default=429.0402526855469, help="Shared Pi3X focal length fy in pixels for original images")
 parser.add_argument("--cx", type=float, default=175.0, help="Shared Pi3X principal point cx in pixels for original images")
 parser.add_argument("--cy", type=float, default=238.0, help="Shared Pi3X principal point cy in pixels for original images")
-
 
 def main():
     """
@@ -206,25 +219,45 @@ def main():
         solver.map.write_points_to_file(solver.graph, args.export_pcd)
         print("Point cloud exported.")
 
-    export_submap_local_dir = "./local_dir"
-    if export_submap_local_dir is not None:
-        print(f"Exporting per-submap local point clouds to {export_submap_local_dir} ...")
-        exported_files = solver.map.write_submaps_to_dir(
-            solver.graph,
-            export_submap_local_dir,
-            coordinate_mode="local",
-        )
-        print(f"Exported {len(exported_files)} local submap point clouds.")
 
-    export_submap_world_dir = "./world_dir"
-    if export_submap_world_dir is not None:
-        print(f"Exporting per-submap world point clouds to {export_submap_world_dir} ...")
-        exported_files = solver.map.write_submaps_to_dir(
+    if args.export_transforms_json is not None:
+        print(f"Exporting LingBot-compatible transforms.json to {args.export_transforms_json} ...")
+        solver.map.write_lingbot_transforms_json(
+            args.export_transforms_json,
             solver.graph,
-            export_submap_world_dir,
-            coordinate_mode="world",
+            path_mode=args.export_transforms_path_mode,
+            unique_images=True,
         )
-        print(f"Exported {len(exported_files)} world submap point clouds.")
+        print("transforms.json exported.")
+
+    if args.export_dense_frames_dir is not None:
+        print(f"Exporting per-frame dense points to {args.export_dense_frames_dir} ...")
+        solver.map.save_framewise_dense_points(
+            solver.graph,
+            args.export_dense_frames_dir,
+            unique_images=not args.export_dense_include_overlap_duplicates,
+        )
+        print("Per-frame dense points exported.")
+
+    # export_submap_local_dir = "./local_dir"
+    # if export_submap_local_dir is not None:
+    #     print(f"Exporting per-submap local point clouds to {export_submap_local_dir} ...")
+    #     exported_files = solver.map.write_submaps_to_dir(
+    #         solver.graph,
+    #         export_submap_local_dir,
+    #         coordinate_mode="local",
+    #     )
+    #     print(f"Exported {len(exported_files)} local submap point clouds.")
+
+    # export_submap_world_dir = "./world_dir"
+    # if export_submap_world_dir is not None:
+    #     print(f"Exporting per-submap world point clouds to {export_submap_world_dir} ...")
+    #     exported_files = solver.map.write_submaps_to_dir(
+    #         solver.graph,
+    #         export_submap_world_dir,
+    #         coordinate_mode="world",
+    #     )
+    #     print(f"Exported {len(exported_files)} world submap point clouds.")
 
 
 

@@ -1,4 +1,6 @@
 import os
+import json
+from pathlib import Path
 import numpy as np
 import torch
 import open3d as o3d
@@ -160,6 +162,141 @@ class GraphMap:
                         quaternion = R.from_matrix(rotation_matrix).as_quat() # x, y, z, w
                         output = np.array([float(frame_id), x, y, z, *quaternion])
                     f.write(" ".join(f"{v:.8f}" for v in output) + "\n")
+
+    def _iter_frame_exports(self, graph, unique_images=True):
+        seen_image_names = set()
+
+        for submap in self.ordered_submaps_by_key():
+            if submap.get_lc_status():
+                continue
+
+            c2w_opencv = submap.get_all_poses_world(graph, give_camera_mat=False)
+            pointclouds, frame_ids, conf_masks = submap.get_points_list_in_world_frame(graph)
+
+            for frame_index, (pointcloud, frame_id, conf_mask) in enumerate(
+                zip(pointclouds, frame_ids, conf_masks)
+            ):
+                image_path = submap.img_names[frame_index] if frame_index < len(submap.img_names) else str(frame_id)
+                image_name = Path(image_path).name
+                if unique_images and image_name in seen_image_names:
+                    continue
+                seen_image_names.add(image_name)
+
+                intrinsic = submap.proj_mats[frame_index][:3, :3]
+                height, width = pointcloud.shape[:2]
+                colors = submap.colors[frame_index] if submap.colors is not None else None
+
+                yield {
+                    "node_id": int(submap.get_id() + frame_index),
+                    "submap_id": int(submap.get_id()),
+                    "frame_index": int(frame_index),
+                    "frame_id": float(frame_id),
+                    "image_path": str(image_path),
+                    "image_name": image_name,
+                    "c2w_opencv": c2w_opencv[frame_index],
+                    "intrinsic": intrinsic,
+                    "height": int(height),
+                    "width": int(width),
+                    "pointcloud": pointcloud,
+                    "mask": conf_mask,
+                    "colors": colors,
+                }
+
+    def write_lingbot_transforms_json(
+        self,
+        file_name,
+        graph,
+        path_mode="basename",
+        unique_images=True,
+    ):
+        records = list(self._iter_frame_exports(graph, unique_images=unique_images))
+        if not records:
+            raise ValueError("No frames available to export transforms.json")
+        if path_mode not in ("basename", "absolute"):
+            raise ValueError("path_mode must be 'basename' or 'absolute'")
+
+        intrinsics = np.stack([record["intrinsic"] for record in records], axis=0)
+        mean_k = intrinsics.mean(axis=0)
+
+        frames = []
+        for record in records:
+            c2w_opengl = np.array(record["c2w_opencv"], copy=True)
+            c2w_opengl[:3, 1:3] *= -1.0
+            intrinsic = record["intrinsic"]
+            file_path = record["image_name"] if path_mode == "basename" else str(Path(record["image_path"]).resolve())
+            frames.append(
+                {
+                    "file_path": file_path,
+                    "transform_matrix": c2w_opengl.tolist(),
+                    "w": record["width"],
+                    "h": record["height"],
+                    "fl_x": float(intrinsic[0, 0]),
+                    "fl_y": float(intrinsic[1, 1]),
+                    "cx": float(intrinsic[0, 2]),
+                    "cy": float(intrinsic[1, 2]),
+                    "image_name": record["image_name"],
+                    "source_image_path": str(record["image_path"]),
+                    "node_id": record["node_id"],
+                    "submap_id": record["submap_id"],
+                    "frame_index": record["frame_index"],
+                    "frame_id": record["frame_id"],
+                }
+            )
+
+        data = {
+            "camera_model": "OpenGL",
+            "fl_x": float(mean_k[0, 0]),
+            "fl_y": float(mean_k[1, 1]),
+            "cx": float(mean_k[0, 2]),
+            "cy": float(mean_k[1, 2]),
+            "frames": frames,
+        }
+
+        os.makedirs(os.path.dirname(file_name) or ".", exist_ok=True)
+        with open(file_name, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=4)
+
+    def save_framewise_dense_points(self, graph, output_dir, unique_images=True):
+        os.makedirs(output_dir, exist_ok=True)
+        metadata = []
+
+        for export_index, record in enumerate(self._iter_frame_exports(graph, unique_images=unique_images)):
+            stem = Path(record["image_name"]).stem
+            dense_file = f"{export_index:06d}_{stem}.npz"
+            dense_path = os.path.join(output_dir, dense_file)
+
+            save_data = {
+                "pointcloud": record["pointcloud"].astype(np.float32),
+                "mask": record["mask"],
+                "c2w_opencv": record["c2w_opencv"].astype(np.float32),
+                "intrinsic": record["intrinsic"].astype(np.float32),
+                "node_id": np.array(record["node_id"], dtype=np.int64),
+                "submap_id": np.array(record["submap_id"], dtype=np.int64),
+                "frame_index": np.array(record["frame_index"], dtype=np.int64),
+                "frame_id": np.array(record["frame_id"], dtype=np.float64),
+                "image_name": np.array(record["image_name"]),
+                "image_path": np.array(record["image_path"]),
+            }
+            if record["colors"] is not None:
+                save_data["colors"] = record["colors"]
+            np.savez_compressed(dense_path, **save_data)
+
+            metadata.append(
+                {
+                    "dense_file": dense_file,
+                    "image_name": record["image_name"],
+                    "image_path": record["image_path"],
+                    "node_id": record["node_id"],
+                    "submap_id": record["submap_id"],
+                    "frame_index": record["frame_index"],
+                    "frame_id": record["frame_id"],
+                    "width": record["width"],
+                    "height": record["height"],
+                }
+            )
+
+        with open(os.path.join(output_dir, "metadata.json"), "w", encoding="utf-8") as f:
+            json.dump({"frames": metadata}, f, indent=4)
 
     def save_framewise_pointclouds(self, graph, file_name):
         os.makedirs(file_name, exist_ok=True)

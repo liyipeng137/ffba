@@ -189,18 +189,17 @@ def create_cameras_and_points_bin(target: str | Path, intrinsics: dict) -> None:
 
 def create_images_from_pose_dict(ws_dir: str | Path, pose_dict: dict[str, np.ndarray]) -> None:
     images = {}
-    for image_name, camera_to_world in pose_dict.items():
+    for image_id, (image_name, camera_to_world) in enumerate(pose_dict.items(), start=1):
         world_to_camera = np.linalg.inv(camera_to_world)
         r = world_to_camera[:3, :3]
         tvec = world_to_camera[:3, 3]
         qvec = rotmat2qvec(r)
-        image_id = int(image_name)
         images[image_id] = Image(
             id=image_id,
             qvec=qvec,
             tvec=tvec,
             camera_id=1,
-            name=f"{image_name}.jpg",
+            name=Path(image_name).name,
             xys=[],
             point3D_ids=[],
         )

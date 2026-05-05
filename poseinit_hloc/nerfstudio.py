@@ -39,14 +39,10 @@ class NerfStudioDataset:
         if not frames:
             raise ValueError(f"No frames found in {self.transform_path}")
 
-        # get global intrinsics
-        global_fx = float(meta.get("fl_x", None))
-        global_fy = float(meta.get("fl_y", None))
-        global_cx = float(meta.get("cx", None))
-        global_cy = float(meta.get("cy", None))
-        has_global_intrinsics = False
-        if all(x is not None for x in [global_fx, global_fy, global_cx, global_cy]):
-            has_global_intrinsics = True
+        global_values = [meta.get("fl_x"), meta.get("fl_y"), meta.get("cx"), meta.get("cy")]
+        has_global_intrinsics = all(x is not None for x in global_values)
+        if has_global_intrinsics:
+            global_fx, global_fy, global_cx, global_cy = [float(x) for x in global_values]
             print(f"Using global intrinsics: fx={global_fx}, fy={global_fy}, cx={global_cx}, cy={global_cy}")
 
         cameras = []
@@ -54,7 +50,9 @@ class NerfStudioDataset:
             image_rel = frame.get("file_path")
             if not image_rel:
                 raise ValueError("Every frame must contain file_path")
-            image_path = self.source_path / image_rel
+            image_path = Path(image_rel)
+            if not image_path.is_absolute():
+                image_path = self.source_path / image_path
             if not image_path.exists():
                 raise FileNotFoundError(f"Missing frame image: {image_path}")
 
@@ -69,11 +67,11 @@ class NerfStudioDataset:
                 cx = global_cx
                 cy = global_cy
             else:
+                fx = float(_frame_value(frame, meta, "fl_x"))
+                fy = float(_frame_value(frame, meta, "fl_y"))
+                cx = float(_frame_value(frame, meta, "cx"))
+                cy = float(_frame_value(frame, meta, "cy"))
                 print(f"Using frame-specific intrinsics: fx={fx}, fy={fy}, cx={cx}, cy={cy}")
-                fx = float(_frame_value(frame, "fl_x"))
-                fy = float(_frame_value(frame, "fl_y"))
-                cx = float(_frame_value(frame, "cx"))
-                cy = float(_frame_value(frame, "cy"))
 
             c2w = np.array(frame["transform_matrix"], dtype=np.float64)
             c2w[:, 1:3] *= -1
@@ -91,9 +89,9 @@ class NerfStudioDataset:
                     image_height=height,
                     principal_point_ndc=np.array([cx / width, cy / height], dtype=np.float64),
                     image_path=image_path,
-                    image_name=str(image_rel),
+                    image_name=image_path.name,
                     image=image,
                 )
             )
 
-        return sorted(cameras, key=lambda camera: camera.image_name)
+        return cameras
