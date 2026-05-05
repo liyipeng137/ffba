@@ -4,12 +4,82 @@ from time import perf_counter
 
 import pypose as pp
 import torch
+import torch.nn as nn
+from pypose.autograd.function import psjac
 
-from ba_helpers import Reproj, least_square_error
 from bae.optim import LM
-from bae.sparse.py_ops import *
 from bae.utils.pysolvers import PCG
 from datapipes.colmap_loader import read_colmap_data, save_colmap_cameras, save_colmap_result
+
+
+@psjac
+def project_colmap(points, camera_params, intrinsics):
+    """Project COLMAP world points with shared PINHOLE intrinsics."""
+    points_proj = pp.SE3(camera_params[..., :7]).Act(points)
+    points_proj = points_proj[..., :2] / points_proj[..., 2].unsqueeze(-1)
+
+    fx = intrinsics[..., 0].unsqueeze(-1)
+    fy = intrinsics[..., 1].unsqueeze(-1)
+    cx = intrinsics[..., 2].unsqueeze(-1)
+    cy = intrinsics[..., 3].unsqueeze(-1)
+    u = fx * points_proj[..., 0].unsqueeze(-1) + cx
+    v = fy * points_proj[..., 1].unsqueeze(-1) + cy
+    return torch.cat([u, v], dim=-1)
+
+
+class ColmapResidual(nn.Module):
+    def __init__(self, camera_params, points_3d, intrinsics, optimize_intrinsics=True):
+        super().__init__()
+        if intrinsics is None:
+            raise ValueError("intrinsics must be provided for COLMAP mode")
+        if intrinsics.dim() == 1:
+            intrinsics = intrinsics.unsqueeze(0)
+        if intrinsics.shape[-1] != 4:
+            raise ValueError("intrinsics must have shape [4] or [1, 4]")
+
+        self.pose = pp.Parameter(camera_params, sjac=True)
+        self.points_3d = pp.Parameter(points_3d, sjac=True)
+        self.pose.trim_SE3_grad = True
+
+        if optimize_intrinsics:
+            self.shared_intr = pp.Parameter(intrinsics, sjac=True)
+        else:
+            self.register_buffer("shared_intr", intrinsics)
+
+    def forward(self, points_2d, camera_indices=None, point_indices=None):
+        if isinstance(points_2d, dict):
+            input_dict = points_2d
+            points_2d = input_dict["points_2d"]
+            camera_indices = input_dict["camera_indices"]
+            point_indices = input_dict["point_indices"]
+
+        zero_indices = torch.zeros_like(camera_indices)
+        intrinsics_batched = self.shared_intr[zero_indices]
+        points_proj = project_colmap(
+            self.points_3d[point_indices],
+            self.pose[camera_indices],
+            intrinsics_batched,
+        )
+        return points_proj - points_2d
+
+
+def least_square_error(
+    camera_params,
+    points_3d,
+    camera_indices,
+    point_indices,
+    points_2d,
+    intrinsics,
+    optimize_intrinsics=True,
+):
+    model = ColmapResidual(
+        camera_params,
+        points_3d,
+        intrinsics=intrinsics,
+        optimize_intrinsics=optimize_intrinsics,
+    )
+    loss = model(points_2d, camera_indices, point_indices)
+    return torch.sum(loss**2, dim=-1).mean()
 
 
 def parse_args():
@@ -70,10 +140,9 @@ def main():
         "point_indices": trimmed_dataset["point_index_of_observations"],
     }
 
-    model = Reproj(
+    model = ColmapResidual(
         trimmed_dataset["camera_params"].clone(),
         trimmed_dataset["points_3d"].clone(),
-        load_colmap=True,
         intrinsics=trimmed_dataset.get("intrinsics", None),
         optimize_intrinsics=args.optimize_intrinsics,
     ).to(args.device)
@@ -88,7 +157,6 @@ def main():
         trimmed_dataset["camera_index_of_observations"],
         trimmed_dataset["point_index_of_observations"],
         trimmed_dataset["points_2d"],
-        load_colmap=True,
         intrinsics=trimmed_dataset.get("intrinsics", None),
         optimize_intrinsics=args.optimize_intrinsics,
     ).item()
@@ -109,7 +177,6 @@ def main():
         trimmed_dataset["camera_index_of_observations"],
         trimmed_dataset["point_index_of_observations"],
         trimmed_dataset["points_2d"],
-        load_colmap=True,
         intrinsics=trimmed_dataset.get("intrinsics", None),
         optimize_intrinsics=args.optimize_intrinsics,
     ).item()

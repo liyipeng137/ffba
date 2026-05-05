@@ -14,10 +14,6 @@ def rotate_euler(points, rot_vecs):
     sin_theta = torch.sin(theta)
     return cos_theta * points + sin_theta * torch.cross(v, points, dim=-1) + dot * (1 - cos_theta) * v
 
-def rotate_quat(points, rot_vecs):
-    rot_vecs = pp.SE3(rot_vecs)
-    return rot_vecs.Act(points)
-
 # inverse quat
 def openGL2gtsam(pose):
     R = pose.rotation()

@@ -1,14 +1,111 @@
 import torch
 import numpy as np
 import pypose as pp
+from functools import wraps
 
-WHITELISTED_MAPS = (torch._C.TensorBase.__add__, 
-                    torch._C.TensorBase.__sub__, 
-                    torch._C.TensorBase.__mul__, 
-                    torch._C.TensorBase.__div__,
-                    torch._C.TensorBase.add,
-                    torch._C.TensorBase.sub,
-                    torch._C.TensorBase.mul,)
+WHITELISTED_MAPS = tuple(
+    func for func in (
+        torch._C.TensorBase.__add__,
+        torch._C.TensorBase.__sub__,
+        torch._C.TensorBase.__mul__,
+        getattr(torch._C.TensorBase, "__div__", None),
+        torch._C.TensorBase.add,
+        torch._C.TensorBase.sub,
+        torch._C.TensorBase.mul,
+    ) if func is not None
+)
+
+_LTYPE_PRESERVING_FUNCS = {
+    torch._C.TensorBase.__getitem__,
+    torch.cat,
+    *WHITELISTED_MAPS,
+    torch._C.TensorBase.clone,
+    torch._C.TensorBase.to,
+}
+
+
+def _iter_tracked_tensors(values):
+    if isinstance(values, torch.Tensor):
+        yield values
+    elif isinstance(values, dict):
+        for value in values.values():
+            yield from _iter_tracked_tensors(value)
+    elif isinstance(values, (tuple, list)):
+        for value in values:
+            yield from _iter_tracked_tensors(value)
+
+
+def _attach_index_trace(result, index, tensor):
+    if not hasattr(result, 'optrace'):
+        result.optrace = {}
+    result.optrace[id(result)] = ("index", index, tensor)
+    return result
+
+
+def _attach_cat_trace(result, tensors, dim):
+    tracked = []
+    offset = 0
+    for t in tensors:
+        n = t.shape[0]
+        if hasattr(t, 'optrace') or isinstance(t, torch.nn.Parameter):
+            tracked.append((offset, offset + n, t))
+        offset += n
+    result.optrace = {id(result): ("cat", dim, tuple(tracked))}
+    return result
+
+
+def _attach_map_trace(result, func, args):
+    result.optrace = {id(result): ("map", func, args)}
+    return result
+
+
+def _find_tracking_source(values, cls):
+    for value in _iter_tracked_tensors(values):
+        if isinstance(value, cls):
+            return value
+    return None
+
+
+def _unwrap_tracking_tensor(value):
+    if not isinstance(value, TrackingTensor):
+        return value
+    if isinstance(value, pp.LieTensor):
+        unwrapped = torch.Tensor.as_subclass(value, pp.LieTensor)
+        unwrapped.ltype = value.ltype
+        return unwrapped
+    return torch.Tensor.as_subclass(value, torch.Tensor)
+
+
+def _unwrap_tracking_tensors(values):
+    if isinstance(values, TrackingTensor):
+        return _unwrap_tracking_tensor(values)
+    if isinstance(values, dict):
+        return {key: _unwrap_tracking_tensors(value) for key, value in values.items()}
+    if isinstance(values, tuple):
+        return tuple(_unwrap_tracking_tensors(value) for value in values)
+    if isinstance(values, list):
+        return [_unwrap_tracking_tensors(value) for value in values]
+    return values
+
+
+def _rewrap_tracking_tensor(result, tracking_source):
+    if tracking_source is None or not isinstance(result, torch.Tensor) or isinstance(result, TrackingTensor):
+        return result
+    return TrackingTensor(result)
+
+
+def _retain_ltype(result, tracking_source, cls, func):
+    if tracking_source is None or not issubclass(cls, pp.LieTensor):
+        return result
+    if func not in _LTYPE_PRESERVING_FUNCS:
+        return result
+    if not isinstance(result, torch.Tensor) or isinstance(result, cls):
+        return result
+    if result.shape[-1:] != tracking_source.ltype.dimension:
+        return result
+    wrapped = torch.Tensor.as_subclass(result, cls)
+    wrapped.ltype = tracking_source.ltype
+    return wrapped
 
 # =============================================================================
 # Class: IndexTrackingTensor
@@ -18,32 +115,36 @@ WHITELISTED_MAPS = (torch._C.TensorBase.__add__,
 class TrackingTensor(torch.Tensor):
     @staticmethod
     def __new__(cls, data, *args, **kwargs):
+        if cls is TrackingTensor and isinstance(data, pp.LieTensor):
+            return _TrackingLieTensor(data, *args, **kwargs)
+
         if isinstance(data, torch.Tensor):
-            instance = torch.Tensor._make_subclass(cls, data, *args, **kwargs)
-        else:
-            instance = torch.Tensor._make_subclass(cls, torch.as_tensor(data), *args, **kwargs)
-        return instance
+            return torch.Tensor._make_subclass(cls, data, *args, **kwargs)
+        return torch.Tensor._make_subclass(cls, torch.as_tensor(data), *args, **kwargs)
 
 
     @classmethod
     def __torch_function__(cls, func, types, args=(), kwargs=None):
+        if kwargs is None:
+            kwargs = {}
         result = super(TrackingTensor, cls).__torch_function__(func, types, args=args, kwargs=kwargs)
-        
-        if isinstance(result, torch.Tensor) and getattr(args[0], '_active', True):
-            # print(f"__torch_function__ called with {func}")
-            if (func == torch._C.TensorBase.__getitem__) and isinstance(args[1], torch.Tensor):
-                if not hasattr(result, 'optrace'):
-                    result.optrace = {}
-                index_edge = ("index", args[1], args[0])
-                result.optrace[id(result)] = index_edge
-            elif func in WHITELISTED_MAPS:
-                merged_optrace = {}
-                for arg in args:
-                    if isinstance(arg, torch.Tensor) and hasattr(arg, 'optrace'):
-                        merged_optrace.update(arg.optrace)
+        trace_inputs = (args, kwargs)
+        tracking_source = _find_tracking_source(trace_inputs, cls)
+        result = _retain_ltype(result, tracking_source, cls, func)
 
-                merged_optrace[id(result)] = ("map", func, args)
-                result.optrace = merged_optrace
+        if isinstance(result, torch.Tensor):
+            if (func == torch._C.TensorBase.__getitem__) and isinstance(args[1], torch.Tensor):
+                result = _attach_index_trace(result, args[1], args[0])
+            elif func == torch.cat:
+                tensors = args[0]
+                dim = kwargs.get("dim", 0)
+                if len(args) > 1:
+                    dim = args[1]
+                if dim != 0:
+                    raise NotImplementedError("TrackingTensor only supports torch.cat(..., dim=0)")
+                result = _attach_cat_trace(result, tensors, dim)
+            elif func in WHITELISTED_MAPS:
+                result = _attach_map_trace(result, func, args)
         return result
     
     def __getitem__(self, index):
@@ -56,11 +157,6 @@ class TrackingTensor(torch.Tensor):
         #     else:
         #         index = (self._convert_to_index_tensor(index[0]), *index[1:])
         result = super().__getitem__(index)
-        # if getattr(self, '_active', True):
-        #     print(f"__getitem__ called with index {index}")
-        #     if isinstance(index, torch.Tensor):
-        #         index_edge = ("index", index, self)
-        #         result.optrace[id(result)] = index_edge
         return result
 
     def _convert_to_index_tensor(self, index):
@@ -75,9 +171,33 @@ class TrackingTensor(torch.Tensor):
             return torch.tensor(index)
         elif isinstance(index, np.ndarray):
             return torch.from_numpy(index)
+
+    def __format__(self, format_spec):
+        if self.numel() == 1:
+            return format(self.item(), format_spec)
+        return format(str(self), format_spec)
         
     def tensor(self) -> torch.Tensor:
         return torch.Tensor.as_subclass(self, torch.Tensor)
+
+
+class _TrackingLieTensor(TrackingTensor, pp.LieTensor):
+    def __init__(self, data=None, *args, **kwargs):
+        if isinstance(data, pp.LieTensor):
+            self.ltype = data.ltype
+
+    @staticmethod
+    def __new__(cls, data, *args, **kwargs):
+        if not isinstance(data, pp.LieTensor):
+            raise TypeError(f"_TrackingLieTensor expects a LieTensor input, got {type(data)!r}")
+        instance = torch.Tensor.as_subclass(data, cls)
+        instance.ltype = data.ltype
+        return instance
+
+    def detach(self):
+        detached = torch.Tensor.as_subclass(super().detach(), type(self))
+        detached.ltype = self.ltype
+        return detached
 """
 graph design
 Node: (tensor_type: [nn.Parameter, tensor, pp.LieTensor])
@@ -85,7 +205,7 @@ Edge: (indexing, mapping)
 
 G: (V: [Node...], E: [Edge...])
 
-for each e = (u, v) \in E
+for each e = (u, v) in E
 parent[loss] = (project, [camera_indexed, point_indexed])
 parent[camera_indexed] = ((indexing, indices), camera_parameters)
 
@@ -110,32 +230,24 @@ recusively call 1-3 until input node is reached.
 # =============================================================================
 def index_transform(tensor, index):
     result = tensor[index]
-    if not hasattr(result, 'optrace'):
-        result.optrace = {}
-    # index edge (edge_type, indicies, orig_arg)
-    index_edge = ("index", index, tensor)
-    result.optrace[id(result)] = index_edge
-    return result
+    return _attach_index_trace(result, index, tensor)
 
 
 # =============================================================================
 # Decorator: map_transform
 # A decorator that wraps a function to apply a map transformation.
-# It unsqueezes tensor arguments, calls the function, then squeezes the result.
-# Additionally, it merges metadata from all input tensors.
+# It runs the function on unwrapped tensors so inner operations stay opaque,
+# then reattaches a single map edge to the result.
 # =============================================================================
 def map_transform(func):
+    @wraps(func)
     def wrapper(*args, **kwargs):
-        result = func(*args, **kwargs)
+        tracking_source = _find_tracking_source((args, kwargs), TrackingTensor)
+        result = func(*_unwrap_tracking_tensors(args), **_unwrap_tracking_tensors(kwargs))
         # map edge (edge_type, func, [input_args])
         # ensure final result is an IndexTrackingTensor
-        merged_optrace = {}
-        for arg in args:
-            if isinstance(arg, torch.Tensor) and hasattr(arg, 'optrace'):
-                merged_optrace.update(arg.optrace)
-
-        merged_optrace[id(result)] = ("map", func, args)
-        result.optrace = merged_optrace
+        result = _rewrap_tracking_tensor(result, tracking_source)
+        result = _attach_map_trace(result, func, args)
         return result
     return wrapper
 
