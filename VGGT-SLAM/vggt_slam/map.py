@@ -145,6 +145,8 @@ class GraphMap:
                 if submap.get_lc_status():
                     continue
                 frame_ids = submap.get_frame_ids()
+                if getattr(submap, "global_frame_ids", None) is not None:
+                    frame_ids = submap.get_global_frame_ids()
                 print(frame_ids)
                 for frame_index, frame_id in enumerate(frame_ids):
                     pose = all_poses[count]
@@ -172,6 +174,8 @@ class GraphMap:
 
             c2w_opencv = submap.get_all_poses_world(graph, give_camera_mat=False)
             pointclouds, frame_ids, conf_masks = submap.get_points_list_in_world_frame(graph)
+            if getattr(submap, "global_frame_ids", None) is not None:
+                frame_ids = submap.get_global_frame_ids()
 
             for frame_index, (pointcloud, frame_id, conf_mask) in enumerate(
                 zip(pointclouds, frame_ids, conf_masks)

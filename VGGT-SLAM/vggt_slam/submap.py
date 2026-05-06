@@ -23,6 +23,10 @@ class Submap:
         self.voxelized_points = None
         self.last_non_loop_frame_index = None
         self.frame_ids = None
+        self.global_frame_ids = None
+        self.anchor_keyframe_ids = []
+        self.target_keyframe_ids = []
+        self.non_keyframe_ids = []
         self.is_lc_submap = False
         self.img_names = []
         self.semantic_vectors = []
@@ -145,8 +149,20 @@ class Submap:
             if match:
                 frame_ids.append(float(match.group()))
             else:
-                raise ValueError(f"No number found in image name: {filename}")
+                frame_ids.append(float(len(frame_ids)))
         self.frame_ids = frame_ids
+
+    def set_global_frame_ids(self, global_frame_ids):
+        self.global_frame_ids = [int(frame_id) for frame_id in global_frame_ids]
+
+    def set_batch_metadata(self, metadata):
+        if metadata is None:
+            return
+        if "frame_ids" in metadata:
+            self.set_global_frame_ids(metadata["frame_ids"])
+        self.anchor_keyframe_ids = [int(i) for i in metadata.get("anchor_keyframes", [])]
+        self.target_keyframe_ids = [int(i) for i in metadata.get("target_keyframes", [])]
+        self.non_keyframe_ids = [int(i) for i in metadata.get("non_keyframes", [])]
 
     def set_last_non_loop_frame_index(self, last_non_loop_frame_index):
         self.last_non_loop_frame_index = last_non_loop_frame_index
@@ -166,6 +182,21 @@ class Submap:
     def get_frame_ids(self):
         # Note this does not include any of the loop closure frames
         return self.frame_ids
+
+    def get_global_frame_ids(self):
+        if self.global_frame_ids is not None:
+            return self.global_frame_ids
+        return [int(frame_id) for frame_id in self.frame_ids]
+
+    def get_local_index_for_global_frame_id(self, global_frame_id):
+        global_frame_id = int(global_frame_id)
+        for local_index, candidate_id in enumerate(self.get_global_frame_ids()):
+            if int(candidate_id) == global_frame_id:
+                return local_index
+        return None
+
+    def get_shared_global_frame_ids(self, other_submap):
+        return sorted(set(self.get_global_frame_ids()).intersection(other_submap.get_global_frame_ids()))
 
     def filter_data_by_confidence(self, data):
         init_conf_mask = self.conf > self.conf_threshold

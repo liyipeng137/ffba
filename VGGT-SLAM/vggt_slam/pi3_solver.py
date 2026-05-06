@@ -180,6 +180,7 @@ class Pi3Solver(Solver):
         min_loop_frame_gap: int = 32,
         loop_translation_thresh: float = 1.0,
         loop_rotation_thresh_deg: float = 30.0,
+        min_shared_anchors: int = 2,
     ):
         super().__init__(
             init_conf_threshold=init_conf_threshold,
@@ -198,6 +199,7 @@ class Pi3Solver(Solver):
         self.min_loop_frame_gap = int(min_loop_frame_gap)
         self.loop_translation_thresh = float(loop_translation_thresh)
         self.loop_rotation_thresh_deg = float(loop_rotation_thresh_deg)
+        self.min_shared_anchors = int(min_shared_anchors)
         self.lingbot_pose_db = self._load_lingbot_prior_poses(lingbot_transforms_json)
 
     def _load_original_images(self, image_names):
@@ -519,23 +521,80 @@ class Pi3Solver(Solver):
         )
         return overlap_count
 
-    def _estimate_submap_alignment(self, current_submap, prior_submap, overlap_count):
+    def _prefix_overlap_pairs(self, current_submap, prior_submap, overlap_count):
+        prior_last_index = prior_submap.get_last_non_loop_frame_index()
+        prior_overlap_start = prior_last_index - overlap_count + 1
+        return [
+            {
+                "current_index": offset,
+                "prior_index": prior_overlap_start + offset,
+                "global_frame_id": int(current_submap.get_global_frame_ids()[offset]),
+                "source": "prefix_suffix_overlap",
+            }
+            for offset in range(overlap_count)
+        ]
+
+    def _shared_anchor_pairs(self, current_submap, prior_submap):
+        shared_global_ids = current_submap.get_shared_global_frame_ids(prior_submap)
+        pairs = []
+        for global_frame_id in shared_global_ids:
+            current_index = current_submap.get_local_index_for_global_frame_id(global_frame_id)
+            prior_index = prior_submap.get_local_index_for_global_frame_id(global_frame_id)
+            if current_index is None or prior_index is None:
+                continue
+            pairs.append(
+                {
+                    "current_index": int(current_index),
+                    "prior_index": int(prior_index),
+                    "global_frame_id": int(global_frame_id),
+                    "source": "shared_anchor",
+                }
+            )
+        return pairs
+
+    def _find_alignment_prior_submap(self, current_submap, fallback_submap_id):
+        if fallback_submap_id is None:
+            return None, []
+
+        best_submap = None
+        best_pairs = []
+        for candidate in self.map.ordered_submaps_by_key():
+            if candidate.get_lc_status():
+                continue
+            if candidate.get_id() == current_submap.get_id():
+                continue
+            pairs = self._shared_anchor_pairs(current_submap, candidate)
+            if len(pairs) > len(best_pairs):
+                best_submap = candidate
+                best_pairs = pairs
+
+        if best_submap is not None and len(best_pairs) >= self.min_shared_anchors:
+            print(
+                "Pi3 shared-anchor prior selected:",
+                {
+                    "prior_submap_id": int(best_submap.get_id()),
+                    "shared_count": int(len(best_pairs)),
+                    "shared_global_frame_ids": [pair["global_frame_id"] for pair in best_pairs],
+                },
+            )
+            return best_submap, best_pairs
+
+        return self.map.get_submap(fallback_submap_id), []
+
+    def _estimate_submap_alignment(self, current_submap, prior_submap, alignment_pairs):
         current_w2c = current_submap.get_all_poses()
         prior_w2c = prior_submap.get_all_poses()
         current_c2w = np.linalg.inv(current_w2c)
         prior_c2w = np.linalg.inv(prior_w2c)
-
-        prior_last_index = prior_submap.get_last_non_loop_frame_index()
-        prior_overlap_start = prior_last_index - overlap_count + 1
 
         source_points_all = []
         target_points_all = []
         overlap_debug = []
         pose_diagnostics = []
 
-        for offset in range(overlap_count):
-            current_index = offset
-            prior_index = prior_overlap_start + offset
+        for pair in alignment_pairs:
+            current_index = pair["current_index"]
+            prior_index = pair["prior_index"]
 
             current_conf = current_submap.get_conf_masks_frame(current_index)
             prior_conf = prior_submap.get_conf_masks_frame(prior_index)
@@ -561,6 +620,8 @@ class Pi3Solver(Solver):
                 {
                     "current_index": current_index,
                     "prior_index": prior_index,
+                    "global_frame_id": pair.get("global_frame_id"),
+                    "source": pair.get("source"),
                     "valid_points": int(num_valid),
                 }
             )
@@ -576,6 +637,7 @@ class Pi3Solver(Solver):
                     {
                         "current_index": current_index,
                         "prior_index": prior_index,
+                        "global_frame_id": pair.get("global_frame_id"),
                         "rotation_deg": rotation_angle_degrees(pose_rotation),
                         "translation_norm": float(np.linalg.norm(pose_translation)),
                     }
@@ -607,7 +669,7 @@ class Pi3Solver(Solver):
         print(
             colored("Pi3 overlap Sim3", "green"),
             {
-                "num_frames": overlap_count,
+                "num_frames": len(alignment_pairs),
                 "num_points": int(source_points.shape[0]),
                 "scale": scale,
                 "rotation_deg": rotation_angle_degrees(rotation),
@@ -618,9 +680,9 @@ class Pi3Solver(Solver):
             },
         )
 
-        return transform, overlap_count, prior_overlap_start
+        return transform, alignment_pairs
 
-    def run_predictions(self, image_names, model, max_loops, clip_model, clip_preprocess):
+    def run_predictions(self, image_names, model, max_loops, clip_model, clip_preprocess, batch_metadata=None):
         t1 = time.time()
         device = next(model.parameters()).device
         images = self._load_original_images(image_names).to(device)
@@ -636,6 +698,7 @@ class Pi3Solver(Solver):
         new_submap = Submap(new_pcd_num)
         new_submap.add_all_frames(images.detach().cpu())
         new_submap.set_frame_ids(image_names)
+        new_submap.set_batch_metadata(batch_metadata)
         new_submap.set_last_non_loop_frame_index(images.shape[0] - 1)
         new_submap.set_all_retrieval_vectors([])
         new_submap.set_img_names(image_names)
@@ -661,6 +724,7 @@ class Pi3Solver(Solver):
             "camera_poses": inference_outputs["camera_poses"],
             "intrinsic": inference_outputs["intrinsic"],
             "detected_loops": loop_candidates[: max_loops if max_loops > 0 else 0],
+            "batch_metadata": batch_metadata,
         }
 
     def add_edge(self, submap_id_curr, frame_id_curr, submap_id_prev=None, frame_id_prev=None, is_loop_closure=False):
@@ -669,65 +733,64 @@ class Pi3Solver(Solver):
             return
 
         current_submap = self.map.get_submap(submap_id_curr)
-        H_w_submap = np.eye(4)
-        overlap_count = 0
-        prior_overlap_start = None
         current_w2c = current_submap.get_all_poses()
         current_c2w = np.linalg.inv(current_w2c)
+        G_map_from_current_submap = np.linalg.inv(current_c2w[0])
+        alignment_pairs = []
+        prior_submap = None
 
         if submap_id_prev is not None:
-            prior_submap = self.map.get_submap(submap_id_prev)
-            overlap_count = self._infer_overlap_count(current_submap, prior_submap)
-            if overlap_count <= 0:
-                raise ValueError("Pi3Solver expected at least one overlapping frame between adjacent submaps.")
+            prior_submap, shared_pairs = self._find_alignment_prior_submap(current_submap, submap_id_prev)
+            if shared_pairs:
+                alignment_pairs = shared_pairs
+            else:
+                overlap_count = self._infer_overlap_count(current_submap, prior_submap)
+                if overlap_count <= 0:
+                    raise ValueError(
+                        "Pi3Solver expected shared anchors or at least one prefix/suffix overlapping frame "
+                        "between adjacent submaps."
+                    )
+                alignment_pairs = self._prefix_overlap_pairs(current_submap, prior_submap, overlap_count)
 
-            H_prior_from_current_submap, overlap_count, prior_overlap_start = self._estimate_submap_alignment(
+            H_prior_from_current_submap, alignment_pairs = self._estimate_submap_alignment(
                 current_submap=current_submap,
                 prior_submap=prior_submap,
-                overlap_count=overlap_count,
+                alignment_pairs=alignment_pairs,
             )
 
-            prior_anchor_index = prior_overlap_start
-            prior_anchor_node_id = submap_id_prev + prior_anchor_index
+            anchor_pair = alignment_pairs[0]
+            prior_anchor_index = anchor_pair["prior_index"]
+            prior_anchor_node_id = prior_submap.get_id() + prior_anchor_index
             prior_anchor_homography = self.graph.get_homography(prior_anchor_node_id)
             prior_anchor_w2c = prior_submap.get_all_poses()[prior_anchor_index]
-
             G_map_from_prior_submap = prior_anchor_homography @ prior_anchor_w2c
             G_map_from_current_submap = G_map_from_prior_submap @ H_prior_from_current_submap
-            H_w_submap = G_map_from_current_submap @ current_c2w[frame_id_curr]
-
-            H_overlap_prior_overlap_current = (
-                prior_anchor_w2c @ H_prior_from_current_submap @ current_c2w[frame_id_curr]
-            ).astype(np.float32)
 
             print(
                 "Pi3 overlap anchor:",
                 {
-                    "overlap_count": overlap_count,
-                    "prior_anchor_index": prior_anchor_index,
-                    "current_anchor_index": frame_id_curr,
+                    "alignment_source": anchor_pair.get("source"),
+                    "num_alignment_pairs": len(alignment_pairs),
+                    "prior_submap_id": int(prior_submap.get_id()),
+                    "prior_anchor_index": int(prior_anchor_index),
+                    "current_anchor_index": int(anchor_pair["current_index"]),
+                    "global_frame_id": anchor_pair.get("global_frame_id"),
                 },
-            )
-
-            self.graph.add_homography(submap_id_curr + frame_id_curr, H_w_submap.astype(np.float32))
-            self.graph.add_between_factor(
-                prior_anchor_node_id,
-                submap_id_curr + frame_id_curr,
-                H_overlap_prior_overlap_current,
-                self.graph.intra_submap_noise,
             )
         else:
             assert (submap_id_curr == 0 and frame_id_curr == 0), "First added node must be submap 0 frame 0"
-            self.graph.add_homography(submap_id_curr + frame_id_curr, H_w_submap)
-            self.graph.add_prior_factor(submap_id_curr + frame_id_curr, H_w_submap)
+
+        for index, pose in enumerate(current_w2c):
+            current_node = G_map_from_current_submap @ current_c2w[index]
+            self.graph.add_homography(submap_id_curr + index, current_node.astype(np.float32))
+
+        if submap_id_prev is None:
+            self.graph.add_prior_factor(submap_id_curr + frame_id_curr, self.graph.get_homography(submap_id_curr + frame_id_curr))
 
         for index, pose in enumerate(current_w2c):
             if index == 0:
                 continue
-
             H_inner = current_w2c[index - 1] @ np.linalg.inv(pose)
-            current_node = self.graph.get_homography(submap_id_curr + index - 1) @ H_inner
-            self.graph.add_homography(submap_id_curr + index, current_node)
             self.graph.add_between_factor(
                 submap_id_curr + index - 1,
                 submap_id_curr + index,
@@ -735,21 +798,19 @@ class Pi3Solver(Solver):
                 self.graph.inner_submap_noise,
             )
 
-        if submap_id_prev is not None and overlap_count > 1:
-            prior_submap = self.map.get_submap(submap_id_prev)
+        if submap_id_prev is not None and alignment_pairs:
             prior_w2c = prior_submap.get_all_poses()
-            prior_c2w = np.linalg.inv(prior_w2c)
-            G_map_from_current_submap = self.graph.get_homography(submap_id_curr) @ current_w2c[0]
-            G_map_from_prior_submap = self.graph.get_homography(submap_id_prev + prior_overlap_start) @ prior_w2c[
-                prior_overlap_start
-            ]
+            prior_anchor_pair = alignment_pairs[0]
+            G_map_from_prior_submap = self.graph.get_homography(
+                prior_submap.get_id() + prior_anchor_pair["prior_index"]
+            ) @ prior_w2c[prior_anchor_pair["prior_index"]]
             H_prior_from_current_submap = np.linalg.inv(G_map_from_prior_submap) @ G_map_from_current_submap
 
             extra_constraints = []
-            for offset in range(1, overlap_count):
-                prior_index = prior_overlap_start + offset
-                current_index = offset
-                prior_node_id = submap_id_prev + prior_index
+            for pair in alignment_pairs:
+                prior_index = pair["prior_index"]
+                current_index = pair["current_index"]
+                prior_node_id = prior_submap.get_id() + prior_index
                 current_node_id = submap_id_curr + current_index
                 relative_h = (
                     prior_w2c[prior_index] @ H_prior_from_current_submap @ current_c2w[current_index]
@@ -764,10 +825,12 @@ class Pi3Solver(Solver):
                     {
                         "prior_node_id": int(prior_node_id),
                         "current_node_id": int(current_node_id),
+                        "global_frame_id": pair.get("global_frame_id"),
+                        "source": pair.get("source"),
                     }
                 )
 
-            print("Pi3 extra overlap constraints:", extra_constraints)
+            print("Pi3 shared/overlap constraints:", extra_constraints)
 
     def add_points(self, pred_dict):
         images = pred_dict["images"]

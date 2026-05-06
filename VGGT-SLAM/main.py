@@ -13,6 +13,7 @@ import matplotlib.pyplot as plt
 import vggt_slam.slam_utils as utils
 from vggt_slam.solver import Solver
 from vggt_slam.pi3_solver import Pi3Solver, load_pi3x_model
+from vggt_slam.offline_planner import generate_offline_plan, load_local_batch_plan
 from vggt_slam.submap import Submap
 
 from vggt.models.vggt import VGGT
@@ -58,6 +59,17 @@ parser.add_argument("--fx", type=float, default=290.5493469238281, help="Shared 
 parser.add_argument("--fy", type=float, default=429.0402526855469, help="Shared Pi3X focal length fy in pixels for original images")
 parser.add_argument("--cx", type=float, default=175.0, help="Shared Pi3X principal point cx in pixels for original images")
 parser.add_argument("--cy", type=float, default=238.0, help="Shared Pi3X principal point cy in pixels for original images")
+parser.add_argument("--generate_offline_submap_plan", action="store_true", help="Generate offline keyframes/local_batches from LingBot poses and HLoc sparse outputs before running.")
+parser.add_argument("--offline_plan_dir", type=str, default=None, help="Directory for generated offline planning JSON files.")
+parser.add_argument("--hloc_sparse_dir", type=str, default=None, help="Path to HLoc/COLMAP sparse model directory containing images.bin and points3D.bin.")
+parser.add_argument("--hloc_features_h5", type=str, default=None, help="Optional HLoc features.h5 used for feature_count stats.")
+parser.add_argument("--hloc_matches_h5", type=str, default=None, help="Optional HLoc matches.h5 reserved for future connectivity stats.")
+parser.add_argument("--submap_plan_json", type=str, default=None, help="Path to a local_batches.json file. If set, submaps are built from this plan instead of sequential windows.")
+parser.add_argument("--offline_keyframe_ratio", type=float, default=0.2, help="Target global keyframe ratio for offline planning.")
+parser.add_argument("--offline_min_observation_quantile", type=float, default=0.25, help="Observation-count quantile used as the low-quality keyframe threshold.")
+parser.add_argument("--offline_max_temporal_gap", type=int, default=40, help="Maximum frame gap without a keyframe in offline planning.")
+parser.add_argument("--offline_anchor_count", type=int, default=4, help="Number of shared/global keyframe anchors to include in each offline local batch.")
+parser.add_argument("--offline_min_shared_anchors", type=int, default=2, help="Minimum shared anchors required for shared-anchor alignment before falling back to prefix/suffix overlap.")
 
 def main():
     """
@@ -94,6 +106,7 @@ def main():
             min_loop_frame_gap=args.min_loop_frame_gap,
             loop_translation_thresh=args.loop_translation_thresh,
             loop_rotation_thresh_deg=args.loop_rotation_thresh_deg,
+            min_shared_anchors=args.offline_min_shared_anchors,
         )
     else:
         solver = Solver(
@@ -144,29 +157,76 @@ def main():
     image_names = utils.downsample_images(image_names, downsample_factor)
     print(f"Found {len(image_names)} images")
 
+    submap_batches = None
+    if args.generate_offline_submap_plan:
+        if args.base_model != "pi3x":
+            raise ValueError("Offline submap planning is currently implemented for --base_model pi3x.")
+        if args.lingbot_transforms_json is None:
+            raise ValueError("--generate_offline_submap_plan requires --lingbot_transforms_json.")
+        if args.hloc_sparse_dir is None:
+            raise ValueError("--generate_offline_submap_plan requires --hloc_sparse_dir.")
+        if args.offline_plan_dir is None:
+            raise ValueError("--generate_offline_submap_plan requires --offline_plan_dir.")
+
+        print("Generating offline keyframe/local batch plan...")
+        outputs = generate_offline_plan(
+            image_names=image_names,
+            lingbot_transforms_json=args.lingbot_transforms_json,
+            hloc_sparse_dir=args.hloc_sparse_dir,
+            output_dir=args.offline_plan_dir,
+            hloc_features_h5=args.hloc_features_h5,
+            keyframe_ratio=args.offline_keyframe_ratio,
+            min_observation_quantile=args.offline_min_observation_quantile,
+            max_temporal_gap=args.offline_max_temporal_gap,
+            submap_size=args.submap_size,
+            anchor_count=args.offline_anchor_count,
+            min_shared_anchors=args.offline_min_shared_anchors,
+        )
+        args.submap_plan_json = str(outputs["local_batches"])
+        print("Offline plan generated:", {key: str(value) for key, value in outputs.items()})
+
+    if args.submap_plan_json is not None:
+        if args.base_model != "pi3x":
+            raise ValueError("--submap_plan_json is currently implemented for --base_model pi3x.")
+        submap_batches = load_local_batch_plan(args.submap_plan_json, image_names)
+        use_optical_flow_downsample = False
+        print(
+            "Loaded submap plan:",
+            {
+                "path": args.submap_plan_json,
+                "num_batches": len(submap_batches),
+            },
+        )
+
     image_names_subset = []
     count = 0
     image_count = 0
     total_time_start = time.time()
     keyframe_time = utils.Accumulator()
     backend_time = utils.Accumulator()
-    for image_name in tqdm(image_names):
-        if use_optical_flow_downsample:
-            with keyframe_time:
-                img = cv2.imread(image_name)
-                enough_disparity = solver.flow_tracker.compute_disparity(img, args.min_disparity, args.vis_flow)
-                if enough_disparity:
-                    image_names_subset.append(image_name)
-                    image_count += 1
-        else:
-            image_names_subset.append(image_name)
 
-        # Run submap processing if enough images are collected or if it's the last group of images.
-        if len(image_names_subset) == args.submap_size + args.overlapping_window_size or image_name == image_names[-1]:
+    if submap_batches is not None:
+        unique_processed_images = set()
+        for batch_image_names, batch_metadata in tqdm(submap_batches, desc="Offline submap batches"):
             count += 1
-            print(image_names_subset)
+            print(
+                "Processing planned submap:",
+                {
+                    "batch_id": batch_metadata.get("batch_id"),
+                    "num_frames": len(batch_image_names),
+                    "frame_ids": batch_metadata.get("frame_ids"),
+                    "anchor_keyframes": batch_metadata.get("anchor_keyframes", []),
+                },
+            )
             t1 = time.time()
-            predictions = solver.run_predictions(image_names_subset, model, args.max_loops, clip_model, clip_preprocess)
+            predictions = solver.run_predictions(
+                batch_image_names,
+                model,
+                args.max_loops,
+                clip_model,
+                clip_preprocess,
+                batch_metadata=batch_metadata,
+            )
             print("Solver total time", time.time()-t1)
             print(count, "submaps processed")
 
@@ -181,9 +241,45 @@ def main():
                     solver.update_all_submap_vis()
                 else:
                     solver.update_latest_submap_vis()
-            
-            # Reset for next submap.
-            image_names_subset = image_names_subset[-args.overlapping_window_size:]
+
+            unique_processed_images.update(str(path) for path in batch_image_names)
+
+        image_count = max(len(unique_processed_images), 1)
+    else:
+        for image_name in tqdm(image_names):
+            if use_optical_flow_downsample:
+                with keyframe_time:
+                    img = cv2.imread(image_name)
+                    enough_disparity = solver.flow_tracker.compute_disparity(img, args.min_disparity, args.vis_flow)
+                    if enough_disparity:
+                        image_names_subset.append(image_name)
+                        image_count += 1
+            else:
+                image_names_subset.append(image_name)
+
+            # Run submap processing if enough images are collected or if it's the last group of images.
+            if len(image_names_subset) == args.submap_size + args.overlapping_window_size or image_name == image_names[-1]:
+                count += 1
+                print(image_names_subset)
+                t1 = time.time()
+                predictions = solver.run_predictions(image_names_subset, model, args.max_loops, clip_model, clip_preprocess)
+                print("Solver total time", time.time()-t1)
+                print(count, "submaps processed")
+
+                solver.add_points(predictions)
+
+                with backend_time:
+                    solver.graph.optimize()
+
+                loop_closure_detected = len(predictions["detected_loops"]) > 0
+                if args.vis_map:
+                    if loop_closure_detected:
+                        solver.update_all_submap_vis()
+                    else:
+                        solver.update_latest_submap_vis()
+                
+                # Reset for next submap.
+                image_names_subset = image_names_subset[-args.overlapping_window_size:]
 
     total_time = time.time() - total_time_start
     average_fps = total_time / image_count
