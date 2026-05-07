@@ -163,6 +163,24 @@ def rotation_angle_degrees(rotation):
     return float(np.degrees(np.arccos(cos_theta)))
 
 
+def _safe_percentile(values, percentile):
+    values = np.asarray(values)
+    if values.size == 0:
+        return None
+    return float(np.percentile(values, percentile))
+
+
+def _sim3_scale_from_transform(transform):
+    return float(np.cbrt(abs(np.linalg.det(transform[:3, :3]))))
+
+
+def _sim3_rotation_from_transform(transform):
+    scale = _sim3_scale_from_transform(transform)
+    if scale < 1e-8:
+        return transform[:3, :3]
+    return transform[:3, :3] / scale
+
+
 class Pi3Solver(Solver):
     """Solver variant that consumes Pi3X local point maps instead of VGGT depth."""
 
@@ -589,6 +607,7 @@ class Pi3Solver(Solver):
 
         source_points_all = []
         target_points_all = []
+        pair_point_sets = []
         overlap_debug = []
         pose_diagnostics = []
 
@@ -598,9 +617,14 @@ class Pi3Solver(Solver):
 
             current_conf = current_submap.get_conf_masks_frame(current_index)
             prior_conf = prior_submap.get_conf_masks_frame(prior_index)
-            good_mask = (prior_conf > prior_submap.get_conf_threshold()) & (
-                current_conf > current_submap.get_conf_threshold()
-            )
+            # good_mask = (prior_conf > prior_submap.get_conf_threshold()) & (
+            #     current_conf > current_submap.get_conf_threshold()
+            # )
+
+            current_thr = np.percentile(current_conf, 60)
+            prior_thr = np.percentile(prior_conf, 60)
+            good_mask = (prior_conf > prior_thr) & (current_conf > current_thr)
+
             good_mask = good_mask.reshape(-1)
 
             current_points_local = current_submap.get_frame_pointcloud(current_index).reshape(-1, 3)
@@ -629,6 +653,13 @@ class Pi3Solver(Solver):
             if num_valid >= 3:
                 source_points_all.append(current_points_submap)
                 target_points_all.append(prior_points_submap)
+                pair_point_sets.append(
+                    {
+                        "pair": dict(pair),
+                        "source_points": current_points_submap,
+                        "target_points": prior_points_submap,
+                    }
+                )
 
                 pose_transform = prior_c2w[prior_index] @ current_w2c[current_index]
                 pose_rotation = pose_transform[:3, :3]
@@ -666,6 +697,57 @@ class Pi3Solver(Solver):
         aligned_source = transform_points(source_points, transform)
         residuals = np.linalg.norm(aligned_source - target_points, axis=1)
 
+        pair_residual_debug = []
+        pair_transform_debug = []
+        for item in pair_point_sets:
+            pair_aligned = transform_points(item["source_points"], transform)
+            pair_residuals = np.linalg.norm(pair_aligned - item["target_points"], axis=1)
+
+            try:
+                pair_transform, pair_scale, pair_rotation, pair_translation = estimate_similarity_transform(
+                    item["source_points"],
+                    item["target_points"],
+                )
+                pair_rotation_delta = pair_rotation.T @ _sim3_rotation_from_transform(transform)
+                pair_transform_debug.append(
+                    {
+                        "source": item["pair"].get("source"),
+                        "global_frame_id": item["pair"].get("global_frame_id"),
+                        "current_index": int(item["pair"]["current_index"]),
+                        "prior_index": int(item["pair"]["prior_index"]),
+                        "single_anchor_scale": float(pair_scale),
+                        "scale_vs_joint": float(pair_scale / max(_sim3_scale_from_transform(transform), 1e-8)),
+                        "rotation_delta_to_joint_deg": rotation_angle_degrees(pair_rotation_delta),
+                        "translation_delta_to_joint_norm": float(
+                            np.linalg.norm(pair_translation - transform[:3, 3])
+                        ),
+                    }
+                )
+            except ValueError as exc:
+                pair_transform_debug.append(
+                    {
+                        "source": item["pair"].get("source"),
+                        "global_frame_id": item["pair"].get("global_frame_id"),
+                        "current_index": int(item["pair"]["current_index"]),
+                        "prior_index": int(item["pair"]["prior_index"]),
+                        "error": str(exc),
+                    }
+                )
+
+            pair_residual_debug.append(
+                {
+                    "source": item["pair"].get("source"),
+                    "global_frame_id": item["pair"].get("global_frame_id"),
+                    "current_index": int(item["pair"]["current_index"]),
+                    "prior_index": int(item["pair"]["prior_index"]),
+                    "num_points": int(pair_residuals.shape[0]),
+                    "residual_mean": float(pair_residuals.mean()),
+                    "residual_median": float(np.median(pair_residuals)),
+                    "residual_p90": _safe_percentile(pair_residuals, 90),
+                    "residual_p95": _safe_percentile(pair_residuals, 95),
+                }
+            )
+
         print(
             colored("Pi3 overlap Sim3", "green"),
             {
@@ -679,6 +761,8 @@ class Pi3Solver(Solver):
                 "residual_p95": float(np.percentile(residuals, 95)),
             },
         )
+        print("Pi3 per-anchor alignment residuals:", pair_residual_debug)
+        print("Pi3 per-anchor transform disagreement:", pair_transform_debug)
 
         return transform, alignment_pairs
 
@@ -831,6 +915,7 @@ class Pi3Solver(Solver):
                 )
 
             print("Pi3 shared/overlap constraints:", extra_constraints)
+
 
     def add_points(self, pred_dict):
         images = pred_dict["images"]

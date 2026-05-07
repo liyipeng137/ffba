@@ -332,6 +332,59 @@ class GraphMap:
         pcd_all.colors = o3d.utility.Vector3dVector(colors_all)
         o3d.io.write_point_cloud(file_name, pcd_all)
 
+    def write_keyframe_anchor_points_to_file(self, graph, file_name):
+        pcd_all = []
+        colors_all = []
+        seen_global_frame_ids = set()
+
+        for submap in self.ordered_submaps_by_key():
+            if submap.get_lc_status():
+                continue
+
+            selected_frame_ids = set()
+            selected_frame_ids.update(int(i) for i in getattr(submap, "anchor_keyframe_ids", []))
+            selected_frame_ids.update(int(i) for i in getattr(submap, "target_keyframe_ids", []))
+            if not selected_frame_ids:
+                continue
+
+            pointclouds, frame_ids, conf_masks = submap.get_points_list_in_world_frame(graph)
+            if getattr(submap, "global_frame_ids", None) is not None:
+                frame_ids = submap.get_global_frame_ids()
+
+            for frame_index, (pointcloud, frame_id, conf_mask) in enumerate(zip(pointclouds, frame_ids, conf_masks)):
+                global_frame_id = int(frame_id)
+                if global_frame_id not in selected_frame_ids:
+                    continue
+                if global_frame_id in seen_global_frame_ids:
+                    continue
+                seen_global_frame_ids.add(global_frame_id)
+
+                mask = conf_mask.astype(bool)
+                pcd_all.append(pointcloud[mask].reshape(-1, 3))
+                colors_all.append(submap.colors[frame_index][mask].reshape(-1, 3))
+
+        if not pcd_all:
+            print(f"No keyframe/anchor points available to export to {file_name}.")
+            return
+
+        pcd_all = np.concatenate(pcd_all, axis=0)
+        colors_all = np.concatenate(colors_all, axis=0)
+        if colors_all.max() > 1.0:
+            colors_all = colors_all / 255.0
+
+        os.makedirs(os.path.dirname(file_name) or ".", exist_ok=True)
+        pcd_o3d = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(pcd_all))
+        pcd_o3d.colors = o3d.utility.Vector3dVector(colors_all)
+        o3d.io.write_point_cloud(file_name, pcd_o3d)
+        print(
+            "Keyframe/anchor point cloud exported:",
+            {
+                "path": file_name,
+                "num_frames": len(seen_global_frame_ids),
+                "num_points": int(pcd_all.shape[0]),
+            },
+        )
+
     def write_submaps_to_dir(self, graph, output_dir, coordinate_mode="world"):
         os.makedirs(output_dir, exist_ok=True)
         exported_files = []

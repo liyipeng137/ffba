@@ -315,6 +315,8 @@ def main():
         solver.map.write_points_to_file(solver.graph, args.export_pcd)
         print("Point cloud exported.")
 
+    if args.base_model == "pi3x":
+        solver.map.write_keyframe_anchor_points_to_file(solver.graph, "offline/keyframe_anchor_points.ply")
 
     if args.export_transforms_json is not None:
         print(f"Exporting LingBot-compatible transforms.json to {args.export_transforms_json} ...")
