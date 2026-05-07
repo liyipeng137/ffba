@@ -68,8 +68,8 @@ parser.add_argument("--submap_plan_json", type=str, default=None, help="Path to 
 parser.add_argument("--offline_keyframe_ratio", type=float, default=0.2, help="Target global keyframe ratio for offline planning.")
 parser.add_argument("--offline_min_observation_quantile", type=float, default=0.25, help="Observation-count quantile used as the low-quality keyframe threshold.")
 parser.add_argument("--offline_max_temporal_gap", type=int, default=40, help="Maximum frame gap without a keyframe in offline planning.")
-parser.add_argument("--offline_anchor_count", type=int, default=4, help="Number of shared/global keyframe anchors to include in each offline local batch.")
-parser.add_argument("--offline_min_shared_anchors", type=int, default=2, help="Minimum shared anchors required for shared-anchor alignment before falling back to prefix/suffix overlap.")
+parser.add_argument("--offline_anchor_count", type=int, default=6, help="Number of shared/global keyframe anchors to include in each offline local batch.")
+parser.add_argument("--offline_min_shared_anchors", type=int, default=3, help="Minimum shared anchors required for shared-anchor alignment before falling back to prefix/suffix overlap.")
 
 def main():
     """

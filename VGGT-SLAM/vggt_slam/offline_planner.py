@@ -324,6 +324,21 @@ def _nearest_keyframes_by_pose(frame_ids, keyframe_ids, pose_dists, limit, exclu
     return [idx for _, idx in ranked[:limit]]
 
 
+def _select_rolling_shared_anchors(previous_anchor_ids, target_frame_ids, pose_dists, limit):
+    if not previous_anchor_ids or limit <= 0:
+        return []
+    target_start = min(target_frame_ids)
+    target_center = int(round(float(np.mean(target_frame_ids))))
+    ranked = []
+    for keyframe_id in previous_anchor_ids:
+        temporal_gap = max(0, target_start - keyframe_id)
+        pose_gap = float(pose_dists[target_center, keyframe_id])
+        # Prefer anchors close to the new batch boundary; pose distance breaks ties.
+        ranked.append((temporal_gap, pose_gap, -keyframe_id, keyframe_id))
+    ranked.sort()
+    return [item[-1] for item in ranked[:limit]]
+
+
 def build_local_batches(
     image_names,
     pose_records,
@@ -342,21 +357,21 @@ def build_local_batches(
 
     batches = []
     cursor = 0
-    previous_shared = []
+    previous_anchor_ids = []
     batch_id = 0
     while cursor < num_frames:
         target_frame_ids = list(range(cursor, min(num_frames, cursor + target_count)))
         target_set = set(target_frame_ids)
         target_keyframes = [idx for idx in target_frame_ids if idx in keyframe_ids]
 
-        anchors = []
-        for idx in previous_shared[:min_shared_anchors]:
-            if idx not in anchors:
-                anchors.append(idx)
+        anchors = _select_rolling_shared_anchors(
+            previous_anchor_ids,
+            target_frame_ids,
+            pose_dists,
+            limit=min_shared_anchors,
+        )
 
         progressive_keyframes = [idx for idx in keyframe_ids if idx <= target_frame_ids[-1]]
-        if len(progressive_keyframes) < anchor_count:
-            progressive_keyframes = keyframe_ids
         preferred = target_keyframes + _nearest_keyframes_by_pose(
             target_frame_ids,
             progressive_keyframes,
@@ -391,11 +406,11 @@ def build_local_batches(
             "target_keyframes": [idx for idx in target_frame_ids if idx in keyframe_ids],
             "non_keyframes": [idx for idx in target_frame_ids if idx not in keyframe_ids],
             "target_frame_ids": target_frame_ids,
-            "shared_with_previous": sorted(set(frame_ids).intersection(previous_shared)) if batches else [],
+            "shared_with_previous": sorted(set(frame_ids).intersection(previous_anchor_ids)) if batches else [],
         }
         batches.append(batch)
 
-        previous_shared = anchor_keyframes if anchor_keyframes else [idx for idx in frame_ids if idx in keyframe_ids]
+        previous_anchor_ids = anchor_keyframes if anchor_keyframes else [idx for idx in frame_ids if idx in keyframe_ids]
         cursor += target_count
         batch_id += 1
 
