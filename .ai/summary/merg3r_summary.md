@@ -47,6 +47,106 @@
 
 ---
 
+## 子集划分算法详解（`sequence.py`）
+
+三种 Sequence 子类，由 `create_sequence()` 统一入口选择：
+
+### VideoSequence（`--sequence_type video`）
+
+在**原始帧顺序**上直接滑动窗口：
+
+```
+帧序列: [0,1,2,...,N-1]，subset_size=T，overlap=O，stride=T-O
+
+subset 0: frames[0 : T]
+subset 1: frames[T-O : 2T-O]   ← 前 O 帧与上一 subset 重叠
+...
+
+边缘处理：最后一个 subset < 50%*T 时，将末尾两个 subset 合并后均分
+```
+
+`generate_edges()`：简单链式 `0→1→2→...`，重叠索引 = 父 subset 末尾 O 帧 / 子 subset 开头 O 帧。
+
+---
+
+### ShortestPath（`--sequence_type shortest_path`，默认推荐）
+
+三步流程：**DINO 相似度矩阵 → 哈密顿路径 → 重排 → 滑动窗口**
+
+**Step 1：构建 DINO 相似度矩阵（`get_sim_matrix`）**
+
+```
+DINOv3 提取所有图的 patch token → frame_feat: (N, P, D)
+L2 归一化后均值池化 → frame_feat_mean: (N, D)
+
+全局相似度:  sim_global = frame_feat_mean @ frame_feat_mean.T   # (N,N) 图像级
+
+MNN patch 一致性（针对 top-30 候选对）:
+  对每对候选图 (i,j)，统计满足以下条件的 patch 比例：
+    patch_i 在图j 中最近邻为 patch_j，且 patch_j 的最近邻也是 patch_i（互最近邻）
+    且匹配置信度 > 0.6
+  → mnn_sim_matrix: (N,N)，稀疏（非候选对为0）
+
+融合：sim_matrix = 0.3 * sim_global + 0.7 * mnn_sim_matrix
+```
+
+全局外观占 30%，patch 级互最近邻一致性占 70%，后者更能反映真实几何重叠。
+
+**Step 2：求最长哈密顿路径（`solve_longest_hamiltonian_path`）**
+
+目标：找帧排列 path 使得 `Σ sim_matrix[path[k], path[k+1]]` 最大（NP-hard，用启发式）。
+
+三种算法并跑，取最优：
+
+| 算法 | 核心思路 |
+|---|---|
+| `regret` 后悔插入 | 每步计算每个未访问节点的"最佳插入位置收益 - 次佳收益"，优先插入错过代价最大的节点 |
+| `ga` 遗传算法 | 种群30条路径，有序交叉(OX) + 随机交换变异，精英保留，迭代120代 |
+| `ig` 迭代贪心+模拟退火 | 每轮随机移除5%连续块后用 regret 插入修复，以 exp(Δw/T) 概率接受较差解，T×=0.98 |
+
+**Step 3：路径重排（`--splitting_type`）**
+
+| 策略 | 方式 | 效果 |
+|---|---|---|
+| `interleave`（默认）| 按列读矩阵：`new_path = [path[0], path[K], path[2K], ..., path[1], ...]`，K=num_subsets | 每 subset 含来自 path 首/中/尾的帧，视角多样性最大 |
+| `zigzag` | 以 interleave 步长交替正向/反向扫描，剩余帧按相似度插入最佳位置 | 多样性略低于 interleave |
+| `threshold` | 贪心选帧：相似度在 [50th, 100th] percentile 之间的帧 | 强制视角跳变 |
+| `original` | 不重排，直接用 DINO path 原序 | 保留时序连续性 |
+| `original_threshold` | 在原始 0..N-1 顺序上应用 threshold（跳过 DINO path） | 忽略 DINO 排序 |
+
+**Step 4：滑动窗口**
+
+```
+stride = subset_size - overlap
+在 new_path 上滑动，停止条件：current + overlap >= len(path)
+末尾处理：最后一个 subset < 50% * subset_size 时，将末尾两个 subset 合并均分
+```
+
+---
+
+### GraphSequence（`--sequence_type graph`）
+
+不做滑动窗口，直接用 MST 聚类：
+```
+get_sim_matrix() → DINO 相似度矩阵
+build_mst()      → k-NN 图 + 最大生成树 → clusters（内部已嵌入 overlap）
+generate_edges() → BFS 遍历 MST，建树形边结构
+```
+边结构为**树形**，其余两种为**链式**。
+
+---
+
+### 三种方式对比
+
+| | VideoSequence | ShortestPath | GraphSequence |
+|---|---|---|---|
+| 排序依据 | 原始帧顺序 | DINO 哈密顿路径 | DINO k-NN 聚类 |
+| subset 内多样性 | 低（时序相邻） | 高（interleave 跨段采样） | 中（聚类内相似） |
+| 边结构 | 链式 | 链式 | 树形（MST） |
+| 适用场景 | 有序视频流 | 无序图集（主推） | 无序图集（备选） |
+
+---
+
 ## 子集对齐算法详解（`weighted_iterative_alignment`）
 
 默认对齐方法 `--alignment_type weighted_iterative` 的核心思想：**用模型预测的深度置信度作为初始权重，再用 Huber-IRLS 迭代剔除外点，在 Sim(3) 空间内求解子集间的相似变换。**
@@ -90,6 +190,68 @@
 | 外点处理 | Huber-IRLS 迭代重加权 | RANSAC（可选）|
 | 鲁棒性来源 | 模型置信度 + 残差自适应 | 随机采样一致性 |
 | 计算开销 | 较低（5次迭代，有Numba加速）| RANSAC需500+次迭代 |
+
+---
+
+## 跟踪算法详解（`extract_matches_lightglue` / `graph_extract_matches_lightglue`）
+
+核心思想：**SuperPoint + LightGlue 配对匹配，双向 3D 重投影过滤假匹配，并查集将配对匹配升维为多视图一致轨迹，置信度加权均值初始化 3D 点坐标。**
+
+### 两种模式对比
+
+| 函数 | 配对策略 | 适用场景 |
+|---|---|---|
+| `extract_matches_lightglue` | 固定步长跳连 `steps=[1,2,3,5,7,10]`，匹配 `(i, i+step)` | `--sequence_type video` |
+| `graph_extract_matches_lightglue` | DINO 相似度 top-k，每图找最相似的 k 张 | `--sequence_type shortest_path` |
+
+### 三阶段流程
+
+```
+阶段一：特征提取
+  SuperPoint 对所有 N 张图提取关键点（max 4096点/图）
+  → all_features[i]
+
+阶段二：配对匹配 + 双向重投影过滤
+  对每对 (i1, i2)：
+    LightGlue → 原始匹配 (kpt_idx_i1, kpt_idx_i2)
+      │
+      ├─ 取整关键点坐标，查预计算的世界系 3D 点图
+      │     3d_pt1 = points[i1][round(y1), round(x1)]
+      │     3d_pt2 = points[i2][round(y2), round(x2)]
+      │
+      ├─ 双向重投影误差：
+      │     error1 = ||project(3d_pt1 → i2) - kpt2||
+      │     error2 = ||project(3d_pt2 → i1) - kpt1||
+      │
+      └─ 保留：error1 < 8px AND error2 < 8px AND 两点均在图像内
+
+阶段三：并查集 → 多视图轨迹
+  有效匹配 → DisjointSet.merge((i1, kpt_idx), (i2, kpt_idx))
+
+  遍历每个连通分量（= 一条跨视图轨迹）：
+    对分量内每个 (img, kpt_idx) 观测：
+      ├─ 2D 像素坐标 → final_track[img]
+      ├─ 全局点 ID   → points_id[img]
+      └─ 查该像素深度置信度，累积加权 3D 坐标
+
+    轨迹 3D 位置 = Σ(3d_coord × conf) / Σconf   ← 置信度加权均值
+    轨迹置信度   = Σconf / 观测数                 ← 平均置信度
+```
+
+### 输出
+
+```
+final_track[i]    : (P_i, 2)      图 i 的观测像素坐标
+points_id[i]      : (P_i,)        对应全局 3D 点 ID
+final_points      : (P_total, 3)  所有轨迹 3D 坐标
+final_points_conf : (P_total,)    每条轨迹置信度
+```
+
+### 关键设计
+
+- **双向重投影**：同时检验两个方向，过滤 LightGlue 假匹配和深度图预测误差导致的 3D 偏差
+- **无需三角化**：直接用模型预测深度初始化 3D 点，BA 开始前已有高质量初值
+- **并查集传递性**：A-B 匹配 + B-C 匹配 → A-B-C 同一轨迹，自动处理跨帧传递而无需显式追踪
 
 ---
 

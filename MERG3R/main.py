@@ -30,6 +30,12 @@ def parse_args():
     parser.add_argument("--epoch", type=int, default=300)
     parser.add_argument("--max_reproj", type=float, default=8.0)
     parser.add_argument("--stride", type=int, default=100)
+    parser.add_argument(
+        "--dense_max_points",
+        type=int,
+        default=2_000_000,
+        help="Maximum points to export in dense_model_points.ply. Set <=0 to disable.",
+    )
     parser.add_argument("--model", type=str, default="vggt")
     parser.add_argument("--pi3x_ckpt", type=str, default=None, help="Optional local Pi3X checkpoint path. If omitted, loads yyfz233/Pi3X.")
     parser.add_argument("--multi_dirs", action="store_true")
@@ -196,19 +202,16 @@ def main():
     peak_mem = torch.cuda.max_memory_allocated() / (1024**2)  # in MiB
     elapsed = end_time - start_time
 
-    final_predictions['world_points'] = unproject_depth_map_to_point_map(final_predictions['depth'], final_predictions['extrinsic'], final_predictions['intrinsic'])
     if 'local_points' in final_predictions:
-        final_predictions['world_points_from_local'] = local_point_map_to_world_point_map(
+        export_dense_local_point_map_ply(
+            os.path.join(args.output_dir, "dense_model_points.ply"),
             final_predictions['local_points'],
             final_predictions['extrinsic'],
-        )
-        export_dense_point_map_ply(
-            os.path.join(args.output_dir, "dense_model_points.ply"),
-            final_predictions['world_points_from_local'],
             sequence.images,
             final_predictions['depth_conf'],
             conf_threshold=args.point_vis_threshold,
             stride=1,
+            max_points=args.dense_max_points if args.dense_max_points > 0 else None,
         )
 
     with open(os.path.join(args.output_dir, "computation_stats.txt",), "w")as f:

@@ -692,74 +692,158 @@ def compute_depth(points, extrin):
     return depth
 
 
-def local_point_map_to_world_point_map(local_points, extrinsic):
+def _world_points_from_local_frame(local_points_frame, extrinsic_frame):
+    extrinsic_frame = np.asarray(extrinsic_frame, dtype=np.float32)
+    if extrinsic_frame.shape == (4, 4):
+        extrinsic_frame = extrinsic_frame[:3, :4]
+    elif extrinsic_frame.shape != (3, 4):
+        raise ValueError(f"Expected extrinsic frame shape (3, 4) or (4, 4), got {extrinsic_frame.shape}")
+
+    w2c = np.eye(4, dtype=np.float32)
+    w2c[:3, :4] = extrinsic_frame
+    c2w = np.linalg.inv(w2c)
+    return local_points_frame.astype(np.float32) @ c2w[:3, :3].T + c2w[:3, 3]
+
+
+def _image_frame_to_colors(image_frame, target_hw):
+    if isinstance(image_frame, torch.Tensor):
+        image_frame = image_frame.detach().cpu().numpy()
+    if image_frame.shape[0] == 3:
+        image_frame = np.transpose(image_frame, (1, 2, 0))
+    height, width = target_hw
+    return (cv2.resize(image_frame, (width, height)) * 255).clip(0, 255).astype(np.uint8)
+
+
+def _write_binary_ply_header(file_obj, num_vertices):
+    header = (
+        "ply\n"
+        "format binary_little_endian 1.0\n"
+        f"element vertex {num_vertices}\n"
+        "property float x\n"
+        "property float y\n"
+        "property float z\n"
+        "property uchar red\n"
+        "property uchar green\n"
+        "property uchar blue\n"
+        "end_header\n"
+    )
+    file_obj.write(header.encode("ascii"))
+
+
+def _write_binary_ply_vertices(file_obj, points, colors):
+    vertices = np.empty(
+        len(points),
+        dtype=[
+            ("x", np.float32),
+            ("y", np.float32),
+            ("z", np.float32),
+            ("red", np.uint8),
+            ("green", np.uint8),
+            ("blue", np.uint8),
+        ],
+    )
+    vertices["x"] = points[:, 0]
+    vertices["y"] = points[:, 1]
+    vertices["z"] = points[:, 2]
+    vertices["red"] = colors[:, 0]
+    vertices["green"] = colors[:, 1]
+    vertices["blue"] = colors[:, 2]
+    file_obj.write(vertices.tobytes())
+
+
+def export_dense_local_point_map_ply(
+    output_path,
+    local_points,
+    extrinsic,
+    images,
+    conf,
+    conf_threshold=50.0,
+    stride=1,
+    max_points=2_000_000,
+):
     """
-    Transform per-frame camera-local point maps into world coordinates.
+    Stream a dense model point cloud to PLY using local point maps and final poses.
 
-    Args:
-        local_points: (N, H, W, 3), camera coordinates.
-        extrinsic: (N, 3, 4), world-to-camera matrices.
-
-    Returns:
-        world_points: (N, H, W, 3), world coordinates under the current poses.
+    This avoids materializing full-sequence world point maps or color maps.
     """
     if isinstance(local_points, torch.Tensor):
         local_points = local_points.detach().cpu().numpy()
     if isinstance(extrinsic, torch.Tensor):
         extrinsic = extrinsic.detach().cpu().numpy()
-
-    N, H, W, _ = local_points.shape
-    w2c = np.tile(np.eye(4, dtype=np.float32), (N, 1, 1))
-    w2c[:, :3, :4] = extrinsic.astype(np.float32)
-    c2w = np.linalg.inv(w2c)
-
-    local_h = np.concatenate(
-        [local_points.astype(np.float32), np.ones((N, H, W, 1), dtype=np.float32)],
-        axis=-1,
-    )
-    return np.einsum("nij,nhwj->nhwi", c2w, local_h)[..., :3]
-
-
-def export_dense_point_map_ply(output_path, points, images, conf, conf_threshold=50.0, stride=1):
-    """
-    Export dense point maps to PLY using a percentile confidence threshold.
-    """
-    if isinstance(images, torch.Tensor):
-        images_np = images.detach().cpu().numpy()
-    else:
-        images_np = images
-
-    S, H, W = points.shape[:3]
-    colors = np.zeros((S, H, W, 3), dtype=np.float32)
-    for i, img in enumerate(images_np):
-        if img.shape[0] == 3:
-            img = np.transpose(img, (1, 2, 0))
-        colors[i] = cv2.resize(img, (W, H))
+    if isinstance(conf, torch.Tensor):
+        conf = conf.detach().cpu().numpy()
 
     conf = np.asarray(conf)
+    if conf.ndim == 4 and conf.shape[-1] == 1:
+        conf = conf[..., 0]
+
+    num_frames, height, width, _ = local_points.shape
+    if stride < 1:
+        raise ValueError(f"stride must be >= 1, got {stride}")
+    if max_points is not None and max_points <= 0:
+        raise ValueError(f"max_points must be positive or None, got {max_points}")
+    if conf.shape[:3] != (num_frames, height, width):
+        raise ValueError(
+            "Confidence shape must match local_points spatial shape. "
+            f"Got conf={conf.shape}, local_points={local_points.shape}."
+        )
+    if len(extrinsic) != num_frames:
+        raise ValueError(f"Expected {num_frames} extrinsics, got {len(extrinsic)}")
+
     threshold_value = 0.0 if conf_threshold == 0.0 else np.percentile(conf, conf_threshold)
-    mask = (conf >= threshold_value) & (conf > 1e-5)
+    valid_counts = []
+    for i in range(num_frames):
+        conf_i = conf[i, ::stride, ::stride]
+        local_i = local_points[i, ::stride, ::stride]
+        valid = (conf_i >= threshold_value) & (conf_i > 1e-5) & np.isfinite(local_i).all(axis=-1)
+        valid_counts.append(int(np.count_nonzero(valid)))
 
-    if stride > 1:
-        stride_mask = np.zeros_like(mask, dtype=bool)
-        stride_mask[:, ::stride, ::stride] = True
-        mask = mask & stride_mask
-
-    points_flat = points.reshape(-1, 3)
-    colors_flat = (colors.reshape(-1, 3) * 255).clip(0, 255).astype(np.uint8)
-    mask_flat = mask.reshape(-1)
-
-    points_out = points_flat[mask_flat]
-    colors_out = colors_flat[mask_flat]
-
-    if len(points_out) == 0:
+    total_valid = int(np.sum(valid_counts))
+    if total_valid == 0:
         print(f"[OUTPUT WRITING] No dense points passed filtering for {output_path}")
         return
 
-    trimesh.PointCloud(points_out, colors_out).export(output_path)
+    frame_quotas = np.asarray(valid_counts, dtype=np.int64)
+    if max_points is not None and total_valid > max_points:
+        max_points = int(max_points)
+        valid_counts_np = np.asarray(valid_counts, dtype=np.float64)
+        ideal_quotas = valid_counts_np * (max_points / float(total_valid))
+        frame_quotas = np.floor(ideal_quotas).astype(np.int64)
+        remainder = max_points - int(frame_quotas.sum())
+        if remainder > 0:
+            order = np.argsort(-(ideal_quotas - frame_quotas))
+            frame_quotas[order[:remainder]] += 1
+
+    total_vertices = int(frame_quotas.sum())
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    with open(output_path, "wb") as file_obj:
+        _write_binary_ply_header(file_obj, total_vertices)
+        for i in range(num_frames):
+            quota = int(frame_quotas[i])
+            if quota <= 0:
+                continue
+
+            local_i = local_points[i, ::stride, ::stride]
+            conf_i = conf[i, ::stride, ::stride]
+            valid = (conf_i >= threshold_value) & (conf_i > 1e-5) & np.isfinite(local_i).all(axis=-1)
+            if not np.any(valid):
+                continue
+
+            valid_indices = np.flatnonzero(valid.reshape(-1))
+            if quota < len(valid_indices):
+                sample_positions = np.linspace(0, len(valid_indices) - 1, quota, dtype=np.int64)
+                valid_indices = valid_indices[sample_positions]
+
+            local_flat = local_i.reshape(-1, 3)
+            color_i = _image_frame_to_colors(images[i], (height, width))[::stride, ::stride]
+            color_flat = color_i.reshape(-1, 3)
+            world_i = _world_points_from_local_frame(local_flat[valid_indices], extrinsic[i])
+            _write_binary_ply_vertices(file_obj, world_i, color_flat[valid_indices])
+
     print(
-        f"[OUTPUT WRITING] Exported {len(points_out)} dense points to {output_path} "
-        f"(conf percentile={conf_threshold}, value={threshold_value:.4f}, stride={stride})"
+        f"[OUTPUT WRITING] Stream-exported {total_vertices} dense model points to {output_path} "
+        f"(valid={total_valid}, max_points={max_points}, conf percentile={conf_threshold}, "
+        f"value={threshold_value:.4f}, stride={stride})"
     )
 
 
