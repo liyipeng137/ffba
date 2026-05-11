@@ -92,6 +92,7 @@ def parse_args():
     )
     parser.add_argument("--model", type=str, default="pi3x", choices=['vggt', 'pi3', 'pi3x'])
     parser.add_argument("--pi3x_ckpt", type=str, default=None, help="Optional local Pi3X checkpoint path. If omitted, loads yyfz233/Pi3X.")
+    parser.add_argument("--pi3x_intrinsics_method", type=str, default="lstsq", choices=["lstsq", "moge"])
     parser.add_argument("--multi_dirs", action="store_true")
     parser.add_argument("--point_vis_threshold", type=float, default=50.0)
     parser.add_argument("--tracking_type", type=str, default="graph", choices=['graph', 'video'])
@@ -158,7 +159,14 @@ def main():
     model, _ = load_model(args.model, device=device, pi3x_ckpt=args.pi3x_ckpt)
     inf_start = time.time()
 
-    sequence.predictions = run_inference_step_by_step(model, batches, size_hw, device, need_features=False)
+    sequence.predictions = run_inference_step_by_step(
+        model,
+        batches,
+        size_hw,
+        device,
+        need_features=False,
+        pi3x_intrinsics_method=args.pi3x_intrinsics_method,
+    )
     inf_end = time.time()
     del model
 

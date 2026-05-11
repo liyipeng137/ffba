@@ -23,6 +23,7 @@ from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 from vggt.utils.geometry import unproject_depth_map_to_point_map
 from pi3.models.pi3 import Pi3
 from pi3x_model.models.pi3x import Pi3X
+from pi3x_model.utils.transforms_utils import recover_intrinsics_from_output
 
 
 def extrinsic_to_colmap_format(extrinsics):
@@ -549,7 +550,7 @@ def load_model(model_name="vggt", device=None, pi3x_ckpt=None):
 
 
 
-def run_inference_step_by_step(model, batches, size_hw, device, need_features=False):
+def run_inference_step_by_step(model, batches, size_hw, device, need_features=False, pi3x_intrinsics_method="lstsq"):
     """
     Output:
      - extrinsic: (N, 3, 4)
@@ -629,6 +630,9 @@ def run_inference_step_by_step(model, batches, size_hw, device, need_features=Fa
             torch.cuda.empty_cache()
 
     elif isinstance(model, Pi3X):
+        if pi3x_intrinsics_method not in ("lstsq", "moge"):
+            raise ValueError(f"Unsupported pi3x_intrinsics_method: {pi3x_intrinsics_method}")
+
         for i, images in enumerate(batches):
             prediction = dict()
             if images.shape[-2] % 14 != 0 or images.shape[-1] % 14 != 0:
@@ -649,8 +653,14 @@ def run_inference_step_by_step(model, batches, size_hw, device, need_features=Fa
             prediction['depth_conf'] = torch.sigmoid(prediction['depth_conf'])
             prediction['local_points'] = res['local_points'].to(dtype=torch.float32, device='cpu').squeeze(0)
 
-            intrinsic, depth = estimate_intrinsics_and_depth(res['local_points'].squeeze(0))
-            prediction['intrinsic'] = intrinsic.to(dtype=torch.float32, device='cpu')
+            if pi3x_intrinsics_method == "moge":
+                intrinsic = recover_intrinsics_from_output(res)
+                prediction['intrinsic'] = torch.from_numpy(intrinsic).to(dtype=torch.float32, device='cpu')
+                depth = res['local_points'].squeeze(0)[..., 2]
+            else:
+                intrinsic, depth = estimate_intrinsics_and_depth(res['local_points'].squeeze(0))
+                prediction['intrinsic'] = intrinsic.to(dtype=torch.float32, device='cpu')
+
             prediction['depth'] = depth.to(dtype=torch.float32, device='cpu').unsqueeze(0).unsqueeze(-1)
 
             predictions.append(prediction)
