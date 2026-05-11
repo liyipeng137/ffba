@@ -31,6 +31,7 @@ def parse_args():
     parser.add_argument("--max_reproj", type=float, default=8.0)
     parser.add_argument("--stride", type=int, default=100)
     parser.add_argument("--model", type=str, default="vggt")
+    parser.add_argument("--pi3x_ckpt", type=str, default=None, help="Optional local Pi3X checkpoint path. If omitted, loads yyfz233/Pi3X.")
     parser.add_argument("--multi_dirs", action="store_true")
     parser.add_argument("--point_vis_threshold", type=float, default=50.0)
     parser.add_argument("--tracking_type", type=str, default="graph", choices=['graph', 'video'])
@@ -94,7 +95,7 @@ def main():
     torch.cuda.empty_cache()
 
     
-    model, _ = load_model(args.model, device=device)
+    model, _ = load_model(args.model, device=device, pi3x_ckpt=args.pi3x_ckpt)
     inf_start = time.time()
 
     sequence.predictions = run_inference_step_by_step(model, batches, size_hw, device, need_features=False)
@@ -196,6 +197,19 @@ def main():
     elapsed = end_time - start_time
 
     final_predictions['world_points'] = unproject_depth_map_to_point_map(final_predictions['depth'], final_predictions['extrinsic'], final_predictions['intrinsic'])
+    if 'local_points' in final_predictions:
+        final_predictions['world_points_from_local'] = local_point_map_to_world_point_map(
+            final_predictions['local_points'],
+            final_predictions['extrinsic'],
+        )
+        export_dense_point_map_ply(
+            os.path.join(args.output_dir, "dense_model_points.ply"),
+            final_predictions['world_points_from_local'],
+            sequence.images,
+            final_predictions['depth_conf'],
+            conf_threshold=args.point_vis_threshold,
+            stride=1,
+        )
 
     with open(os.path.join(args.output_dir, "computation_stats.txt",), "w")as f:
         f.write(f"Runtime: {elapsed:.4f} seconds\n")

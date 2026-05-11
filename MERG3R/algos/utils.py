@@ -21,6 +21,7 @@ from vggt.utils.load_fn import load_and_preprocess_images
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 from vggt.utils.geometry import unproject_depth_map_to_point_map
 from pi3.models.pi3 import Pi3
+from pi3x_model.models.pi3x import Pi3X
 
 
 def extrinsic_to_colmap_format(extrinsics):
@@ -514,8 +515,8 @@ def write_colmap_points3D_txt(file_path, points3D):
 
 
 
-def load_model(model_name="vggt", device=None):
-    """Load and initialize the VGGT model."""
+def load_model(model_name="vggt", device=None, pi3x_ckpt=None):
+    """Load and initialize a supported geometric foundation model."""
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
@@ -524,6 +525,19 @@ def load_model(model_name="vggt", device=None):
         model = VGGT.from_pretrained("facebook/VGGT-1B")
     elif model_name == 'pi3':
         model = Pi3.from_pretrained("yyfz233/Pi3")
+    elif model_name == 'pi3x':
+        if pi3x_ckpt is None:
+            model = Pi3X.from_pretrained("yyfz233/Pi3X")
+        else:
+            model = Pi3X()
+            if pi3x_ckpt.endswith(".safetensors"):
+                from safetensors.torch import load_file
+                state_dict = load_file(pi3x_ckpt)
+            else:
+                state_dict = torch.load(pi3x_ckpt, map_location="cpu", weights_only=False)
+                if isinstance(state_dict, dict) and "model" in state_dict:
+                    state_dict = state_dict["model"]
+            model.load_state_dict(state_dict, strict=False)
     else:
         raise NotImplementedError("Other model backbones are not implemented!")
 
@@ -599,6 +613,7 @@ def run_inference_step_by_step(model, batches, size_hw, device, need_features=Fa
             prediction['world_points'] = res['points'].to(dtype=torch.float32, device='cpu').squeeze(0)
             prediction['depth_conf'] = res['conf'].to(dtype=torch.float32, device='cpu').squeeze(-1)
             prediction['depth_conf'] = torch.sigmoid(prediction['depth_conf'])
+            prediction['local_points'] = res['local_points'].to(dtype=torch.float32, device='cpu').squeeze(0)
             # prediction['dino_features'] = res['dino_features']
 
             intrinsic, depth = estimate_intrinsics_and_depth(res['local_points'].squeeze(0))
@@ -608,6 +623,38 @@ def run_inference_step_by_step(model, batches, size_hw, device, need_features=Fa
             predictions.append(prediction)
 
             del res, images
+            
+            gc.collect()
+            torch.cuda.empty_cache()
+
+    elif isinstance(model, Pi3X):
+        for i, images in enumerate(batches):
+            prediction = dict()
+            if images.shape[-2] % 14 != 0 or images.shape[-1] % 14 != 0:
+                raise ValueError(
+                    "Pi3X requires image height and width to be multiples of 14. "
+                    f"Got {tuple(images.shape[-2:])} for subset {i}."
+                )
+
+            with torch.no_grad():
+                with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                    images = images[None].to(device)  # add batch dimension
+                    res = model(imgs=images)
+
+            c2w = res['camera_poses'].squeeze(0)
+            prediction['extrinsic'] = remove_homogeneous_row(torch.linalg.inv(c2w)).to(dtype=torch.float32, device='cpu')
+            prediction['world_points'] = res['points'].to(dtype=torch.float32, device='cpu').squeeze(0)
+            prediction['depth_conf'] = res['conf'].to(dtype=torch.float32, device='cpu').squeeze(0).squeeze(-1)
+            prediction['depth_conf'] = torch.sigmoid(prediction['depth_conf'])
+            prediction['local_points'] = res['local_points'].to(dtype=torch.float32, device='cpu').squeeze(0)
+
+            intrinsic, depth = estimate_intrinsics_and_depth(res['local_points'].squeeze(0))
+            prediction['intrinsic'] = intrinsic.to(dtype=torch.float32, device='cpu')
+            prediction['depth'] = depth.to(dtype=torch.float32, device='cpu').unsqueeze(0).unsqueeze(-1)
+
+            predictions.append(prediction)
+
+            del res, images, c2w
             
             gc.collect()
             torch.cuda.empty_cache()
@@ -643,6 +690,77 @@ def compute_depth(points, extrin):
     depth = cam_points[..., 2]
 
     return depth
+
+
+def local_point_map_to_world_point_map(local_points, extrinsic):
+    """
+    Transform per-frame camera-local point maps into world coordinates.
+
+    Args:
+        local_points: (N, H, W, 3), camera coordinates.
+        extrinsic: (N, 3, 4), world-to-camera matrices.
+
+    Returns:
+        world_points: (N, H, W, 3), world coordinates under the current poses.
+    """
+    if isinstance(local_points, torch.Tensor):
+        local_points = local_points.detach().cpu().numpy()
+    if isinstance(extrinsic, torch.Tensor):
+        extrinsic = extrinsic.detach().cpu().numpy()
+
+    N, H, W, _ = local_points.shape
+    w2c = np.tile(np.eye(4, dtype=np.float32), (N, 1, 1))
+    w2c[:, :3, :4] = extrinsic.astype(np.float32)
+    c2w = np.linalg.inv(w2c)
+
+    local_h = np.concatenate(
+        [local_points.astype(np.float32), np.ones((N, H, W, 1), dtype=np.float32)],
+        axis=-1,
+    )
+    return np.einsum("nij,nhwj->nhwi", c2w, local_h)[..., :3]
+
+
+def export_dense_point_map_ply(output_path, points, images, conf, conf_threshold=50.0, stride=1):
+    """
+    Export dense point maps to PLY using a percentile confidence threshold.
+    """
+    if isinstance(images, torch.Tensor):
+        images_np = images.detach().cpu().numpy()
+    else:
+        images_np = images
+
+    S, H, W = points.shape[:3]
+    colors = np.zeros((S, H, W, 3), dtype=np.float32)
+    for i, img in enumerate(images_np):
+        if img.shape[0] == 3:
+            img = np.transpose(img, (1, 2, 0))
+        colors[i] = cv2.resize(img, (W, H))
+
+    conf = np.asarray(conf)
+    threshold_value = 0.0 if conf_threshold == 0.0 else np.percentile(conf, conf_threshold)
+    mask = (conf >= threshold_value) & (conf > 1e-5)
+
+    if stride > 1:
+        stride_mask = np.zeros_like(mask, dtype=bool)
+        stride_mask[:, ::stride, ::stride] = True
+        mask = mask & stride_mask
+
+    points_flat = points.reshape(-1, 3)
+    colors_flat = (colors.reshape(-1, 3) * 255).clip(0, 255).astype(np.uint8)
+    mask_flat = mask.reshape(-1)
+
+    points_out = points_flat[mask_flat]
+    colors_out = colors_flat[mask_flat]
+
+    if len(points_out) == 0:
+        print(f"[OUTPUT WRITING] No dense points passed filtering for {output_path}")
+        return
+
+    trimesh.PointCloud(points_out, colors_out).export(output_path)
+    print(
+        f"[OUTPUT WRITING] Exported {len(points_out)} dense points to {output_path} "
+        f"(conf percentile={conf_threshold}, value={threshold_value:.4f}, stride={stride})"
+    )
 
 
 @torch.no_grad()

@@ -206,6 +206,8 @@ class Sequence(ABC):
 
         transformed_node['extrinsic'] = converted_extri
         transformed_node['depth'] *= scale
+        if 'local_points' in transformed_node:
+            transformed_node['local_points'] *= scale
         intrinsic = transformed_node['intrinsic']
         # intrinsic[:, 0, 0], intrinsic[:, 1, 1] = intrinsic[:, 0, 0] / scale, intrinsic[:, 1, 1] / scale
         transformed_node['intrinsic'] = intrinsic
