@@ -33,10 +33,10 @@ def parse_args():
     parser.add_argument(
         "--dense_max_points",
         type=int,
-        default=2_000_000,
+        default=20_000_000,
         help="Maximum points to export in dense_model_points.ply. Set <=0 to disable.",
     )
-    parser.add_argument("--model", type=str, default="vggt")
+    parser.add_argument("--model", type=str, default="vggt", choices=['vggt', 'pi3', 'pi3x'])
     parser.add_argument("--pi3x_ckpt", type=str, default=None, help="Optional local Pi3X checkpoint path. If omitted, loads yyfz233/Pi3X.")
     parser.add_argument("--multi_dirs", action="store_true")
     parser.add_argument("--point_vis_threshold", type=float, default=50.0)
