@@ -2,6 +2,7 @@ import copy
 import gc
 import os
 import glob
+from pyexpat import model
 import shutil
 import tempfile
 import time
@@ -357,7 +358,7 @@ def write_colmap_cameras_txt(file_path, intrinsics, image_width, image_height):
 
 
 def write_colmap_images_txt(
-    file_path, quaternions, translations, image_points2D, image_names
+    file_path, quaternions, translations, image_points2D, image_names, shared_camera=False
 ):
     """Write camera poses and keypoints to COLMAP images.txt format."""
     with open(file_path, "w") as f:
@@ -373,7 +374,7 @@ def write_colmap_images_txt(
 
         for i in range(len(quaternions)):
             image_id = i + 1
-            camera_id = i + 1
+            camera_id = 1 if shared_camera else i + 1
 
             qw, qx, qy, qz = quaternions[i]
             tx, ty, tz = translations[i]
@@ -418,7 +419,7 @@ def write_colmap_cameras_bin(file_path, intrinsics, image_width, image_height):
             # Parameters (double)
             fid.write(struct.pack('<dddd', fx, fy, cx, cy))
 
-def write_colmap_images_bin(file_path, quaternions, translations, image_points2D, image_names):
+def write_colmap_images_bin(file_path, quaternions, translations, image_points2D, image_names, shared_camera=False):
     """Write camera poses and keypoints to COLMAP images.bin format."""
     with open(file_path, 'wb') as fid:
         # Write number of images (uint64)
@@ -426,7 +427,7 @@ def write_colmap_images_bin(file_path, quaternions, translations, image_points2D
         
         for i in range(len(quaternions)):
             image_id = i + 1
-            camera_id = i + 1
+            camera_id = 1 if shared_camera else i + 1
             
             qw, qx, qy, qz = quaternions[i].astype(float)
             tx, ty, tz = translations[i].astype(float)
@@ -942,35 +943,38 @@ def remove_homogeneous_row(matrix: torch.Tensor) -> torch.Tensor:
         raise ValueError("Invalid input shape.")
     
 
-def output_to_colmap(predictions, img_names, output_dir, image_points2D, points3D, idx=None, format="txt"):
+def output_to_colmap(predictions, img_names, output_dir, image_points2D, points3D, idx=None, format="txt", shared_camera=False):
     name = "colmap" if idx is None else f"colmap_{idx}"
     quaternions, translations = extrinsic_to_colmap_format(predictions['extrinsic'])
     
     height, width = predictions["depth"].shape[1:3]
     os.makedirs(os.path.join(output_dir, name), exist_ok=True)
+    intrinsics = predictions["intrinsic"]
+    if shared_camera:
+        intrinsics = np.mean(intrinsics, axis=0, keepdims=True)
     if format == "txt":
         write_colmap_cameras_txt(
         os.path.join(output_dir, name, "cameras.txt"), 
-        predictions["intrinsic"], width, height)
+        intrinsics, width, height)
         write_colmap_images_txt(
             os.path.join(output_dir, name, "images.txt"), 
-            quaternions, translations, image_points2D, img_names)
+            quaternions, translations, image_points2D, img_names, shared_camera=shared_camera)
         write_colmap_points3D_txt(
             os.path.join(output_dir, name, "points3D.txt"), 
             points3D)
     elif format == "bin":
         write_colmap_cameras_bin(
             os.path.join(output_dir, name, "cameras.bin"), 
-            predictions["intrinsic"], width, height)
+            intrinsics, width, height)
         write_colmap_images_bin(
             os.path.join(output_dir, name, "images.bin"), 
-            quaternions, translations, image_points2D, img_names)
+            quaternions, translations, image_points2D, img_names, shared_camera=shared_camera)
         write_colmap_points3D_bin(
             os.path.join(output_dir, name, "points3D.bin"), 
             points3D)
 
 
-def write_recon_to_colmap(output_dir, predictions, images, names, stride=100, conf_threshold=50.0, format="txt"):
+def write_recon_to_colmap(output_dir, predictions, images, names, stride=100, conf_threshold=50.0, format="txt", shared_camera=False):
     size_hw = images.shape[-2:]
     if "extrinsic" not in predictions.keys():
         extrinsic, intrinsic = pose_encoding_to_extri_intri(predictions["pose_enc"], size_hw)
@@ -1023,7 +1027,7 @@ def write_recon_to_colmap(output_dir, predictions, images, names, stride=100, co
         points_3d.append((x, y, z))
         points_rgb.append((r, g, b, 1))
     trimesh.PointCloud(points_3d, points_rgb).export(os.path.join(output_dir, "points.ply"))
-    output_to_colmap(predictions, names, output_dir, image_points2D, points3D, format=format)
+    output_to_colmap(predictions, names, output_dir, image_points2D, points3D, format=format, shared_camera=shared_camera)
 
 
 def restore_predictions_order(predictions):
@@ -1130,7 +1134,7 @@ def process_images(image_dir, subsample, device, num_images, multi_dirs=False):
         img = Image.open(img_path).convert('RGB')
         original_images.append(np.array(img))
     
-    images = load_and_preprocess_images(image_names).to(device)
+    images = load_and_preprocess_images(image_names, mode="raw").to(device)
 
     print(f"[UTILS] Preprocessed images shape: {images.shape}")
     

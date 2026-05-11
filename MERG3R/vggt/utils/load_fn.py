@@ -126,7 +126,7 @@ def load_and_preprocess_images(image_path_list, mode="crop"):
         raise ValueError("At least 1 image is required")
 
     # Validate mode
-    if mode not in ["crop", "pad"]:
+    if mode not in ["crop", "pad", "raw"]:
         raise ValueError("Mode must be either 'crop' or 'pad'")
 
     images = []
@@ -150,6 +150,12 @@ def load_and_preprocess_images(image_path_list, mode="crop"):
         img = img.convert("RGB")
 
         width, height = img.size
+
+        if mode == "raw":
+            img = to_tensor(img)
+            images.append(img)
+            shapes.add((img.shape[1], img.shape[2]))
+            continue
 
         if mode == "pad":
             # Make the largest dimension 518px while maintaining aspect ratio
