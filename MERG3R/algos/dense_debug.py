@@ -260,7 +260,7 @@ def build_sparse_dense_anchor_diagnostics(predictions, images, track, points_id,
     return observations, frame_observations
 
 
-def export_dense_debug_outputs(
+def d(
     output_dir,
     predictions,
     images,
