@@ -858,6 +858,255 @@ def export_dense_local_point_map_ply(
     )
 
 
+def project_world_points_to_depth(world_points, extrinsic, intrinsics, image_size, chunk_size=1_000_000):
+    """
+    Project world-space points into each camera and build depth maps via z-buffer.
+
+    Args:
+        world_points: (P, 3) merged dense world points.
+        extrinsic:    (N, 3, 4) or (N, 4, 4) world-to-camera matrices.
+        intrinsics:   (N, 3, 3) camera intrinsics.
+        image_size:   (H, W).
+    Returns:
+        depth_maps: (N, H, W), metric camera-space z depth.
+    """
+    world_points = np.asarray(world_points, dtype=np.float32)
+    extrinsic = np.asarray(extrinsic, dtype=np.float32)
+    intrinsics = np.asarray(intrinsics, dtype=np.float32)
+    H, W = image_size
+    N = extrinsic.shape[0]
+    depth_maps = np.zeros((N, H, W), dtype=np.float32)
+
+    if world_points.size == 0:
+        return depth_maps
+    if world_points.ndim != 2 or world_points.shape[1] != 3:
+        raise ValueError(f"Expected world_points shape (P, 3), got {world_points.shape}")
+    if extrinsic.ndim != 3 or extrinsic.shape[-2:] not in ((3, 4), (4, 4)):
+        raise ValueError(f"Expected extrinsic shape (N, 3, 4) or (N, 4, 4), got {extrinsic.shape}")
+    if intrinsics.shape != (N, 3, 3):
+        raise ValueError(f"Expected intrinsics shape ({N}, 3, 3), got {intrinsics.shape}")
+    if chunk_size <= 0:
+        raise ValueError(f"chunk_size must be positive, got {chunk_size}")
+
+    for i in range(N):
+        w2c = extrinsic[i, :3, :4].astype(np.float32, copy=False)
+        R = w2c[:, :3]
+        t = w2c[:, 3]
+        K = intrinsics[i].astype(np.float32, copy=False)
+        depth_flat = np.full(H * W, np.inf, dtype=np.float32)
+
+        for start in range(0, world_points.shape[0], chunk_size):
+            points = world_points[start : start + chunk_size]
+            cam_points = points @ R.T + t
+            z = cam_points[:, 2]
+            valid = np.isfinite(z) & (z > 1e-6)
+            if not np.any(valid):
+                continue
+
+            cam_points = cam_points[valid]
+            z = z[valid].astype(np.float32, copy=False)
+            u = K[0, 0] * (cam_points[:, 0] / z) + K[0, 2]
+            v = K[1, 1] * (cam_points[:, 1] / z) + K[1, 2]
+
+            valid_uv = np.isfinite(u) & np.isfinite(v)
+            if not np.any(valid_uv):
+                continue
+
+            u = np.rint(u[valid_uv]).astype(np.int32)
+            v = np.rint(v[valid_uv]).astype(np.int32)
+            z = z[valid_uv]
+
+            in_bounds = (u >= 0) & (u < W) & (v >= 0) & (v < H)
+            if not np.any(in_bounds):
+                continue
+
+            idx = v[in_bounds] * W + u[in_bounds]
+            np.minimum.at(depth_flat, idx, z[in_bounds])
+
+        depth = depth_flat.reshape(H, W)
+        depth[~np.isfinite(depth)] = 0.0
+        depth_maps[i] = depth
+
+    return depth_maps
+
+
+def save_depth_pngs(depth_np, image_names, output_dir):
+    """
+    Save depth maps in three formats:
+      1) uint16 millimeter PNGs under depth_u16
+      2) uint8 pseudo-color PNGs under depth_vis
+      3) float32 NPY files under depth_npy
+    """
+    depth_u16_dir = os.path.join(output_dir, "depth_u16")
+    depth_vis_dir = os.path.join(output_dir, "depth_vis")
+    depth_npy_dir = os.path.join(output_dir, "depth_npy")
+    os.makedirs(depth_u16_dir, exist_ok=True)
+    os.makedirs(depth_vis_dir, exist_ok=True)
+    os.makedirs(depth_npy_dir, exist_ok=True)
+
+    for idx in range(depth_np.shape[0]):
+        depth_frame = np.nan_to_num(depth_np[idx], nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
+        depth_u16 = np.clip(depth_frame * 1000.0, 0, np.iinfo(np.uint16).max).astype(np.uint16)
+
+        if idx < len(image_names):
+            stem = os.path.splitext(os.path.basename(str(image_names[idx])))[0]
+        else:
+            stem = f"frame_{idx:04d}"
+        base_name = stem + ".png"
+
+        cv2.imwrite(os.path.join(depth_u16_dir, base_name), depth_u16)
+        np.save(os.path.join(depth_npy_dir, stem + ".npy"), depth_frame.astype(np.float32, copy=False))
+
+        valid_mask = np.isfinite(depth_frame) & (depth_frame > 0)
+        if np.any(valid_mask):
+            d = depth_frame[valid_mask]
+            d_min = np.percentile(d, 2.0)
+            d_max = np.percentile(d, 98.0)
+            if d_max <= d_min:
+                d_max = d_min + 1e-6
+
+            depth_norm = (depth_frame - d_min) / (d_max - d_min)
+            depth_norm = np.clip(depth_norm, 0.0, 1.0)
+            depth_vis_u8 = (depth_norm * 255.0).astype(np.uint8)
+            depth_vis_u8[~valid_mask] = 0
+            depth_color = cv2.applyColorMap(depth_vis_u8, cv2.COLORMAP_TURBO)
+        else:
+            h, w = depth_frame.shape[:2]
+            depth_color = np.zeros((h, w, 3), dtype=np.uint8)
+
+        cv2.imwrite(os.path.join(depth_vis_dir, base_name), depth_color)
+
+
+def export_dense_projected_depth_maps(
+    output_dir,
+    local_points,
+    extrinsic,
+    intrinsic,
+    image_names,
+    conf,
+    conf_threshold=50.0,
+    stride=1,
+    max_points=20_000_000,
+    chunk_size=1_000_000,
+):
+    """
+    Merge dense local point maps with final poses, project the merged cloud to every camera,
+    and save per-view depth maps.
+    """
+    if isinstance(local_points, torch.Tensor):
+        local_points = local_points.detach().cpu().numpy()
+    if isinstance(extrinsic, torch.Tensor):
+        extrinsic = extrinsic.detach().cpu().numpy()
+    if isinstance(intrinsic, torch.Tensor):
+        intrinsic = intrinsic.detach().cpu().numpy()
+    if isinstance(conf, torch.Tensor):
+        conf = conf.detach().cpu().numpy()
+
+    local_points = np.asarray(local_points, dtype=np.float32)
+    extrinsic = np.asarray(extrinsic, dtype=np.float32)
+    intrinsic = np.asarray(intrinsic, dtype=np.float32)
+    conf = np.asarray(conf)
+    if conf.ndim == 4 and conf.shape[-1] == 1:
+        conf = conf[..., 0]
+
+    if stride < 1:
+        raise ValueError(f"stride must be >= 1, got {stride}")
+    if max_points is not None and max_points <= 0:
+        raise ValueError(f"max_points must be positive or None, got {max_points}")
+
+    num_frames, height, width, _ = local_points.shape
+    if conf.shape[:3] != (num_frames, height, width):
+        raise ValueError(
+            "Confidence shape must match local_points spatial shape. "
+            f"Got conf={conf.shape}, local_points={local_points.shape}."
+        )
+    if len(extrinsic) != num_frames or len(intrinsic) != num_frames:
+        raise ValueError(
+            f"Expected {num_frames} camera matrices, got extrinsic={len(extrinsic)}, intrinsic={len(intrinsic)}"
+        )
+
+    threshold_value = 0.0 if conf_threshold == 0.0 else np.percentile(conf, conf_threshold)
+    valid_counts = []
+    for i in range(num_frames):
+        conf_i = conf[i, ::stride, ::stride]
+        local_i = local_points[i, ::stride, ::stride]
+        valid = (conf_i >= threshold_value) & (conf_i > 1e-5) & np.isfinite(local_i).all(axis=-1)
+        valid_counts.append(int(np.count_nonzero(valid)))
+
+    total_valid = int(np.sum(valid_counts))
+    if total_valid == 0:
+        print(f"[DEPTH EXPORT] No dense points passed filtering for {output_dir}")
+        return {
+            "num_depth_frames": int(num_frames),
+            "num_merged_points": 0,
+            "num_valid_points_before_cap": 0,
+            "num_nonzero_depth_pixels": 0,
+            "output_dir": output_dir,
+        }
+
+    frame_quotas = np.asarray(valid_counts, dtype=np.int64)
+    if max_points is not None and total_valid > max_points:
+        max_points = int(max_points)
+        valid_counts_np = np.asarray(valid_counts, dtype=np.float64)
+        ideal_quotas = valid_counts_np * (max_points / float(total_valid))
+        frame_quotas = np.floor(ideal_quotas).astype(np.int64)
+        remainder = max_points - int(frame_quotas.sum())
+        if remainder > 0:
+            order = np.argsort(-(ideal_quotas - frame_quotas))
+            frame_quotas[order[:remainder]] += 1
+
+    total_points = int(frame_quotas.sum())
+    world_points = np.empty((total_points, 3), dtype=np.float32)
+    offset = 0
+    for i in range(num_frames):
+        quota = int(frame_quotas[i])
+        if quota <= 0:
+            continue
+
+        local_i = local_points[i, ::stride, ::stride]
+        conf_i = conf[i, ::stride, ::stride]
+        valid = (conf_i >= threshold_value) & (conf_i > 1e-5) & np.isfinite(local_i).all(axis=-1)
+        if not np.any(valid):
+            continue
+
+        valid_indices = np.flatnonzero(valid.reshape(-1))
+        if quota < len(valid_indices):
+            sample_positions = np.linspace(0, len(valid_indices) - 1, quota, dtype=np.int64)
+            valid_indices = valid_indices[sample_positions]
+
+        local_flat = local_i.reshape(-1, 3)
+        world_i = _world_points_from_local_frame(local_flat[valid_indices], extrinsic[i])
+        world_points[offset : offset + len(world_i)] = world_i
+        offset += len(world_i)
+
+    if offset != total_points:
+        world_points = world_points[:offset]
+        total_points = int(offset)
+
+    depth_np = project_world_points_to_depth(
+        world_points=world_points,
+        extrinsic=extrinsic,
+        intrinsics=intrinsic,
+        image_size=(height, width),
+        chunk_size=chunk_size,
+    )
+    save_depth_pngs(depth_np=depth_np, image_names=image_names, output_dir=output_dir)
+
+    nonzero_pixels = int(np.count_nonzero(depth_np > 0))
+    print(
+        f"[DEPTH EXPORT] Saved projected dense depth maps to {output_dir} "
+        f"(frames={num_frames}, points={total_points}, valid={total_valid}, "
+        f"nonzero_pixels={nonzero_pixels}, conf percentile={conf_threshold}, value={threshold_value:.4f})"
+    )
+    return {
+        "num_depth_frames": int(num_frames),
+        "num_merged_points": int(total_points),
+        "num_valid_points_before_cap": int(total_valid),
+        "num_nonzero_depth_pixels": nonzero_pixels,
+        "output_dir": output_dir,
+    }
+
+
 @torch.no_grad()
 def estimate_intrinsics_and_depth(points: torch.Tensor):
     """

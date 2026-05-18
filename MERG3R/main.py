@@ -9,6 +9,8 @@ from algos.sequence import create_sequence
 from algos.bundle_adjustment import global_bundle_adjustment
 from algos.alignment import align_extrinsics
 from algos.tracking import  extract_matches_lightglue, graph_extract_matches_lightglue
+from algos.dense_debug import export_dense_debug_outputs
+from algos.dense_correction import apply_inverse_depth_affine_correction
 from bae_pipe import run_bae_refinement
 
 
@@ -90,6 +92,79 @@ def parse_args():
         default=20_000_000,
         help="Maximum points to export in dense_model_points.ply. Set <=0 to disable.",
     )
+    parser.add_argument(
+        "--save_dense_depth",
+        dest="save_dense_depth",
+        action="store_true",
+        default=True,
+        help="Save per-camera depth maps projected from the merged dense point cloud.",
+    )
+    parser.add_argument(
+        "--no_save_dense_depth",
+        dest="save_dense_depth",
+        action="store_false",
+        help="Disable per-camera depth maps projected from the merged dense point cloud.",
+    )
+    parser.add_argument(
+        "--dense_depth_dir",
+        type=str,
+        default=None,
+        help="Directory for projected dense depth maps. Defaults to <output_dir>/dense_depth.",
+    )
+    parser.add_argument(
+        "--dense_depth_max_points",
+        type=int,
+        default=-1,
+        help="Maximum merged dense points to use for projected depth. Set <=0 to reuse --dense_max_points.",
+    )
+    parser.add_argument(
+        "--dense_depth_stride",
+        type=int,
+        default=1,
+        help="Pixel stride when collecting dense points for projected depth maps.",
+    )
+    parser.add_argument(
+        "--dense_depth_chunk_size",
+        type=int,
+        default=1_000_000,
+        help="Projection chunk size for dense depth export.",
+    )
+    parser.add_argument(
+        "--dense_debug",
+        dest="dense_debug",
+        action="store_true",
+        default=True,
+        help="Export sparse-dense residual diagnostics after global BA/BAE.",
+    )
+    parser.add_argument(
+        "--no_dense_debug",
+        dest="dense_debug",
+        action="store_false",
+        help="Disable sparse-dense residual diagnostics.",
+    )
+    parser.add_argument(
+        "--dense_debug_max_points",
+        type=int,
+        default=2_000_000,
+        help="Maximum points to export in dense_debug/dense_before_correction.ply. Set <=0 to disable.",
+    )
+    parser.add_argument(
+        "--dense_correction",
+        type=str,
+        default="none",
+        choices=["none", "invz_affine"],
+        help="Dense local point correction method to run after global BA/BAE.",
+    )
+    parser.add_argument("--dense_correction_min_anchors", type=int, default=50)
+    parser.add_argument("--dense_correction_alpha", type=float, default=0.75)
+    parser.add_argument("--dense_correction_conf_quantile", type=float, default=0.2)
+    parser.add_argument("--dense_correction_edge_quantile", type=float, default=0.8)
+    parser.add_argument("--dense_correction_residual_mad_k", type=float, default=3.5)
+    parser.add_argument("--dense_correction_scale_min", type=float, default=0.5)
+    parser.add_argument("--dense_correction_scale_max", type=float, default=2.0)
+    parser.add_argument("--dense_correction_bias_abs_max", type=float, default=0.25)
+    parser.add_argument("--dense_correction_depth_ratio_min", type=float, default=0.7)
+    parser.add_argument("--dense_correction_depth_ratio_max", type=float, default=1.3)
     parser.add_argument("--model", type=str, default="pi3x", choices=['vggt', 'pi3', 'pi3x'])
     parser.add_argument("--pi3x_ckpt", type=str, default=None, help="Optional local Pi3X checkpoint path. If omitted, loads yyfz233/Pi3X.")
     parser.add_argument("--pi3x_intrinsics_method", type=str, default="lstsq", choices=["lstsq", "moge"])
@@ -110,6 +185,24 @@ def main():
     args = parse_args()
 
     args_dict = vars(args)
+    if args.dense_correction != "none" and not args.global_ba:
+        raise ValueError("--dense_correction requires --global_ba so sparse tracks and BA points are available")
+    if args.dense_correction_depth_ratio_min <= 0 or args.dense_correction_depth_ratio_max <= 0:
+        raise ValueError("Dense correction depth ratio bounds must be positive.")
+    if args.dense_correction_depth_ratio_min > args.dense_correction_depth_ratio_max:
+        raise ValueError("--dense_correction_depth_ratio_min must be <= --dense_correction_depth_ratio_max")
+    if not 0 <= args.dense_correction_alpha <= 1:
+        raise ValueError("--dense_correction_alpha must be in [0, 1]")
+    if not 0 <= args.dense_correction_conf_quantile <= 1:
+        raise ValueError("--dense_correction_conf_quantile must be in [0, 1]")
+    if not 0 <= args.dense_correction_edge_quantile <= 1:
+        raise ValueError("--dense_correction_edge_quantile must be in [0, 1]")
+    if args.dense_correction_scale_min > args.dense_correction_scale_max:
+        raise ValueError("--dense_correction_scale_min must be <= --dense_correction_scale_max")
+    if args.dense_depth_stride < 1:
+        raise ValueError("--dense_depth_stride must be >= 1")
+    if args.dense_depth_chunk_size < 1:
+        raise ValueError("--dense_depth_chunk_size must be >= 1")
     
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required to run this pipeline. No CUDA device was detected.")
@@ -311,6 +404,41 @@ def main():
     peak_mem = torch.cuda.max_memory_allocated() / (1024**2)  # in MiB
     elapsed = end_time - start_time
 
+    dense_debug_stats = None
+    if args.dense_debug and args.global_ba:
+        dense_debug_stats = export_dense_debug_outputs(
+            args.output_dir,
+            final_predictions,
+            sequence.images,
+            sequence.image_names,
+            track,
+            points_id,
+            valid_track_mask=valid_track_mask,
+            dense_max_points=args.dense_debug_max_points if args.dense_debug_max_points > 0 else None,
+        )
+
+    dense_correction_stats = None
+    if args.dense_correction == "invz_affine":
+        dense_correction_stats = apply_inverse_depth_affine_correction(
+            final_predictions,
+            sequence.images,
+            sequence.image_names,
+            track,
+            points_id,
+            valid_track_mask=valid_track_mask,
+            output_dir=args.output_dir,
+            min_anchors_per_frame=args.dense_correction_min_anchors,
+            alpha=args.dense_correction_alpha,
+            conf_quantile=args.dense_correction_conf_quantile,
+            edge_quantile=args.dense_correction_edge_quantile,
+            residual_mad_k=args.dense_correction_residual_mad_k,
+            scale_min=args.dense_correction_scale_min,
+            scale_max=args.dense_correction_scale_max,
+            bias_abs_max=args.dense_correction_bias_abs_max,
+            depth_ratio_min=args.dense_correction_depth_ratio_min,
+            depth_ratio_max=args.dense_correction_depth_ratio_max,
+        )
+
     if 'local_points' in final_predictions:
         export_dense_local_point_map_ply(
             os.path.join(args.output_dir, "dense_model_points.ply"),
@@ -321,6 +449,27 @@ def main():
             conf_threshold=args.point_vis_threshold,
             stride=1,
             max_points=args.dense_max_points if args.dense_max_points > 0 else None,
+        )
+
+    dense_depth_stats = None
+    if args.save_dense_depth and 'local_points' in final_predictions:
+        dense_depth_dir = args.dense_depth_dir or os.path.join(args.output_dir, "dense_depth")
+        dense_depth_max_points = (
+            args.dense_depth_max_points
+            if args.dense_depth_max_points > 0
+            else (args.dense_max_points if args.dense_max_points > 0 else None)
+        )
+        dense_depth_stats = export_dense_projected_depth_maps(
+            dense_depth_dir,
+            final_predictions['local_points'],
+            final_predictions['extrinsic'],
+            final_predictions['intrinsic'],
+            sequence.image_names,
+            final_predictions['depth_conf'],
+            conf_threshold=args.point_vis_threshold,
+            stride=args.dense_depth_stride,
+            max_points=dense_depth_max_points,
+            chunk_size=args.dense_depth_chunk_size,
         )
 
     with open(os.path.join(args.output_dir, "computation_stats.txt",), "w")as f:
@@ -340,6 +489,19 @@ def main():
             f.write(f"BAE Cameras: {bae_stats['num_cameras']}\n")
             f.write(f"BAE Dropped Cameras: {bae_stats['num_dropped_cameras']}\n")
             f.write(f"BAE Points: {bae_stats['num_points']}\n")
+        if dense_debug_stats is not None:
+            f.write(f"Dense Debug Observations: {dense_debug_stats['num_observations']}\n")
+            f.write(f"Dense Debug Frames With Anchors: {dense_debug_stats['num_frames_with_anchors']}\n")
+        if dense_correction_stats is not None:
+            f.write(f"Dense Correction Method: {dense_correction_stats['method']}\n")
+            f.write(f"Dense Correction Corrected Frames: {dense_correction_stats['corrected_frames']}\n")
+            f.write(f"Dense Correction Skipped Frames: {dense_correction_stats['skipped_frames']}\n")
+            f.write(f"Dense Correction Clamped Frames: {dense_correction_stats['clamped_frames']}\n")
+        if dense_depth_stats is not None:
+            f.write(f"Dense Depth Frames: {dense_depth_stats['num_depth_frames']}\n")
+            f.write(f"Dense Depth Merged Points: {dense_depth_stats['num_merged_points']}\n")
+            f.write(f"Dense Depth Nonzero Pixels: {dense_depth_stats['num_nonzero_depth_pixels']}\n")
+            f.write(f"Dense Depth Output Dir: {dense_depth_stats['output_dir']}\n")
         f.write(f"Peak GPU memory: {peak_mem:.2f} MiB\n")
 
     write_recon_to_colmap(
