@@ -148,3 +148,4 @@ skyseg.onnx
 .pixi
 *.egg-info
 
+./pi3x/
