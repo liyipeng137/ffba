@@ -211,3 +211,4 @@ gtsam-develop/
 *.json
 LoGeR/
 logs/
+.todelete/
