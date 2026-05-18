@@ -11,6 +11,7 @@ from algos.alignment import align_extrinsics
 from algos.tracking import  extract_matches_lightglue, graph_extract_matches_lightglue
 from algos.dense_debug import export_dense_debug_outputs
 from algos.dense_correction import apply_inverse_depth_affine_correction
+from algos.lingbot_depth_refine import run_lingbot_depth_refinement
 from bae_pipe import run_bae_refinement
 
 
@@ -89,7 +90,7 @@ def parse_args():
     parser.add_argument(
         "--dense_max_points",
         type=int,
-        default=20_000_000,
+        default=50_000_000,
         help="Maximum points to export in dense_model_points.ply. Set <=0 to disable.",
     )
     parser.add_argument(
@@ -115,19 +116,59 @@ def parse_args():
         "--dense_depth_max_points",
         type=int,
         default=-1,
-        help="Maximum merged dense points to use for projected depth. Set <=0 to reuse --dense_max_points.",
+        help="Maximum points from the shared dense_model_points set to use for projected depth. Set <=0 to use all shared points.",
     )
     parser.add_argument(
         "--dense_depth_stride",
         type=int,
         default=1,
-        help="Pixel stride when collecting dense points for projected depth maps.",
+        help="Pixel stride when collecting the shared dense_model_points set if dense depth export is enabled.",
     )
     parser.add_argument(
         "--dense_depth_chunk_size",
         type=int,
         default=1_000_000,
         help="Projection chunk size for dense depth export. Set -1 to disable chunking.",
+    )
+    parser.add_argument(
+        "--dense_depth_camera_batch_size",
+        type=int,
+        default=4,
+        help="Number of cameras projected together on CUDA for dense depth export.",
+    )
+    parser.add_argument(
+        "--dense_depth_backend",
+        type=str,
+        default="cuda",
+        choices=["cuda", "cpu"],
+        help="Projection backend for dense depth export.",
+    )
+    parser.add_argument(
+        "--lingbot_refine",
+        action="store_true",
+        help="Run LingBot-Depth refinement after projected dense depth export.",
+    )
+    parser.add_argument(
+        "--lingbot_output_dir",
+        type=str,
+        default=None,
+        help="Directory for LingBot-Depth refined outputs. Defaults to <output_dir>/lingbot_depth.",
+    )
+    parser.add_argument(
+        "--lingbot_model",
+        type=str,
+        default="robbyant/lingbot-depth-pretrain-vitl-14-v0.5",
+        help="LingBot-Depth model path or Hugging Face ID.",
+    )
+    parser.add_argument(
+        "--lingbot_no_fp16",
+        action="store_true",
+        help="Disable LingBot-Depth mixed precision inference.",
+    )
+    parser.add_argument(
+        "--lingbot_enable_depth_mask",
+        action="store_true",
+        help="Enable LingBot-Depth depth token masking during refinement.",
     )
     parser.add_argument(
         "--dense_debug",
@@ -203,6 +244,10 @@ def main():
         raise ValueError("--dense_depth_stride must be >= 1")
     if args.dense_depth_chunk_size == 0 or args.dense_depth_chunk_size < -1:
         raise ValueError("--dense_depth_chunk_size must be positive, or -1 for no chunking")
+    if args.dense_depth_camera_batch_size < 1:
+        raise ValueError("--dense_depth_camera_batch_size must be >= 1")
+    if args.lingbot_refine and not args.save_dense_depth:
+        raise ValueError("--lingbot_refine requires projected dense depth export; remove --no_save_dense_depth")
     
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required to run this pipeline. No CUDA device was detected.")
@@ -439,38 +484,93 @@ def main():
             depth_ratio_max=args.dense_correction_depth_ratio_max,
         )
 
+    dense_world_points = None
+    dense_world_colors = None
+    dense_world_stats = None
+    dense_collect_start = 0
+    dense_collect_end = 0
+    dense_ply_start = 0
+    dense_ply_end = 0
+    dense_depth_start = 0
+    dense_depth_end = 0
     if 'local_points' in final_predictions:
-        export_dense_local_point_map_ply(
-            os.path.join(args.output_dir, "dense_model_points.ply"),
+        dense_collect_start = time.time()
+        dense_world_points, dense_world_colors, dense_world_stats = collect_dense_world_points(
             final_predictions['local_points'],
             final_predictions['extrinsic'],
             sequence.images,
             final_predictions['depth_conf'],
             conf_threshold=args.point_vis_threshold,
-            stride=1,
+            stride=args.dense_depth_stride if args.save_dense_depth else 1,
             max_points=args.dense_max_points if args.dense_max_points > 0 else None,
+            include_colors=True,
         )
+        dense_collect_end = time.time()
+        if len(dense_world_points) == 0:
+            print("[OUTPUT WRITING] No dense points passed filtering for dense_model_points.ply")
+        else:
+            dense_ply_start = time.time()
+            export_dense_world_points_ply(
+                os.path.join(args.output_dir, "dense_model_points.ply"),
+                dense_world_points,
+                dense_world_colors,
+                stats=dense_world_stats,
+            )
+            dense_ply_end = time.time()
 
     dense_depth_stats = None
-    if args.save_dense_depth and 'local_points' in final_predictions:
-        dense_depth_dir = args.dense_depth_dir or os.path.join(args.output_dir, "dense_depth")
-        dense_depth_max_points = (
-            args.dense_depth_max_points
-            if args.dense_depth_max_points > 0
-            else (args.dense_max_points if args.dense_max_points > 0 else None)
-        )
+    dense_depth_dir = args.dense_depth_dir or os.path.join(args.output_dir, "dense_depth")
+    if args.save_dense_depth and dense_world_points is not None:
+        dense_depth_start = time.time()
+        dense_depth_world_points = dense_world_points
+        if args.dense_depth_max_points > 0 and len(dense_depth_world_points) > args.dense_depth_max_points:
+            sample_indices = np.linspace(
+                0,
+                len(dense_depth_world_points) - 1,
+                args.dense_depth_max_points,
+                dtype=np.int64,
+            )
+            dense_depth_world_points = dense_depth_world_points[sample_indices]
         dense_depth_stats = export_dense_projected_depth_maps(
             dense_depth_dir,
-            final_predictions['local_points'],
+            None,
             final_predictions['extrinsic'],
             final_predictions['intrinsic'],
             sequence.image_names,
-            final_predictions['depth_conf'],
-            conf_threshold=args.point_vis_threshold,
-            stride=args.dense_depth_stride,
-            max_points=dense_depth_max_points,
+            None,
             chunk_size=args.dense_depth_chunk_size,
+            world_points=dense_depth_world_points,
+            image_size=tuple(final_predictions['local_points'].shape[1:3]),
+            backend=args.dense_depth_backend,
+            camera_batch_size=args.dense_depth_camera_batch_size,
         )
+        dense_depth_end = time.time()
+
+    lingbot_start = 0
+    lingbot_end = 0
+    lingbot_stats = None
+    if args.lingbot_refine:
+        if dense_depth_stats is None:
+            raise RuntimeError("LingBot-Depth refinement requires projected dense depth outputs, but none were produced.")
+        lingbot_start = time.time()
+        lingbot_output_dir = args.lingbot_output_dir or os.path.join(args.output_dir, "lingbot_depth")
+        shared_intrinsic = np.mean(np.asarray(final_predictions['intrinsic'], dtype=np.float32), axis=0)
+        lingbot_stats = run_lingbot_depth_refinement(
+            sequence.images,
+            sequence.image_names,
+            os.path.join(dense_depth_dir, "depth_npy"),
+            lingbot_output_dir,
+            shared_intrinsic,
+            model_name=args.lingbot_model,
+            device=device,
+            use_fp16=not args.lingbot_no_fp16,
+            enable_depth_mask=args.lingbot_enable_depth_mask,
+        )
+        lingbot_end = time.time()
+
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        peak_mem = max(peak_mem, torch.cuda.max_memory_allocated() / (1024**2))
 
     with open(os.path.join(args.output_dir, "computation_stats.txt",), "w")as f:
         f.write(f"Runtime: {elapsed:.4f} seconds\n")
@@ -498,10 +598,20 @@ def main():
             f.write(f"Dense Correction Skipped Frames: {dense_correction_stats['skipped_frames']}\n")
             f.write(f"Dense Correction Clamped Frames: {dense_correction_stats['clamped_frames']}\n")
         if dense_depth_stats is not None:
+            f.write(f"Dense Depth Backend: {dense_depth_stats['backend']}\n")
             f.write(f"Dense Depth Frames: {dense_depth_stats['num_depth_frames']}\n")
             f.write(f"Dense Depth Merged Points: {dense_depth_stats['num_merged_points']}\n")
             f.write(f"Dense Depth Nonzero Pixels: {dense_depth_stats['num_nonzero_depth_pixels']}\n")
             f.write(f"Dense Depth Output Dir: {dense_depth_stats['output_dir']}\n")
+        if lingbot_stats is not None:
+            f.write(f"LingBot Depth Model: {lingbot_stats['model']}\n")
+            f.write(f"LingBot Depth Processed: {lingbot_stats['num_processed']}\n")
+            f.write(f"LingBot Depth Skipped: {lingbot_stats['num_skipped']}\n")
+            f.write(f"LingBot Depth Output Dir: {lingbot_stats['output_dir']}\n")
+        f.write(f"Dense World Collect Time: {dense_collect_end - dense_collect_start} seconds\n")
+        f.write(f"Dense PLY Time: {dense_ply_end - dense_ply_start} seconds\n")
+        f.write(f"Dense Depth Time: {dense_depth_end - dense_depth_start} seconds\n")
+        f.write(f"LingBot Depth Time: {lingbot_end - lingbot_start} seconds\n")
         f.write(f"Peak GPU memory: {peak_mem:.2f} MiB\n")
 
     write_recon_to_colmap(

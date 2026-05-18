@@ -762,8 +762,7 @@ def _write_binary_ply_vertices(file_obj, points, colors):
     file_obj.write(vertices.tobytes())
 
 
-def export_dense_local_point_map_ply(
-    output_path,
+def collect_dense_world_points(
     local_points,
     extrinsic,
     images,
@@ -771,11 +770,13 @@ def export_dense_local_point_map_ply(
     conf_threshold=50.0,
     stride=1,
     max_points=2_000_000,
+    include_colors=True,
 ):
     """
-    Stream a dense model point cloud to PLY using local point maps and final poses.
+    Collect a sampled dense local point map into one world-space point set.
 
-    This avoids materializing full-sequence world point maps or color maps.
+    The returned points are intended to be shared by dense PLY export and
+    camera-depth projection so both outputs use the same sampled global cloud.
     """
     if isinstance(local_points, torch.Tensor):
         local_points = local_points.detach().cpu().numpy()
@@ -784,6 +785,8 @@ def export_dense_local_point_map_ply(
     if isinstance(conf, torch.Tensor):
         conf = conf.detach().cpu().numpy()
 
+    local_points = np.asarray(local_points, dtype=np.float32)
+    extrinsic = np.asarray(extrinsic, dtype=np.float32)
     conf = np.asarray(conf)
     if conf.ndim == 4 and conf.shape[-1] == 1:
         conf = conf[..., 0]
@@ -810,9 +813,20 @@ def export_dense_local_point_map_ply(
         valid_counts.append(int(np.count_nonzero(valid)))
 
     total_valid = int(np.sum(valid_counts))
+    stats = {
+        "num_frames": int(num_frames),
+        "height": int(height),
+        "width": int(width),
+        "stride": int(stride),
+        "conf_threshold": float(conf_threshold),
+        "conf_threshold_value": float(threshold_value),
+        "num_valid_points_before_cap": int(total_valid),
+        "max_points": None if max_points is None else int(max_points),
+    }
     if total_valid == 0:
-        print(f"[OUTPUT WRITING] No dense points passed filtering for {output_path}")
-        return
+        stats["num_points"] = 0
+        empty_colors = np.empty((0, 3), dtype=np.uint8) if include_colors else None
+        return np.empty((0, 3), dtype=np.float32), empty_colors, stats
 
     frame_quotas = np.asarray(valid_counts, dtype=np.int64)
     if max_points is not None and total_valid > max_points:
@@ -825,37 +839,102 @@ def export_dense_local_point_map_ply(
             order = np.argsort(-(ideal_quotas - frame_quotas))
             frame_quotas[order[:remainder]] += 1
 
-    total_vertices = int(frame_quotas.sum())
-    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-    with open(output_path, "wb") as file_obj:
-        _write_binary_ply_header(file_obj, total_vertices)
-        for i in range(num_frames):
-            quota = int(frame_quotas[i])
-            if quota <= 0:
-                continue
+    total_points = int(frame_quotas.sum())
+    world_points = np.empty((total_points, 3), dtype=np.float32)
+    colors = np.empty((total_points, 3), dtype=np.uint8) if include_colors else None
+    offset = 0
+    for i in range(num_frames):
+        quota = int(frame_quotas[i])
+        if quota <= 0:
+            continue
 
-            local_i = local_points[i, ::stride, ::stride]
-            conf_i = conf[i, ::stride, ::stride]
-            valid = (conf_i >= threshold_value) & (conf_i > 1e-5) & np.isfinite(local_i).all(axis=-1)
-            if not np.any(valid):
-                continue
+        local_i = local_points[i, ::stride, ::stride]
+        conf_i = conf[i, ::stride, ::stride]
+        valid = (conf_i >= threshold_value) & (conf_i > 1e-5) & np.isfinite(local_i).all(axis=-1)
+        if not np.any(valid):
+            continue
 
-            valid_indices = np.flatnonzero(valid.reshape(-1))
-            if quota < len(valid_indices):
-                sample_positions = np.linspace(0, len(valid_indices) - 1, quota, dtype=np.int64)
-                valid_indices = valid_indices[sample_positions]
+        valid_indices = np.flatnonzero(valid.reshape(-1))
+        if quota < len(valid_indices):
+            sample_positions = np.linspace(0, len(valid_indices) - 1, quota, dtype=np.int64)
+            valid_indices = valid_indices[sample_positions]
 
-            local_flat = local_i.reshape(-1, 3)
+        local_flat = local_i.reshape(-1, 3)
+        world_i = _world_points_from_local_frame(local_flat[valid_indices], extrinsic[i])
+        world_points[offset : offset + len(world_i)] = world_i
+
+        if include_colors:
             color_i = _image_frame_to_colors(images[i], (height, width))[::stride, ::stride]
             color_flat = color_i.reshape(-1, 3)
-            world_i = _world_points_from_local_frame(local_flat[valid_indices], extrinsic[i])
-            _write_binary_ply_vertices(file_obj, world_i, color_flat[valid_indices])
+            colors[offset : offset + len(world_i)] = color_flat[valid_indices]
 
-    print(
-        f"[OUTPUT WRITING] Stream-exported {total_vertices} dense model points to {output_path} "
-        f"(valid={total_valid}, max_points={max_points}, conf percentile={conf_threshold}, "
-        f"value={threshold_value:.4f}, stride={stride})"
+        offset += len(world_i)
+
+    if offset != total_points:
+        world_points = world_points[:offset]
+        if include_colors:
+            colors = colors[:offset]
+        total_points = int(offset)
+
+    stats["num_points"] = int(total_points)
+    return world_points, colors, stats
+
+
+def export_dense_world_points_ply(output_path, world_points, colors, stats=None, write_chunk_size=1_000_000):
+    world_points = np.asarray(world_points, dtype=np.float32)
+    colors = np.asarray(colors, dtype=np.uint8)
+    if world_points.ndim != 2 or world_points.shape[1] != 3:
+        raise ValueError(f"Expected world_points shape (P, 3), got {world_points.shape}")
+    if colors.shape != (world_points.shape[0], 3):
+        raise ValueError(f"Expected colors shape ({world_points.shape[0]}, 3), got {colors.shape}")
+    if write_chunk_size <= 0:
+        raise ValueError(f"write_chunk_size must be positive, got {write_chunk_size}")
+
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    with open(output_path, "wb") as file_obj:
+        _write_binary_ply_header(file_obj, len(world_points))
+        for start in range(0, len(world_points), write_chunk_size):
+            end = min(start + write_chunk_size, len(world_points))
+            _write_binary_ply_vertices(file_obj, world_points[start:end], colors[start:end])
+
+    if stats is None:
+        print(f"[OUTPUT WRITING] Exported {len(world_points)} dense model points to {output_path}")
+    else:
+        print(
+            f"[OUTPUT WRITING] Exported {len(world_points)} dense model points to {output_path} "
+            f"(valid={stats['num_valid_points_before_cap']}, max_points={stats['max_points']}, "
+            f"conf percentile={stats['conf_threshold']}, value={stats['conf_threshold_value']:.4f}, "
+            f"stride={stats['stride']})"
+        )
+
+
+def export_dense_local_point_map_ply(
+    output_path,
+    local_points,
+    extrinsic,
+    images,
+    conf,
+    conf_threshold=50.0,
+    stride=1,
+    max_points=2_000_000,
+):
+    """
+    Export a dense model point cloud to PLY using local point maps and final poses.
+    """
+    world_points, colors, stats = collect_dense_world_points(
+        local_points,
+        extrinsic,
+        images,
+        conf,
+        conf_threshold=conf_threshold,
+        stride=stride,
+        max_points=max_points,
+        include_colors=True,
     )
+    if len(world_points) == 0:
+        print(f"[OUTPUT WRITING] No dense points passed filtering for {output_path}")
+        return
+    export_dense_world_points_ply(output_path, world_points, colors, stats=stats)
 
 
 def project_world_points_to_depth(world_points, extrinsic, intrinsics, image_size, chunk_size=1_000_000):
@@ -887,8 +966,8 @@ def project_world_points_to_depth(world_points, extrinsic, intrinsics, image_siz
         raise ValueError(f"Expected intrinsics shape ({N}, 3, 3), got {intrinsics.shape}")
     if chunk_size == -1:
         chunk_size = world_points.shape[0]
-    # elif chunk_size <= 0:
-    #     raise ValueError(f"chunk_size must be positive, or -1 for no chunking, got {chunk_size}")
+    elif chunk_size <= 0:
+        raise ValueError(f"chunk_size must be positive, or -1 for no chunking, got {chunk_size}")
 
     for i in range(N):
         w2c = extrinsic[i, :3, :4].astype(np.float32, copy=False)
@@ -928,6 +1007,110 @@ def project_world_points_to_depth(world_points, extrinsic, intrinsics, image_siz
         depth = depth_flat.reshape(H, W)
         depth[~np.isfinite(depth)] = 0.0
         depth_maps[i] = depth
+
+    return depth_maps
+
+
+@torch.no_grad()
+def project_world_points_to_depth_torch(
+    world_points,
+    extrinsic,
+    intrinsics,
+    image_size,
+    point_chunk_size=1_000_000,
+    camera_batch_size=4,
+    device="cuda",
+):
+    """
+    CUDA implementation of world-point z-buffer projection using torch scatter_reduce.
+
+    The function batches both cameras and points to keep a 24GB GPU within a
+    predictable memory envelope. Depth is returned on CPU as float32.
+    """
+    if not torch.cuda.is_available() and str(device).startswith("cuda"):
+        raise RuntimeError("CUDA depth projection requested but torch.cuda.is_available() is False")
+
+    world_points = np.asarray(world_points, dtype=np.float32)
+    extrinsic = np.asarray(extrinsic, dtype=np.float32)
+    intrinsics = np.asarray(intrinsics, dtype=np.float32)
+    H, W = image_size
+    N = extrinsic.shape[0]
+    depth_maps = np.zeros((N, H, W), dtype=np.float32)
+
+    if world_points.size == 0:
+        return depth_maps
+    if world_points.ndim != 2 or world_points.shape[1] != 3:
+        raise ValueError(f"Expected world_points shape (P, 3), got {world_points.shape}")
+    if extrinsic.ndim != 3 or extrinsic.shape[-2:] not in ((3, 4), (4, 4)):
+        raise ValueError(f"Expected extrinsic shape (N, 3, 4) or (N, 4, 4), got {extrinsic.shape}")
+    if intrinsics.shape != (N, 3, 3):
+        raise ValueError(f"Expected intrinsics shape ({N}, 3, 3), got {intrinsics.shape}")
+    if point_chunk_size == -1:
+        point_chunk_size = world_points.shape[0]
+    elif point_chunk_size <= 0:
+        raise ValueError(f"point_chunk_size must be positive, or -1 for no chunking, got {point_chunk_size}")
+    if camera_batch_size <= 0:
+        raise ValueError(f"camera_batch_size must be positive, got {camera_batch_size}")
+
+    device = torch.device(device)
+    extrinsic_t = torch.as_tensor(extrinsic[:, :3, :4], dtype=torch.float32, device=device)
+    intrinsics_t = torch.as_tensor(intrinsics, dtype=torch.float32, device=device)
+    image_pixels = H * W
+
+    for camera_start in range(0, N, camera_batch_size):
+        camera_end = min(camera_start + camera_batch_size, N)
+        batch_size = camera_end - camera_start
+        R = extrinsic_t[camera_start:camera_end, :, :3]
+        t = extrinsic_t[camera_start:camera_end, :, 3]
+        K = intrinsics_t[camera_start:camera_end]
+        depth_flat = torch.full(
+            (batch_size * image_pixels,),
+            torch.inf,
+            dtype=torch.float32,
+            device=device,
+        )
+        camera_offsets = torch.arange(batch_size, device=device, dtype=torch.int64).view(batch_size, 1) * image_pixels
+
+        for point_start in range(0, world_points.shape[0], point_chunk_size):
+            point_end = min(point_start + point_chunk_size, world_points.shape[0])
+            points = torch.as_tensor(world_points[point_start:point_end], dtype=torch.float32, device=device)
+
+            cam_points = torch.einsum("pj,bij->bpi", points, R) + t[:, None, :]
+            z = cam_points[..., 2]
+            valid = torch.isfinite(z) & (z > 1e-6)
+            if not torch.any(valid):
+                continue
+
+            safe_z = torch.where(valid, z, torch.ones_like(z))
+            u = K[:, None, 0, 0] * (cam_points[..., 0] / safe_z) + K[:, None, 0, 2]
+            v = K[:, None, 1, 1] * (cam_points[..., 1] / safe_z) + K[:, None, 1, 2]
+            u_round = torch.round(u).to(torch.int64)
+            v_round = torch.round(v).to(torch.int64)
+
+            in_bounds = (
+                valid
+                & torch.isfinite(u)
+                & torch.isfinite(v)
+                & (u_round >= 0)
+                & (u_round < W)
+                & (v_round >= 0)
+                & (v_round < H)
+            )
+            if not torch.any(in_bounds):
+                continue
+
+            idx = camera_offsets + v_round * W + u_round
+            depth_flat.scatter_reduce_(
+                0,
+                idx[in_bounds],
+                z[in_bounds],
+                reduce="amin",
+                include_self=True,
+            )
+
+        depth_batch = depth_flat.view(batch_size, H, W)
+        depth_batch = torch.where(torch.isfinite(depth_batch), depth_batch, torch.zeros_like(depth_batch))
+        depth_maps[camera_start:camera_end] = depth_batch.cpu().numpy()
 
     return depth_maps
 
@@ -990,121 +1173,98 @@ def export_dense_projected_depth_maps(
     stride=1,
     max_points=20_000_000,
     chunk_size=1_000_000,
+    world_points=None,
+    image_size=None,
+    backend="cuda",
+    camera_batch_size=4,
 ):
     """
     Merge dense local point maps with final poses, project the merged cloud to every camera,
     and save per-view depth maps.
     """
-    if isinstance(local_points, torch.Tensor):
-        local_points = local_points.detach().cpu().numpy()
     if isinstance(extrinsic, torch.Tensor):
         extrinsic = extrinsic.detach().cpu().numpy()
     if isinstance(intrinsic, torch.Tensor):
         intrinsic = intrinsic.detach().cpu().numpy()
-    if isinstance(conf, torch.Tensor):
-        conf = conf.detach().cpu().numpy()
 
-    local_points = np.asarray(local_points, dtype=np.float32)
     extrinsic = np.asarray(extrinsic, dtype=np.float32)
     intrinsic = np.asarray(intrinsic, dtype=np.float32)
-    conf = np.asarray(conf)
-    if conf.ndim == 4 and conf.shape[-1] == 1:
-        conf = conf[..., 0]
 
-    if stride < 1:
-        raise ValueError(f"stride must be >= 1, got {stride}")
-    if max_points is not None and max_points <= 0:
-        raise ValueError(f"max_points must be positive or None, got {max_points}")
-
-    num_frames, height, width, _ = local_points.shape
-    if conf.shape[:3] != (num_frames, height, width):
-        raise ValueError(
-            "Confidence shape must match local_points spatial shape. "
-            f"Got conf={conf.shape}, local_points={local_points.shape}."
+    if world_points is None:
+        if local_points is None or conf is None:
+            raise ValueError("local_points and conf are required when world_points is not provided")
+        world_points, _, collect_stats = collect_dense_world_points(
+            local_points,
+            extrinsic,
+            images=None,
+            conf=conf,
+            conf_threshold=conf_threshold,
+            stride=stride,
+            max_points=max_points,
+            include_colors=False,
         )
-    if len(extrinsic) != num_frames or len(intrinsic) != num_frames:
-        raise ValueError(
-            f"Expected {num_frames} camera matrices, got extrinsic={len(extrinsic)}, intrinsic={len(intrinsic)}"
-        )
+        if image_size is None:
+            image_size = (collect_stats["height"], collect_stats["width"])
+    else:
+        world_points = np.asarray(world_points, dtype=np.float32)
 
-    threshold_value = 0.0 if conf_threshold == 0.0 else np.percentile(conf, conf_threshold)
-    valid_counts = []
-    for i in range(num_frames):
-        conf_i = conf[i, ::stride, ::stride]
-        local_i = local_points[i, ::stride, ::stride]
-        valid = (conf_i >= threshold_value) & (conf_i > 1e-5) & np.isfinite(local_i).all(axis=-1)
-        valid_counts.append(int(np.count_nonzero(valid)))
+    if image_size is None:
+        if local_points is None:
+            raise ValueError("image_size is required when projecting precomputed world_points without local_points")
+        local_shape = local_points.shape if not isinstance(local_points, torch.Tensor) else tuple(local_points.shape)
+        image_size = (int(local_shape[1]), int(local_shape[2]))
 
-    total_valid = int(np.sum(valid_counts))
-    if total_valid == 0:
+    num_frames = len(extrinsic)
+    if len(intrinsic) != num_frames:
+        raise ValueError(f"Expected {num_frames} intrinsics, got {len(intrinsic)}")
+
+    if len(world_points) == 0:
         print(f"[DEPTH EXPORT] No dense points passed filtering for {output_dir}")
-        return {
+        stats = {
             "num_depth_frames": int(num_frames),
             "num_merged_points": 0,
             "num_valid_points_before_cap": 0,
             "num_nonzero_depth_pixels": 0,
+            "backend": backend,
             "output_dir": output_dir,
         }
+        return stats
 
-    frame_quotas = np.asarray(valid_counts, dtype=np.int64)
-    if max_points is not None and total_valid > max_points:
-        max_points = int(max_points)
-        valid_counts_np = np.asarray(valid_counts, dtype=np.float64)
-        ideal_quotas = valid_counts_np * (max_points / float(total_valid))
-        frame_quotas = np.floor(ideal_quotas).astype(np.int64)
-        remainder = max_points - int(frame_quotas.sum())
-        if remainder > 0:
-            order = np.argsort(-(ideal_quotas - frame_quotas))
-            frame_quotas[order[:remainder]] += 1
-
-    total_points = int(frame_quotas.sum())
-    world_points = np.empty((total_points, 3), dtype=np.float32)
-    offset = 0
-    for i in range(num_frames):
-        quota = int(frame_quotas[i])
-        if quota <= 0:
-            continue
-
-        local_i = local_points[i, ::stride, ::stride]
-        conf_i = conf[i, ::stride, ::stride]
-        valid = (conf_i >= threshold_value) & (conf_i > 1e-5) & np.isfinite(local_i).all(axis=-1)
-        if not np.any(valid):
-            continue
-
-        valid_indices = np.flatnonzero(valid.reshape(-1))
-        if quota < len(valid_indices):
-            sample_positions = np.linspace(0, len(valid_indices) - 1, quota, dtype=np.int64)
-            valid_indices = valid_indices[sample_positions]
-
-        local_flat = local_i.reshape(-1, 3)
-        world_i = _world_points_from_local_frame(local_flat[valid_indices], extrinsic[i])
-        world_points[offset : offset + len(world_i)] = world_i
-        offset += len(world_i)
-
-    if offset != total_points:
-        world_points = world_points[:offset]
-        total_points = int(offset)
-
-    depth_np = project_world_points_to_depth(
-        world_points=world_points,
-        extrinsic=extrinsic,
-        intrinsics=intrinsic,
-        image_size=(height, width),
-        chunk_size=chunk_size,
-    )
+    backend = backend.lower()
+    if backend == "cuda":
+        depth_np = project_world_points_to_depth_torch(
+            world_points=world_points,
+            extrinsic=extrinsic,
+            intrinsics=intrinsic,
+            image_size=image_size,
+            point_chunk_size=chunk_size,
+            camera_batch_size=camera_batch_size,
+            device="cuda",
+        )
+    elif backend == "cpu":
+        depth_np = project_world_points_to_depth(
+            world_points=world_points,
+            extrinsic=extrinsic,
+            intrinsics=intrinsic,
+            image_size=image_size,
+            chunk_size=chunk_size,
+        )
+    else:
+        raise ValueError(f"Unsupported dense depth backend: {backend}")
     save_depth_pngs(depth_np=depth_np, image_names=image_names, output_dir=output_dir)
 
     nonzero_pixels = int(np.count_nonzero(depth_np > 0))
     print(
         f"[DEPTH EXPORT] Saved projected dense depth maps to {output_dir} "
-        f"(frames={num_frames}, points={total_points}, valid={total_valid}, "
-        f"nonzero_pixels={nonzero_pixels}, conf percentile={conf_threshold}, value={threshold_value:.4f})"
+        f"(backend={backend}, frames={num_frames}, points={len(world_points)}, "
+        f"nonzero_pixels={nonzero_pixels})"
     )
     return {
         "num_depth_frames": int(num_frames),
-        "num_merged_points": int(total_points),
-        "num_valid_points_before_cap": int(total_valid),
+        "num_merged_points": int(len(world_points)),
+        "num_valid_points_before_cap": int(len(world_points)),
         "num_nonzero_depth_pixels": nonzero_pixels,
+        "backend": backend,
         "output_dir": output_dir,
     }
 
