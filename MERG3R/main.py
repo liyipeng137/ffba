@@ -127,7 +127,7 @@ def parse_args():
         "--dense_depth_chunk_size",
         type=int,
         default=1_000_000,
-        help="Projection chunk size for dense depth export.",
+        help="Projection chunk size for dense depth export. Set -1 to disable chunking.",
     )
     parser.add_argument(
         "--dense_debug",
@@ -201,8 +201,8 @@ def main():
         raise ValueError("--dense_correction_scale_min must be <= --dense_correction_scale_max")
     if args.dense_depth_stride < 1:
         raise ValueError("--dense_depth_stride must be >= 1")
-    if args.dense_depth_chunk_size < 1:
-        raise ValueError("--dense_depth_chunk_size must be >= 1")
+    if args.dense_depth_chunk_size == 0 or args.dense_depth_chunk_size < -1:
+        raise ValueError("--dense_depth_chunk_size must be positive, or -1 for no chunking")
     
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required to run this pipeline. No CUDA device was detected.")

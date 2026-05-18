@@ -885,8 +885,10 @@ def project_world_points_to_depth(world_points, extrinsic, intrinsics, image_siz
         raise ValueError(f"Expected extrinsic shape (N, 3, 4) or (N, 4, 4), got {extrinsic.shape}")
     if intrinsics.shape != (N, 3, 3):
         raise ValueError(f"Expected intrinsics shape ({N}, 3, 3), got {intrinsics.shape}")
-    if chunk_size <= 0:
-        raise ValueError(f"chunk_size must be positive, got {chunk_size}")
+    if chunk_size == -1:
+        chunk_size = world_points.shape[0]
+    # elif chunk_size <= 0:
+    #     raise ValueError(f"chunk_size must be positive, or -1 for no chunking, got {chunk_size}")
 
     for i in range(N):
         w2c = extrinsic[i, :3, :4].astype(np.float32, copy=False)
