@@ -899,13 +899,230 @@ def export_dense_world_points_ply(output_path, world_points, colors, stats=None,
 
     if stats is None:
         print(f"[OUTPUT WRITING] Exported {len(world_points)} dense model points to {output_path}")
-    else:
+    elif "conf_threshold" in stats:
         print(
             f"[OUTPUT WRITING] Exported {len(world_points)} dense model points to {output_path} "
             f"(valid={stats['num_valid_points_before_cap']}, max_points={stats['max_points']}, "
             f"conf percentile={stats['conf_threshold']}, value={stats['conf_threshold_value']:.4f}, "
             f"stride={stats['stride']})"
         )
+    else:
+        print(
+            f"[OUTPUT WRITING] Exported {len(world_points)} dense model points to {output_path} "
+            f"(valid={stats['num_valid_points_before_cap']}, max_points={stats['max_points']}, "
+            f"stride={stats['stride']})"
+        )
+
+
+def _depth_npy_path_for_image(depth_npy_dir, image_name, frame_idx):
+    stem = os.path.splitext(os.path.basename(str(image_name)))[0]
+    path = os.path.join(depth_npy_dir, f"{stem}.npy")
+    if os.path.exists(path):
+        return path, stem
+
+    fallback_stem = f"frame_{frame_idx:04d}"
+    fallback = os.path.join(depth_npy_dir, f"{fallback_stem}.npy")
+    if os.path.exists(fallback):
+        return fallback, fallback_stem
+    return path, stem
+
+
+def _local_points_from_depth_frame(depth_frame, intrinsic, stride):
+    height, width = depth_frame.shape
+    y_coords = np.arange(0, height, stride, dtype=np.float32)
+    x_coords = np.arange(0, width, stride, dtype=np.float32)
+    u_grid, v_grid = np.meshgrid(x_coords, y_coords)
+    depth = depth_frame[::stride, ::stride].astype(np.float32, copy=False)
+
+    fx = float(intrinsic[0, 0])
+    fy = float(intrinsic[1, 1])
+    cx = float(intrinsic[0, 2])
+    cy = float(intrinsic[1, 2])
+    if abs(fx) < 1e-8 or abs(fy) < 1e-8:
+        raise ValueError(f"Invalid focal lengths fx={fx}, fy={fy}")
+
+    x = (u_grid - cx) / fx * depth
+    y = (v_grid - cy) / fy * depth
+    return np.stack([x, y, depth], axis=-1)
+
+
+def collect_depth_npy_world_points(
+    depth_npy_dir,
+    image_names,
+    images,
+    extrinsic,
+    intrinsic,
+    stride=1,
+    max_points=2_000_000,
+    min_depth=1e-6,
+    max_depth=None,
+    valid_mask_depth_npy_dir=None,
+    valid_mask_min_depth=1e-6,
+):
+    """
+    Back-project float32 depth .npy maps into a sampled world-space point set.
+    """
+    if isinstance(extrinsic, torch.Tensor):
+        extrinsic = extrinsic.detach().cpu().numpy()
+    if isinstance(intrinsic, torch.Tensor):
+        intrinsic = intrinsic.detach().cpu().numpy()
+
+    extrinsic = np.asarray(extrinsic, dtype=np.float32)
+    intrinsic = np.asarray(intrinsic, dtype=np.float32)
+    num_frames = len(extrinsic)
+    if intrinsic.ndim == 2:
+        intrinsic = np.repeat(intrinsic[None], num_frames, axis=0)
+    if intrinsic.shape != (num_frames, 3, 3):
+        raise ValueError(f"Expected intrinsic shape (3, 3) or ({num_frames}, 3, 3), got {intrinsic.shape}")
+    if stride < 1:
+        raise ValueError(f"stride must be >= 1, got {stride}")
+    if max_points is not None and max_points <= 0:
+        raise ValueError(f"max_points must be positive or None, got {max_points}")
+
+    frame_items = []
+    valid_counts = []
+    missing = 0
+    for frame_idx in range(num_frames):
+        image_name = image_names[frame_idx] if frame_idx < len(image_names) else f"frame_{frame_idx:04d}.png"
+        depth_path, stem = _depth_npy_path_for_image(depth_npy_dir, image_name, frame_idx)
+        if not os.path.exists(depth_path):
+            frame_items.append((None, stem))
+            valid_counts.append(0)
+            missing += 1
+            continue
+
+        depth_frame = np.load(depth_path).astype(np.float32)
+        depth_frame = np.nan_to_num(depth_frame, nan=0.0, posinf=0.0, neginf=0.0)
+        depth_s = depth_frame[::stride, ::stride]
+        valid = np.isfinite(depth_s) & (depth_s > min_depth)
+        if max_depth is not None:
+            valid &= depth_s <= max_depth
+        if valid_mask_depth_npy_dir is not None:
+            mask_path, _ = _depth_npy_path_for_image(valid_mask_depth_npy_dir, image_name, frame_idx)
+            if os.path.exists(mask_path):
+                mask_depth = np.load(mask_path).astype(np.float32)
+                mask_depth = np.nan_to_num(mask_depth, nan=0.0, posinf=0.0, neginf=0.0)
+                if mask_depth.shape != depth_frame.shape:
+                    mask_depth = cv2.resize(mask_depth, (depth_frame.shape[1], depth_frame.shape[0]), interpolation=cv2.INTER_NEAREST)
+                mask_depth_s = mask_depth[::stride, ::stride]
+                valid &= np.isfinite(mask_depth_s) & (mask_depth_s > valid_mask_min_depth)
+            else:
+                valid &= False
+        frame_items.append((depth_path, stem))
+        valid_counts.append(int(np.count_nonzero(valid)))
+
+    total_valid = int(np.sum(valid_counts))
+    stats = {
+        "num_frames": int(num_frames),
+        "num_missing_depths": int(missing),
+        "stride": int(stride),
+        "min_depth": float(min_depth),
+        "max_depth": None if max_depth is None else float(max_depth),
+        "valid_mask_depth_npy_dir": None if valid_mask_depth_npy_dir is None else str(valid_mask_depth_npy_dir),
+        "valid_mask_min_depth": float(valid_mask_min_depth),
+        "num_valid_points_before_cap": int(total_valid),
+        "max_points": None if max_points is None else int(max_points),
+    }
+    if total_valid == 0:
+        stats["num_points"] = 0
+        return np.empty((0, 3), dtype=np.float32), np.empty((0, 3), dtype=np.uint8), stats
+
+    frame_quotas = np.asarray(valid_counts, dtype=np.int64)
+    if max_points is not None and total_valid > max_points:
+        max_points = int(max_points)
+        valid_counts_np = np.asarray(valid_counts, dtype=np.float64)
+        ideal_quotas = valid_counts_np * (max_points / float(total_valid))
+        frame_quotas = np.floor(ideal_quotas).astype(np.int64)
+        remainder = max_points - int(frame_quotas.sum())
+        if remainder > 0:
+            order = np.argsort(-(ideal_quotas - frame_quotas))
+            frame_quotas[order[:remainder]] += 1
+
+    total_points = int(frame_quotas.sum())
+    world_points = np.empty((total_points, 3), dtype=np.float32)
+    colors = np.empty((total_points, 3), dtype=np.uint8)
+    offset = 0
+    for frame_idx, ((depth_path, _stem), quota) in enumerate(zip(frame_items, frame_quotas)):
+        quota = int(quota)
+        if depth_path is None or quota <= 0:
+            continue
+
+        depth_frame = np.load(depth_path).astype(np.float32)
+        depth_frame = np.nan_to_num(depth_frame, nan=0.0, posinf=0.0, neginf=0.0)
+        local_i = _local_points_from_depth_frame(depth_frame, intrinsic[frame_idx], stride)
+        depth_s = local_i[..., 2]
+        valid = np.isfinite(depth_s) & (depth_s > min_depth) & np.isfinite(local_i).all(axis=-1)
+        if max_depth is not None:
+            valid &= depth_s <= max_depth
+        if valid_mask_depth_npy_dir is not None:
+            image_name = image_names[frame_idx] if frame_idx < len(image_names) else f"frame_{frame_idx:04d}.png"
+            mask_path, _ = _depth_npy_path_for_image(valid_mask_depth_npy_dir, image_name, frame_idx)
+            if os.path.exists(mask_path):
+                mask_depth = np.load(mask_path).astype(np.float32)
+                mask_depth = np.nan_to_num(mask_depth, nan=0.0, posinf=0.0, neginf=0.0)
+                if mask_depth.shape != depth_frame.shape:
+                    mask_depth = cv2.resize(mask_depth, (depth_frame.shape[1], depth_frame.shape[0]), interpolation=cv2.INTER_NEAREST)
+                mask_depth_s = mask_depth[::stride, ::stride]
+                valid &= np.isfinite(mask_depth_s) & (mask_depth_s > valid_mask_min_depth)
+            else:
+                valid &= False
+        if not np.any(valid):
+            continue
+
+        valid_indices = np.flatnonzero(valid.reshape(-1))
+        if quota < len(valid_indices):
+            sample_positions = np.linspace(0, len(valid_indices) - 1, quota, dtype=np.int64)
+            valid_indices = valid_indices[sample_positions]
+
+        local_flat = local_i.reshape(-1, 3)
+        world_i = _world_points_from_local_frame(local_flat[valid_indices], extrinsic[frame_idx])
+        color_i = _image_frame_to_colors(images[frame_idx], depth_frame.shape)[::stride, ::stride]
+        color_flat = color_i.reshape(-1, 3)
+        world_points[offset : offset + len(world_i)] = world_i
+        colors[offset : offset + len(world_i)] = color_flat[valid_indices]
+        offset += len(world_i)
+
+    if offset != total_points:
+        world_points = world_points[:offset]
+        colors = colors[:offset]
+        total_points = int(offset)
+
+    stats["num_points"] = int(total_points)
+    return world_points, colors, stats
+
+
+def export_depth_npy_world_points_ply(
+    output_path,
+    depth_npy_dir,
+    image_names,
+    images,
+    extrinsic,
+    intrinsic,
+    stride=1,
+    max_points=2_000_000,
+    min_depth=1e-6,
+    max_depth=None,
+    valid_mask_depth_npy_dir=None,
+    valid_mask_min_depth=1e-6,
+):
+    world_points, colors, stats = collect_depth_npy_world_points(
+        depth_npy_dir,
+        image_names,
+        images,
+        extrinsic,
+        intrinsic,
+        stride=stride,
+        max_points=max_points,
+        min_depth=min_depth,
+        max_depth=max_depth,
+        valid_mask_depth_npy_dir=valid_mask_depth_npy_dir,
+        valid_mask_min_depth=valid_mask_min_depth,
+    )
+    if len(world_points) == 0:
+        print(f"[OUTPUT WRITING] No depth points passed filtering for {output_path}")
+        return stats
+    export_dense_world_points_ply(output_path, world_points, colors, stats=stats)
+    return stats
 
 
 def export_dense_local_point_map_ply(

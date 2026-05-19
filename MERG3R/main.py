@@ -157,7 +157,7 @@ def parse_args():
     parser.add_argument(
         "--lingbot_model",
         type=str,
-        default="robbyant/lingbot-depth-pretrain-vitl-14-v0.5",
+        default="robbyant/lingbot-depth-pretrain-vitl-14-v0.5/model.pt",
         help="LingBot-Depth model path or Hugging Face ID.",
     )
     parser.add_argument(
@@ -169,6 +169,50 @@ def parse_args():
         "--lingbot_enable_depth_mask",
         action="store_true",
         help="Enable LingBot-Depth depth token masking during refinement.",
+    )
+    parser.add_argument(
+        "--no_lingbot_refined_ply",
+        dest="lingbot_refined_ply",
+        action="store_false",
+        default=True,
+        help="Disable dense_lingbot_refined_points.ply export after LingBot-Depth refinement.",
+    )
+    parser.add_argument(
+        "--lingbot_refined_ply_stride",
+        type=int,
+        default=-1,
+        help="Pixel stride for dense_lingbot_refined_points.ply. Set <=0 to reuse --dense_depth_stride.",
+    )
+    parser.add_argument(
+        "--lingbot_refined_ply_max_points",
+        type=int,
+        default=-1,
+        help="Maximum points in dense_lingbot_refined_points.ply. Set <=0 to reuse --dense_max_points.",
+    )
+    parser.add_argument(
+        "--lingbot_refined_ply_max_depth",
+        type=float,
+        default=None,
+        help="Optional max depth filter in meters for dense_lingbot_refined_points.ply.",
+    )
+    parser.add_argument(
+        "--lingbot_refined_ply_projected_mask",
+        dest="lingbot_refined_ply_projected_mask",
+        action="store_true",
+        default=True,
+        help="Filter dense_lingbot_refined_points.ply with projected input depth valid mask.",
+    )
+    parser.add_argument(
+        "--no_lingbot_refined_ply_projected_mask",
+        dest="lingbot_refined_ply_projected_mask",
+        action="store_false",
+        help="Do not filter dense_lingbot_refined_points.ply with projected input depth valid mask.",
+    )
+    parser.add_argument(
+        "--lingbot_refined_ply_projected_mask_min_depth",
+        type=float,
+        default=1e-6,
+        help="Minimum projected input depth considered valid for refined PLY mask.",
     )
     parser.add_argument(
         "--dense_debug",
@@ -549,6 +593,9 @@ def main():
     lingbot_start = 0
     lingbot_end = 0
     lingbot_stats = None
+    lingbot_refined_ply_start = 0
+    lingbot_refined_ply_end = 0
+    lingbot_refined_ply_stats = None
     if args.lingbot_refine:
         if dense_depth_stats is None:
             raise RuntimeError("LingBot-Depth refinement requires projected dense depth outputs, but none were produced.")
@@ -567,6 +614,36 @@ def main():
             enable_depth_mask=args.lingbot_enable_depth_mask,
         )
         lingbot_end = time.time()
+        if args.lingbot_refined_ply:
+            lingbot_refined_ply_start = time.time()
+            lingbot_refined_ply_stride = (
+                args.lingbot_refined_ply_stride
+                if args.lingbot_refined_ply_stride > 0
+                else args.dense_depth_stride
+            )
+            lingbot_refined_ply_max_points = (
+                args.lingbot_refined_ply_max_points
+                if args.lingbot_refined_ply_max_points > 0
+                else (args.dense_max_points if args.dense_max_points > 0 else None)
+            )
+            lingbot_refined_ply_stats = export_depth_npy_world_points_ply(
+                os.path.join(args.output_dir, "dense_lingbot_refined_points.ply"),
+                os.path.join(lingbot_output_dir, "depth_npy"),
+                sequence.image_names,
+                sequence.images,
+                final_predictions['extrinsic'],
+                shared_intrinsic,
+                stride=lingbot_refined_ply_stride,
+                max_points=lingbot_refined_ply_max_points,
+                max_depth=args.lingbot_refined_ply_max_depth,
+                valid_mask_depth_npy_dir=(
+                    os.path.join(dense_depth_dir, "depth_npy")
+                    if args.lingbot_refined_ply_projected_mask
+                    else None
+                ),
+                valid_mask_min_depth=args.lingbot_refined_ply_projected_mask_min_depth,
+            )
+            lingbot_refined_ply_end = time.time()
 
     if torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -608,10 +685,16 @@ def main():
             f.write(f"LingBot Depth Processed: {lingbot_stats['num_processed']}\n")
             f.write(f"LingBot Depth Skipped: {lingbot_stats['num_skipped']}\n")
             f.write(f"LingBot Depth Output Dir: {lingbot_stats['output_dir']}\n")
+        if lingbot_refined_ply_stats is not None:
+            f.write(f"LingBot Refined PLY Points: {lingbot_refined_ply_stats['num_points']}\n")
+            f.write(f"LingBot Refined PLY Valid Before Cap: {lingbot_refined_ply_stats['num_valid_points_before_cap']}\n")
+            f.write(f"LingBot Refined PLY Missing Depths: {lingbot_refined_ply_stats['num_missing_depths']}\n")
+            f.write(f"LingBot Refined PLY Projected Mask: {lingbot_refined_ply_stats['valid_mask_depth_npy_dir']}\n")
         f.write(f"Dense World Collect Time: {dense_collect_end - dense_collect_start} seconds\n")
         f.write(f"Dense PLY Time: {dense_ply_end - dense_ply_start} seconds\n")
         f.write(f"Dense Depth Time: {dense_depth_end - dense_depth_start} seconds\n")
         f.write(f"LingBot Depth Time: {lingbot_end - lingbot_start} seconds\n")
+        f.write(f"LingBot Refined PLY Time: {lingbot_refined_ply_end - lingbot_refined_ply_start} seconds\n")
         f.write(f"Peak GPU memory: {peak_mem:.2f} MiB\n")
 
     write_recon_to_colmap(
