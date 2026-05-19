@@ -3,6 +3,10 @@ import torch.nn.functional as F
 import numpy as np
 from scipy.cluster.hierarchy import DisjointSet
 
+from algos.feedforward_paths import ensure_feedforward_on_path
+
+ensure_feedforward_on_path()
+
 from vggt.dependency.vggsfm_utils import initialize_feature_extractors, extract_keypoints
 from algos.geometry import project_3d_points_to_image_numpy
 from algos.utils import get_sim_matrix, rbd

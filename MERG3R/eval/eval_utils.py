@@ -3,6 +3,7 @@ from PIL import Image
 import cv2
 import io
 import random
+import sys
 import time
 from pathlib import Path
 from typing import List, Tuple, Dict, Optional
@@ -22,6 +23,13 @@ import open3d as o3d  # for point cloud processing and Chamfer Distance computat
 from scipy.spatial.transform import Rotation
 from torchvision import transforms as TF
 
+
+_FEEDFORWARD_ROOT = Path(__file__).resolve().parents[1] / "feedforward"
+if not _FEEDFORWARD_ROOT.is_dir():
+    raise FileNotFoundError(f"Feedforward model directory not found: {_FEEDFORWARD_ROOT}")
+_feedforward_root_str = str(_FEEDFORWARD_ROOT)
+if _feedforward_root_str not in sys.path:
+    sys.path.insert(0, _feedforward_root_str)
 
 from vggt.utils.geometry import unproject_depth_map_to_point_map
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri

@@ -17,6 +17,10 @@ import requests
 from PIL import Image
 from scipy.spatial.transform import Rotation
 
+from algos.feedforward_paths import ensure_feedforward_on_path
+
+ensure_feedforward_on_path()
+
 from vggt.models.vggt import VGGT
 from vggt.utils.load_fn import load_and_preprocess_images
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri

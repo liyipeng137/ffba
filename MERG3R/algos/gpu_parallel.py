@@ -7,6 +7,10 @@ import torch
 import torch.multiprocessing as mp
 import numpy as np
 
+from algos.feedforward_paths import ensure_feedforward_on_path
+
+ensure_feedforward_on_path()
+
 from vggt.models.vggt import VGGT
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 from vggt.utils.geometry import unproject_depth_map_to_point_map

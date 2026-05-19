@@ -4,6 +4,10 @@ import numpy as np
 from scipy.spatial import KDTree
 from copy import deepcopy
 
+from algos.feedforward_paths import ensure_feedforward_on_path
+
+ensure_feedforward_on_path()
+
 from vggt.models.vggt import VGGT
 from vggt.dependency.vggsfm_utils import initialize_feature_extractors, extract_keypoints, farthest_point_sampling
 from algos.sequence import Sequence
