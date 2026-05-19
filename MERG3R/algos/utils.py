@@ -570,7 +570,7 @@ def run_inference_step_by_step(model, batches, size_hw, device, need_features=Fa
             prediction = dict()
 
             with torch.no_grad():
-                with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                     images = images[None].to(device)  # add batch dimension
                     aggregated_tokens_list, ps_idx, patch_tokens = model.aggregator(images)
             
@@ -610,7 +610,7 @@ def run_inference_step_by_step(model, batches, size_hw, device, need_features=Fa
         for i, images in enumerate(batches):
             prediction = dict()
             with torch.no_grad():
-                    with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                         images = images[None].to(device)  # add batch dimension
                         res = model(images)
             
@@ -645,7 +645,7 @@ def run_inference_step_by_step(model, batches, size_hw, device, need_features=Fa
                 )
 
             with torch.no_grad():
-                with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                     images = images[None].to(device)  # add batch dimension
                     res = model(imgs=images)
 
