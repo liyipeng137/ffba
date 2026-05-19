@@ -11,7 +11,7 @@ DEFAULT_LINGBOT_MODEL = "robbyant/lingbot-depth-pretrain-vitl-14-v0.5"
 
 
 def _ensure_lingbot_import_path():
-    lingbot_root = Path(__file__).resolve().parents[1] / "lingbot-depth"
+    lingbot_root = Path(__file__).resolve().parents[1] / "third_party" / "lingbot-depth"
     if not lingbot_root.exists():
         raise FileNotFoundError(f"LingBot-Depth directory not found: {lingbot_root}")
     lingbot_root_str = str(lingbot_root)

@@ -7,9 +7,21 @@ import torch
 from scipy.spatial.transform import Rotation
 
 
-_LOCAL_BAE_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bae")
-if _LOCAL_BAE_ROOT not in sys.path:
-    sys.path.insert(0, _LOCAL_BAE_ROOT)
+_LOCAL_BAE_ROOT = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "third_party",
+    "bae",
+)
+
+
+def _ensure_local_bae_on_path():
+    if not os.path.isdir(_LOCAL_BAE_ROOT):
+        raise FileNotFoundError(f"BAE directory not found: {_LOCAL_BAE_ROOT}")
+    if _LOCAL_BAE_ROOT not in sys.path:
+        sys.path.insert(0, _LOCAL_BAE_ROOT)
+
+
+_ensure_local_bae_on_path()
 
 import pypose as pp
 import torch.nn as nn
@@ -66,11 +78,6 @@ class ColmapResidual(nn.Module):
             intrinsics_batched,
         )
         return points_proj - points_2d
-
-def _ensure_local_bae_on_path():
-    if _LOCAL_BAE_ROOT not in sys.path:
-        sys.path.insert(0, _LOCAL_BAE_ROOT)
-
 
 def _normalize_extrinsics(extrinsic):
     extrinsic = np.asarray(extrinsic, dtype=np.float64)
