@@ -521,7 +521,7 @@ def write_colmap_points3D_txt(file_path, points3D):
 
 
 
-def load_model(model_name="vggt", device=None, pi3x_ckpt=None):
+def load_model(model_name="vggt", device=None):
     """Load and initialize a supported geometric foundation model."""
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -532,18 +532,17 @@ def load_model(model_name="vggt", device=None, pi3x_ckpt=None):
     elif model_name == 'pi3':
         model = Pi3.from_pretrained("yyfz233/Pi3")
     elif model_name == 'pi3x':
-        if pi3x_ckpt is None:
-            model = Pi3X.from_pretrained("yyfz233/Pi3X")
-        else:
-            model = Pi3X()
-            if pi3x_ckpt.endswith(".safetensors"):
-                from safetensors.torch import load_file
-                state_dict = load_file(pi3x_ckpt)
-            else:
-                state_dict = torch.load(pi3x_ckpt, map_location="cpu", weights_only=False)
-                if isinstance(state_dict, dict) and "model" in state_dict:
-                    state_dict = state_dict["model"]
-            model.load_state_dict(state_dict, strict=False)
+        model = Pi3X.from_pretrained("yyfz233/Pi3X")
+        # else:
+        #     model = Pi3X()
+        #     if pi3x_ckpt.endswith(".safetensors"):
+        #         from safetensors.torch import load_file
+        #         state_dict = load_file(pi3x_ckpt)
+        #     else:
+        #         state_dict = torch.load(pi3x_ckpt, map_location="cpu", weights_only=False)
+        #         if isinstance(state_dict, dict) and "model" in state_dict:
+        #             state_dict = state_dict["model"]
+        #     model.load_state_dict(state_dict, strict=False)
     else:
         raise NotImplementedError("Other model backbones are not implemented!")
 

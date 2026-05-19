@@ -102,8 +102,7 @@ def run_lingbot_depth_refinement(
     intrinsic,
     model_name=DEFAULT_LINGBOT_MODEL,
     device="cuda",
-    use_fp16=True,
-    enable_depth_mask=False,
+    enable_depth_mask=True,
 ):
     """
     Refine projected dense depth maps with LingBot-Depth.
@@ -171,7 +170,7 @@ def run_lingbot_depth_refinement(
             image_t,
             depth_in=depth_t,
             enable_depth_mask=enable_depth_mask,
-            use_fp16=use_fp16,
+            use_fp16=True,
             intrinsics=intrinsics_t,
         )
         depth_pred = output["depth"].squeeze().detach().cpu().numpy()
@@ -196,7 +195,7 @@ def run_lingbot_depth_refinement_from_dirs(
     model_name=DEFAULT_LINGBOT_MODEL,
     device="cuda",
     use_fp16=True,
-    enable_depth_mask=False,
+    enable_depth_mask=True,
 ):
     images_dir = Path(images_dir)
     image_paths = []

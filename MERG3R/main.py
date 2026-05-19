@@ -1,3 +1,4 @@
+from pydoc import describe
 import torch
 import numpy as np
 import os
@@ -69,24 +70,39 @@ def drop_untracked_frames(sequence, final_predictions, images, track, points_id,
 
 def parse_args():
     parser = argparse.ArgumentParser("Test parallel inference on VGGT. ")
-    parser.add_argument("--subset_size", type=int, default=55)
+    ################ MERG3R ################
+    parser.add_argument("--subset_size", type=int, default=100)
     parser.add_argument("--num_images", type=int, default=-1)
     parser.add_argument("--overlap", type=int, default=5)
     parser.add_argument("--subsample", type=int, default=1)
     parser.add_argument("--write_local", action="store_true")
     parser.add_argument("--ba_type", type=str, default="gradient")
     parser.add_argument("--alignment_type", type=str, default="weighted_iterative")
-    parser.add_argument("--global_ba", action="store_true")
+    parser.add_argument("--global_ba", action="store_true", default=True)
+    parser.add_argument("--dataset", type=str)
+    parser.add_argument("--output_dir", type=str, required=True)
+    parser.add_argument("--sequence_type", type=str, default="shortest_path")
+    parser.add_argument("--lr", type=float, default=3e-3)  # 3e-4
+    parser.add_argument("--epoch", type=int, default=300)
+    parser.add_argument("--max_reproj", type=float, default=8.0)
+    parser.add_argument("--stride", type=int, default=10, help="stride of save colmap points")
+    parser.add_argument("--model", type=str, default="pi3x", choices=['vggt', 'pi3', 'pi3x'])
+    parser.add_argument("--pi3x_intrinsics_method", type=str, default="moge", choices=["lstsq", "moge"])
+    parser.add_argument("--multi_dirs", action="store_true")
+    parser.add_argument("--point_vis_threshold", type=float, default=20.0)
+    parser.add_argument("--tracking_type", type=str, default="graph", choices=['graph', 'video'])
+    parser.add_argument("--alpha", type=float, default=0.7)
+    parser.add_argument("--splitting_type", type=str, default="interleave", choices=['interleave', 'zigzag', 'threshold', "original", "original_threshold"])
+    parser.add_argument("--format", type=str, default="txt", choices=['txt', 'bin'])
+    ################ MERG3R ################
+
+    ################ BAE ################
     parser.add_argument("--bae_refine", action="store_true", help="Run BAE sparse refinement after MERG3R global BA.")
     parser.add_argument("--bae_iters", type=int, default=20)
     parser.add_argument("--bae_optimize_intrinsics", action="store_true")
-    parser.add_argument("--dataset", type=str)
-    parser.add_argument("--output_dir", type=str, required=True)
-    parser.add_argument("--sequence_type", type=str, default="video")
-    parser.add_argument("--lr", type=float, default=1e-4)  # 3e-4
-    parser.add_argument("--epoch", type=int, default=300)
-    parser.add_argument("--max_reproj", type=float, default=8.0)
-    parser.add_argument("--stride", type=int, default=100)
+    ################ BAE ################
+
+    ################ SAVE DENSE ################
     parser.add_argument(
         "--dense_max_points",
         type=int,
@@ -143,6 +159,9 @@ def parse_args():
         choices=["cuda", "cpu"],
         help="Projection backend for dense depth export.",
     )
+    ################ SAVE DENSE ################
+
+    ################ LINGBOT ################
     parser.add_argument(
         "--lingbot_refine",
         action="store_true",
@@ -154,66 +173,9 @@ def parse_args():
         default=None,
         help="Directory for LingBot-Depth refined outputs. Defaults to <output_dir>/lingbot_depth.",
     )
-    parser.add_argument(
-        "--lingbot_model",
-        type=str,
-        default="robbyant/lingbot-depth-pretrain-vitl-14-v0.5/model.pt",
-        help="LingBot-Depth model path or Hugging Face ID.",
-    )
-    parser.add_argument(
-        "--lingbot_no_fp16",
-        action="store_true",
-        help="Disable LingBot-Depth mixed precision inference.",
-    )
-    parser.add_argument(
-        "--lingbot_enable_depth_mask",
-        action="store_true",
-        help="Enable LingBot-Depth depth token masking during refinement.",
-    )
-    parser.add_argument(
-        "--no_lingbot_refined_ply",
-        dest="lingbot_refined_ply",
-        action="store_false",
-        default=True,
-        help="Disable dense_lingbot_refined_points.ply export after LingBot-Depth refinement.",
-    )
-    parser.add_argument(
-        "--lingbot_refined_ply_stride",
-        type=int,
-        default=-1,
-        help="Pixel stride for dense_lingbot_refined_points.ply. Set <=0 to reuse --dense_depth_stride.",
-    )
-    parser.add_argument(
-        "--lingbot_refined_ply_max_points",
-        type=int,
-        default=-1,
-        help="Maximum points in dense_lingbot_refined_points.ply. Set <=0 to reuse --dense_max_points.",
-    )
-    parser.add_argument(
-        "--lingbot_refined_ply_max_depth",
-        type=float,
-        default=None,
-        help="Optional max depth filter in meters for dense_lingbot_refined_points.ply.",
-    )
-    parser.add_argument(
-        "--lingbot_refined_ply_projected_mask",
-        dest="lingbot_refined_ply_projected_mask",
-        action="store_true",
-        default=True,
-        help="Filter dense_lingbot_refined_points.ply with projected input depth valid mask.",
-    )
-    parser.add_argument(
-        "--no_lingbot_refined_ply_projected_mask",
-        dest="lingbot_refined_ply_projected_mask",
-        action="store_false",
-        help="Do not filter dense_lingbot_refined_points.ply with projected input depth valid mask.",
-    )
-    parser.add_argument(
-        "--lingbot_refined_ply_projected_mask_min_depth",
-        type=float,
-        default=1e-6,
-        help="Minimum projected input depth considered valid for refined PLY mask.",
-    )
+    ################ LINGBOT ################ 
+
+    ################ DENSE DEBUG ################
     parser.add_argument(
         "--dense_debug",
         dest="dense_debug",
@@ -233,6 +195,9 @@ def parse_args():
         default=2_000_000,
         help="Maximum points to export in dense_debug/dense_before_correction.ply. Set <=0 to disable.",
     )
+    ################ DENSE DEBUG ################
+
+    ################ DENSE CORRECTION ################
     parser.add_argument(
         "--dense_correction",
         type=str,
@@ -250,15 +215,8 @@ def parse_args():
     parser.add_argument("--dense_correction_bias_abs_max", type=float, default=0.25)
     parser.add_argument("--dense_correction_depth_ratio_min", type=float, default=0.7)
     parser.add_argument("--dense_correction_depth_ratio_max", type=float, default=1.3)
-    parser.add_argument("--model", type=str, default="pi3x", choices=['vggt', 'pi3', 'pi3x'])
-    parser.add_argument("--pi3x_ckpt", type=str, default=None, help="Optional local Pi3X checkpoint path. If omitted, loads yyfz233/Pi3X.")
-    parser.add_argument("--pi3x_intrinsics_method", type=str, default="lstsq", choices=["lstsq", "moge"])
-    parser.add_argument("--multi_dirs", action="store_true")
-    parser.add_argument("--point_vis_threshold", type=float, default=50.0)
-    parser.add_argument("--tracking_type", type=str, default="graph", choices=['graph', 'video'])
-    parser.add_argument("--alpha", type=float, default=0.8)
-    parser.add_argument("--splitting_type", type=str, default="interleave", choices=['interleave', 'zigzag', 'threshold', "original", "original_threshold"])
-    parser.add_argument("--format", type=str, default="txt", choices=['txt', 'bin'])
+    ################ DENSE CORRECTION ################
+
     args = parser.parse_args()
 
     
@@ -338,7 +296,7 @@ def main():
     torch.cuda.empty_cache()
 
     
-    model, _ = load_model(args.model, device=device, pi3x_ckpt=args.pi3x_ckpt)
+    model, _ = load_model(args.model, device=device)
     inf_start = time.time()
 
     sequence.predictions = run_inference_step_by_step(
@@ -608,42 +566,22 @@ def main():
             os.path.join(dense_depth_dir, "depth_npy"),
             lingbot_output_dir,
             shared_intrinsic,
-            model_name=args.lingbot_model,
             device=device,
-            use_fp16=not args.lingbot_no_fp16,
-            enable_depth_mask=args.lingbot_enable_depth_mask,
         )
         lingbot_end = time.time()
-        if args.lingbot_refined_ply:
-            lingbot_refined_ply_start = time.time()
-            lingbot_refined_ply_stride = (
-                args.lingbot_refined_ply_stride
-                if args.lingbot_refined_ply_stride > 0
-                else args.dense_depth_stride
-            )
-            lingbot_refined_ply_max_points = (
-                args.lingbot_refined_ply_max_points
-                if args.lingbot_refined_ply_max_points > 0
-                else (args.dense_max_points if args.dense_max_points > 0 else None)
-            )
-            lingbot_refined_ply_stats = export_depth_npy_world_points_ply(
-                os.path.join(args.output_dir, "dense_lingbot_refined_points.ply"),
-                os.path.join(lingbot_output_dir, "depth_npy"),
-                sequence.image_names,
-                sequence.images,
-                final_predictions['extrinsic'],
-                shared_intrinsic,
-                stride=lingbot_refined_ply_stride,
-                max_points=lingbot_refined_ply_max_points,
-                max_depth=args.lingbot_refined_ply_max_depth,
-                valid_mask_depth_npy_dir=(
-                    os.path.join(dense_depth_dir, "depth_npy")
-                    if args.lingbot_refined_ply_projected_mask
-                    else None
-                ),
-                valid_mask_min_depth=args.lingbot_refined_ply_projected_mask_min_depth,
-            )
-            lingbot_refined_ply_end = time.time()
+        lingbot_refined_ply_start = time.time()
+        lingbot_refined_ply_stats = export_depth_npy_world_points_ply(
+            os.path.join(args.output_dir, "dense_lingbot_refined_points.ply"),
+            os.path.join(lingbot_output_dir, "depth_npy"),
+            sequence.image_names,
+            sequence.images,
+            final_predictions['extrinsic'],
+            shared_intrinsic,
+            stride=args.dense_depth_stride,
+            max_points=args.dense_max_points if args.dense_max_points > 0 else None,
+            valid_mask_depth_npy_dir=os.path.join(dense_depth_dir, "depth_npy"),
+        )
+        lingbot_refined_ply_end = time.time()
 
     if torch.cuda.is_available():
         torch.cuda.synchronize()
