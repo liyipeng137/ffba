@@ -19,7 +19,7 @@ fi
 mkdir -p "${OUTPUT_DIR}"
 
 # Set the path to the dinov3 repo and the weights url prior to running the script
-export MERG3R_DINOV3_REPO_DIR=./dinov3
+export MERG3R_DINOV3_REPO_DIR=./third_party/dinov3
 export MERG3R_DINOV3_WEIGHTS_URL=https://...
 
 python main.py \

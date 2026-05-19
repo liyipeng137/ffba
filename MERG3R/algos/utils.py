@@ -1908,11 +1908,14 @@ def get_sim_matrix(
         _RESNET_STD = [0.229, 0.224, 0.225]
         use_hf_dinov3 = model_name == "dinov3"
         if use_hf_dinov3:
-            # repo_dir = os.environ.get("MERG3R_DINOV3_REPO_DIR")
+            # repo_dir = os.environ.get(
+            #     "MERG3R_DINOV3_REPO_DIR",
+            #     os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "third_party", "dinov3"),
+            # )
             # weights_url = os.environ.get("MERG3R_DINOV3_WEIGHTS_URL", None)
-            # if not repo_dir:
+            # if not os.path.isdir(repo_dir):
             #     raise ValueError(
-            #         "DINOv3 requires MERG3R_DINOV3_REPO_DIR (path to dinov3 repo). "
+            #         f"DINOv3 repo directory not found: {repo_dir}. "
             #         "Use model_name='dinov2' for the default public model."
             #     )
             # model = torch.hub.load(

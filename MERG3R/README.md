@@ -37,8 +37,8 @@ It scales base geometry models (`VGGT`, `Pi3`) to long, unordered image collecti
 ├── run.sh                      # recommended starting script
 ├── colmap_export.py            # COLMAP export helpers
 ├── algos/                      # sequence split, alignment, BA, tracking
-├── vggt/                       # VGGT model code
-├── pi3/                        # Pi3 model code
+├── feedforward/                # VGGT, Pi3, and Pi3X model code
+├── third_party/                # external dependencies such as DINOv3
 ├── eval/                       # evaluation scripts
 ├── colmap_to_nerf.py           # convert COLMAP txt -> transforms.json
 └── requirements.txt
@@ -53,7 +53,7 @@ It scales base geometry models (`VGGT`, `Pi3`) to long, unordered image collecti
 pip install -r requirements.txt
 ```
 
-3. Follow [DINOv3](https://github.com/facebookresearch/dinov3) to clone the repo and get the url. Set the environment variables `MERG3R_DINOV3_REPO_DIR` and `MERG3R_DINOV3_WEIGHTS_URL` in `run.sh`. 
+3. DINOv3 is expected at `third_party/dinov3` by default. If you use local `torch.hub` loading, set `MERG3R_DINOV3_REPO_DIR` and `MERG3R_DINOV3_WEIGHTS_URL` in `run.sh`.
 
 Notes:
 - Model weights are downloaded from Hugging Face on first run.
