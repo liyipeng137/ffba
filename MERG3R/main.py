@@ -10,6 +10,7 @@ from algos.sequence import create_sequence
 from algos.bundle_adjustment import global_bundle_adjustment
 from algos.alignment import align_extrinsics
 from algos.tracking import  extract_matches_lightglue, graph_extract_matches_lightglue
+from algos.loma_tracking import graph_extract_matches_loma
 from algos.dense_debug import export_dense_debug_outputs
 from algos.dense_correction import apply_inverse_depth_affine_correction
 from algos.lingbot_depth_refine import run_lingbot_depth_refinement
@@ -91,6 +92,9 @@ def parse_args():
     parser.add_argument("--multi_dirs", action="store_true")
     parser.add_argument("--point_vis_threshold", type=float, default=20.0)
     parser.add_argument("--tracking_type", type=str, default="graph", choices=['graph', 'video'])
+    parser.add_argument("--tracking_matcher", type=str, default="loma", choices=['lightglue', 'loma'])
+    parser.add_argument("--loma_arch", type=str, default="LoMa-B", choices=['LoMa-B', 'LoMa-B128', 'LoMa-L', 'LoMa-G', 'LoMa-R'])
+    parser.add_argument("--loma_filter_threshold", type=float, default=0.1)
     parser.add_argument("--alpha", type=float, default=0.7)
     parser.add_argument("--splitting_type", type=str, default="interleave", choices=['interleave', 'zigzag', 'threshold', "original", "original_threshold"])
     parser.add_argument("--format", type=str, default="txt", choices=['txt', 'bin'])
@@ -361,10 +365,18 @@ def main():
         elif args.sequence_type == 'shortest_path':
 
             if args.tracking_type =="graph":
-                track, points_id, points_3d, points_conf = graph_extract_matches_lightglue(images, final_predictions['world_points'], 
-                                                                        final_predictions['depth_conf'], 
-                                                                        final_predictions['extrinsic'], final_predictions['intrinsic'], k=5,
-                                                                        max_num_keypoints=4096, device=device)
+                if args.tracking_matcher == "loma":
+                    track, points_id, points_3d, points_conf = graph_extract_matches_loma(images, final_predictions['world_points'], 
+                                                                            final_predictions['depth_conf'], 
+                                                                            final_predictions['extrinsic'], final_predictions['intrinsic'], k=5,
+                                                                            max_num_keypoints=4096, device=device,
+                                                                            arch=args.loma_arch,
+                                                                            filter_threshold=args.loma_filter_threshold)
+                else:
+                    track, points_id, points_3d, points_conf = graph_extract_matches_lightglue(images, final_predictions['world_points'], 
+                                                                            final_predictions['depth_conf'], 
+                                                                            final_predictions['extrinsic'], final_predictions['intrinsic'], k=5,
+                                                                            max_num_keypoints=4096, device=device)
             elif args.tracking_type == 'video':
                 reordered_images = images[sequence.video_path]
                 reordered_points = final_predictions['world_points'][sequence.video_path]
@@ -450,6 +462,15 @@ def main():
 
     peak_mem = torch.cuda.max_memory_allocated() / (1024**2)  # in MiB
     elapsed = end_time - start_time
+
+    single_frame_depth_start = time.time()
+    single_frame_depth_stats = export_prediction_depth_maps(
+        final_predictions,
+        sequence.image_names,
+        os.path.join(args.output_dir, "single_frame_depth"),
+        conf_threshold=args.point_vis_threshold,
+    )
+    single_frame_depth_end = time.time()
 
     dense_debug_stats = None
     if args.dense_debug and args.global_ba:
@@ -563,7 +584,8 @@ def main():
         lingbot_stats = run_lingbot_depth_refinement(
             sequence.images,
             sequence.image_names,
-            os.path.join(dense_depth_dir, "depth_npy"),
+            # os.path.join(dense_depth_dir, "depth_npy"),
+            os.path.join(args.output_dir, "single_frame_depth", "depth_npy"),
             lingbot_output_dir,
             shared_intrinsic,
             device=device,
@@ -604,6 +626,13 @@ def main():
             f.write(f"BAE Cameras: {bae_stats['num_cameras']}\n")
             f.write(f"BAE Dropped Cameras: {bae_stats['num_dropped_cameras']}\n")
             f.write(f"BAE Points: {bae_stats['num_points']}\n")
+        if single_frame_depth_stats is not None:
+            f.write(f"Single Frame Depth Frames: {single_frame_depth_stats['num_depth_frames']}\n")
+            f.write(f"Single Frame Depth Nonzero Pixels: {single_frame_depth_stats['num_nonzero_depth_pixels']}\n")
+            f.write(f"Single Frame Depth Conf Percentile: {single_frame_depth_stats['conf_threshold']}\n")
+            f.write(f"Single Frame Depth Conf Threshold Value: {single_frame_depth_stats['conf_threshold_value']}\n")
+            f.write(f"Single Frame Depth Masked By Conf: {single_frame_depth_stats['num_masked_by_conf']}\n")
+            f.write(f"Single Frame Depth Output Dir: {single_frame_depth_stats['output_dir']}\n")
         if dense_debug_stats is not None:
             f.write(f"Dense Debug Observations: {dense_debug_stats['num_observations']}\n")
             f.write(f"Dense Debug Frames With Anchors: {dense_debug_stats['num_frames_with_anchors']}\n")
@@ -630,6 +659,7 @@ def main():
             f.write(f"LingBot Refined PLY Projected Mask: {lingbot_refined_ply_stats['valid_mask_depth_npy_dir']}\n")
         f.write(f"Dense World Collect Time: {dense_collect_end - dense_collect_start} seconds\n")
         f.write(f"Dense PLY Time: {dense_ply_end - dense_ply_start} seconds\n")
+        f.write(f"Single Frame Depth Time: {single_frame_depth_end - single_frame_depth_start} seconds\n")
         f.write(f"Dense Depth Time: {dense_depth_end - dense_depth_start} seconds\n")
         f.write(f"LingBot Depth Time: {lingbot_end - lingbot_start} seconds\n")
         f.write(f"LingBot Refined PLY Time: {lingbot_refined_ply_end - lingbot_refined_ply_start} seconds\n")

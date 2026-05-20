@@ -365,3 +365,11 @@ MERG3R论文介绍了一种名为MERG3R的无训练（training-free）分而治�
         其中 $\pi_i : \mathbb{R}^3 \to \mathbb{R}^2$ 是3D点在图像 $I_i$ 平面上的投影。与MASt3R-SfM等只优化图像对的方法不同，MERG3R在所有视图上优化，从而提高了全局一致性和准确性。
 
 MERG3R的贡献在于其训练无关、模型无关的特性，可与任何预训练的几何基础模型结合，显著提升其在内存效率、可扩展性和重建精度方面的表现，尤其是在数据集超出GPU内存容量限制时。实验结果表明，MERG3R在7-Scenes、NRGBD、Tanks & Temples和Cambridge Landmarks等大规模数据集上，无论是在相机姿态估计还是点云质量方面，都持续优于或媲美现有State-of-the-Art方法，并大幅降低了运行时长和内存消耗。
+
+
+# 项目改造
+## 当前已经对项目增加了如下改造
+--- 增加pi3x作为基础模型
+--- 增加bae作为global ba后的二次ba
+--- 增加基于融合后的dense 点云反投影深度输出
+--- 增加lingbot-depth refine

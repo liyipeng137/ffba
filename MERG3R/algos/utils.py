@@ -1382,6 +1382,60 @@ def save_depth_pngs(depth_np, image_names, output_dir):
         cv2.imwrite(os.path.join(depth_vis_dir, base_name), depth_color)
 
 
+def export_prediction_depth_maps(predictions, image_names, output_dir, conf_threshold=None):
+    """
+    Save per-frame prediction depth maps without reprojecting the merged dense cloud.
+    This is intended for temporary analysis against projected dense depth outputs.
+    """
+    if "depth" not in predictions:
+        raise ValueError("predictions must contain a 'depth' entry")
+
+    depth_np = predictions["depth"]
+    if isinstance(depth_np, torch.Tensor):
+        depth_np = depth_np.detach().cpu().numpy()
+    depth_np = np.asarray(depth_np, dtype=np.float32)
+    if depth_np.ndim == 4 and depth_np.shape[-1] == 1:
+        depth_np = depth_np[..., 0]
+    if depth_np.ndim != 3:
+        raise ValueError(f"Expected prediction depth shape (N, H, W) or (N, H, W, 1), got {depth_np.shape}")
+
+    masked_pixels = 0
+    conf_threshold_value = None
+    if conf_threshold is not None:
+        if "depth_conf" not in predictions:
+            raise ValueError("predictions must contain 'depth_conf' when conf_threshold is provided")
+        conf_np = predictions["depth_conf"]
+        if isinstance(conf_np, torch.Tensor):
+            conf_np = conf_np.detach().cpu().numpy()
+        conf_np = np.asarray(conf_np, dtype=np.float32)
+        if conf_np.ndim == 4 and conf_np.shape[-1] == 1:
+            conf_np = conf_np[..., 0]
+        if conf_np.shape != depth_np.shape:
+            raise ValueError(f"Expected depth_conf shape {depth_np.shape}, got {conf_np.shape}")
+
+        conf_threshold_value = 0.0 if conf_threshold == 0.0 else float(np.percentile(conf_np, 5))
+        valid_conf = np.isfinite(conf_np) & (conf_np >= conf_threshold_value) & (conf_np > 1e-5)
+        masked_pixels = int(depth_np.size - np.count_nonzero(valid_conf))
+        depth_np = np.where(valid_conf, depth_np, 0.0).astype(np.float32, copy=False)
+
+    save_depth_pngs(depth_np=depth_np, image_names=image_names, output_dir=output_dir)
+    nonzero_pixels = int(np.count_nonzero(np.isfinite(depth_np) & (depth_np > 0)))
+    print(
+        f"[DEPTH EXPORT] Saved single-frame prediction depth maps to {output_dir} "
+        f"(frames={depth_np.shape[0]}, nonzero_pixels={nonzero_pixels}, "
+        f"conf_percentile={conf_threshold}, conf_threshold_value={conf_threshold_value}, "
+        f"masked_pixels={masked_pixels})"
+    )
+    return {
+        "num_depth_frames": int(depth_np.shape[0]),
+        "num_nonzero_depth_pixels": nonzero_pixels,
+        "conf_threshold": conf_threshold,
+        "conf_threshold_value": conf_threshold_value,
+        "num_masked_by_conf": masked_pixels,
+        "output_dir": output_dir,
+    }
+
+
 def export_dense_projected_depth_maps(
     output_dir,
     local_points,
