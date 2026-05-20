@@ -373,3 +373,5 @@ MERG3R的贡献在于其训练无关、模型无关的特性，可与任何预�
 --- 增加bae作为global ba后的二次ba
 --- 增加基于融合后的dense 点云反投影深度输出
 --- 增加lingbot-depth refine
+
+--- 增加直接输出feedforward模型返回的depth并refine,不再merge dense点云后投影深度

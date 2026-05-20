@@ -11,6 +11,7 @@ from algos.bundle_adjustment import global_bundle_adjustment
 from algos.alignment import align_extrinsics
 from algos.tracking import  extract_matches_lightglue, graph_extract_matches_lightglue
 from algos.loma_tracking import graph_extract_matches_loma
+from algos.hloc_tracking import graph_extract_matches_hloc
 from algos.dense_debug import export_dense_debug_outputs
 from algos.dense_correction import apply_inverse_depth_affine_correction
 from algos.lingbot_depth_refine import run_lingbot_depth_refinement
@@ -92,7 +93,7 @@ def parse_args():
     parser.add_argument("--multi_dirs", action="store_true")
     parser.add_argument("--point_vis_threshold", type=float, default=20.0)
     parser.add_argument("--tracking_type", type=str, default="graph", choices=['graph', 'video'])
-    parser.add_argument("--tracking_matcher", type=str, default="loma", choices=['lightglue', 'loma'])
+    parser.add_argument("--tracking_matcher", type=str, default="loma", choices=['lightglue', 'loma', 'hloc'])
     parser.add_argument("--loma_arch", type=str, default="LoMa-B", choices=['LoMa-B', 'LoMa-B128', 'LoMa-L', 'LoMa-G', 'LoMa-R'])
     parser.add_argument("--loma_filter_threshold", type=float, default=0.1)
     parser.add_argument("--alpha", type=float, default=0.7)
@@ -365,7 +366,17 @@ def main():
         elif args.sequence_type == 'shortest_path':
 
             if args.tracking_type =="graph":
-                if args.tracking_matcher == "loma":
+                if args.tracking_matcher == "hloc":
+                    track, points_id, points_3d, points_conf = graph_extract_matches_hloc(
+                        images,
+                        final_predictions['extrinsic'],
+                        final_predictions['intrinsic'],
+                        k=5,
+                        workspace_dir=os.path.join(args.output_dir, "hloc_tracking"),
+                        skip_geometric_verification=False,
+                        overwrite=True,
+                    )
+                elif args.tracking_matcher == "loma":
                     track, points_id, points_3d, points_conf = graph_extract_matches_loma(images, final_predictions['world_points'], 
                                                                             final_predictions['depth_conf'], 
                                                                             final_predictions['extrinsic'], final_predictions['intrinsic'], k=5,
