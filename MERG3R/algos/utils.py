@@ -611,6 +611,10 @@ def run_inference_step_by_step(model, batches, size_hw, device, need_features=Fa
             extri, intri = pose_encoding_to_extri_intri(prediction["pose_enc"], size_hw)
             prediction['extrinsic'] = extri.squeeze(0)
             prediction['intrinsic'] = intri.squeeze(0)
+            prediction['local_points'] = depth_intrinsics_to_local_points(
+                prediction['depth'],
+                prediction['intrinsic'],
+            )
             prediction['world_points'] = unproject_depth_map_to_point_map(prediction['depth'].squeeze(0), extri.squeeze(0), intri.squeeze(0))
 
             if need_features:
@@ -651,6 +655,10 @@ def run_inference_step_by_step(model, batches, size_hw, device, need_features=Fa
             prediction['pose_enc'] = res['pose_enc'].to(dtype=torch.float32, device='cpu')
             prediction['extrinsic'] = extri.to(dtype=torch.float32, device='cpu').squeeze(0)
             prediction['intrinsic'] = intri.to(dtype=torch.float32, device='cpu').squeeze(0)
+            prediction['local_points'] = depth_intrinsics_to_local_points(
+                prediction['depth'],
+                prediction['intrinsic'],
+            )
             prediction['world_points'] = unproject_depth_map_to_point_map(
                 prediction['depth'].squeeze(0),
                 prediction['extrinsic'],
@@ -736,6 +744,57 @@ def run_inference_step_by_step(model, batches, size_hw, device, need_features=Fa
     print(f"[INFERENCE] Time used: {end - start}s. ")
     
     return predictions
+
+
+def depth_intrinsics_to_local_points(depth, intrinsic):
+    """
+    Back-project z-depth into camera-local XYZ coordinates using pinhole intrinsics.
+
+    depth: (1, N, H, W, 1), (N, H, W, 1), or (N, H, W)
+    intrinsic: (N, 3, 3)
+    returns: (N, H, W, 3)
+    """
+    if not isinstance(depth, torch.Tensor):
+        depth = torch.as_tensor(depth)
+    if not isinstance(intrinsic, torch.Tensor):
+        intrinsic = torch.as_tensor(intrinsic, dtype=depth.dtype, device=depth.device)
+    else:
+        intrinsic = intrinsic.to(device=depth.device, dtype=depth.dtype)
+
+    if depth.ndim == 5:
+        if depth.shape[0] != 1:
+            raise ValueError(f"Expected batch size 1 for depth, got shape {tuple(depth.shape)}")
+        depth = depth.squeeze(0)
+    if depth.ndim == 4:
+        if depth.shape[-1] != 1:
+            raise ValueError(f"Expected depth last dimension 1, got shape {tuple(depth.shape)}")
+        depth = depth[..., 0]
+    if depth.ndim != 3:
+        raise ValueError(f"Expected depth shape (N, H, W), got {tuple(depth.shape)}")
+
+    if intrinsic.ndim == 4:
+        if intrinsic.shape[0] != 1:
+            raise ValueError(f"Expected batch size 1 for intrinsic, got shape {tuple(intrinsic.shape)}")
+        intrinsic = intrinsic.squeeze(0)
+
+    num_frames, height, width = depth.shape
+    if intrinsic.shape != (num_frames, 3, 3):
+        raise ValueError(f"Expected intrinsic shape ({num_frames}, 3, 3), got {tuple(intrinsic.shape)}")
+
+    y, x = torch.meshgrid(
+        torch.arange(height, dtype=depth.dtype, device=depth.device),
+        torch.arange(width, dtype=depth.dtype, device=depth.device),
+        indexing="ij",
+    )
+
+    fx = intrinsic[:, 0, 0].view(num_frames, 1, 1)
+    fy = intrinsic[:, 1, 1].view(num_frames, 1, 1)
+    cx = intrinsic[:, 0, 2].view(num_frames, 1, 1)
+    cy = intrinsic[:, 1, 2].view(num_frames, 1, 1)
+
+    x = (x.unsqueeze(0) - cx) / fx * depth
+    y = (y.unsqueeze(0) - cy) / fy * depth
+    return torch.stack([x, y, depth], dim=-1).to(dtype=torch.float32, device='cpu')
 
 
 def compute_depth(points, extrin):
