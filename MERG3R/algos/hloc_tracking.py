@@ -7,6 +7,7 @@ import numpy as np
 import torch
 from PIL import Image as PILImage
 
+from algos.tracking_metrics import print_tracking_metrics
 from algos.utils import get_sim_matrix
 
 
@@ -307,4 +308,20 @@ def graph_extract_matches_hloc(
     print("End HLoc tracking.")
     print("Num of HLoc graph pairs: ", len(pairs))
     print("Num of HLoc tracks: ", result[2].shape[0])
+    print_tracking_metrics(
+        "HLocGraph",
+        result[0],
+        result[1],
+        result[2],
+        extrinsic,
+        intrinsic,
+        points_conf=result[3],
+        extra_stats={
+            "pair_count": len(pairs),
+            "feature_conf": feature_conf_name,
+            "matcher_conf": matcher_conf_name,
+            "skip_geometric_verification": skip_geometric_verification,
+            "workspace_dir": workspace,
+        },
+    )
     return result

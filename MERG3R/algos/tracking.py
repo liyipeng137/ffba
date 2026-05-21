@@ -9,6 +9,7 @@ ensure_feedforward_on_path()
 
 from vggt.dependency.vggsfm_utils import initialize_feature_extractors, extract_keypoints
 from algos.geometry import project_3d_points_to_image_numpy
+from algos.tracking_metrics import filter_tracks_by_reprojection, print_tracking_metrics
 from algos.utils import get_sim_matrix, rbd
 from lightglue import LightGlue, SuperPoint
 
@@ -122,29 +123,38 @@ def extract_matches_lightglue(images, points, depth_conf, extrinsic, intrinsic, 
     final_points = []
     final_points_conf = []
     for subset in all_matches.subsets():
-        
+        curr_point_id = len(final_points)
         point = np.zeros((3))
         conf_sum = 0
+        seen_images = set()
+        observations = []
         for img, point_id in subset:
+            if img in seen_images:
+                continue
+            seen_images.add(img)
             query_point = all_features[img]['keypoints'].squeeze()[point_id]
-            curr_point_id = len(final_points)
-            if len(points_id[img]) == 0 or points_id[img][-1] != curr_point_id:
-                final_track[img].append(query_point.cpu().numpy())
-                points_id[img].append(curr_point_id)
-                
-                query_points_round_long = query_point.squeeze(0).long().cpu().numpy()
-                query_points_3d = points[img][
-                    query_points_round_long[1], query_points_round_long[0]
-                ]
-                query_points_3d_conf = depth_conf[img][
-                    query_points_round_long[1], query_points_round_long[0]
-                ]
+            query_point_np = query_point.cpu().numpy()
 
-                point += query_points_3d * query_points_3d_conf
-                conf_sum += query_points_3d_conf
-        
+            query_points_round_long = query_point.squeeze(0).long().cpu().numpy()
+            query_points_3d = points[img][
+                query_points_round_long[1], query_points_round_long[0]
+            ]
+            query_points_3d_conf = depth_conf[img][
+                query_points_round_long[1], query_points_round_long[0]
+            ]
+
+            point += query_points_3d * query_points_3d_conf
+            conf_sum += query_points_3d_conf
+            observations.append((img, query_point_np))
+
+        if len(seen_images) < 2 or np.any(conf_sum <= 0):
+            continue
         point = point / conf_sum
-        conf = conf_sum / len(subset)
+        conf = conf_sum / len(seen_images)
+
+        for img, query_point_np in observations:
+            final_track[img].append(query_point_np)
+            points_id[img].append(curr_point_id)
 
         final_points.append(point)
         final_points_conf.append(conf)
@@ -155,8 +165,12 @@ def extract_matches_lightglue(images, points, depth_conf, extrinsic, intrinsic, 
     final_track = [np.stack(track) if track else np.array([]) for track in final_track]
     points_id = [np.stack(idx) if idx else np.array([]) for idx in points_id ]
     
-    final_points = np.stack(final_points)
-    final_points_conf = np.stack(final_points_conf)
+    if final_points:
+        final_points = np.stack(final_points)
+        final_points_conf = np.stack(final_points_conf)
+    else:
+        final_points = np.empty((0, 3), dtype=np.float32)
+        final_points_conf = np.empty((0,), dtype=np.float32)
 
     return final_track, points_id, final_points, final_points_conf
 
@@ -198,6 +212,11 @@ def graph_extract_matches_lightglue(images, points, depth_conf, extrinsic, intri
         for n in top_k_neighbors_indices:
             pairs.append((i, n.item()))
 
+    raw_match_total = 0
+    valid_match_total = 0
+    raw_match_counts = []
+    valid_match_counts = []
+    valid_pair_reproj_errors = []
 
     for i1, i2 in pairs:
         feats0 = all_features[i1]
@@ -208,6 +227,9 @@ def graph_extract_matches_lightglue(images, points, depth_conf, extrinsic, intri
             rbd(x) for x in [feats0, feats1, matches01]
         ]  # remove batch dimension
         matches = matches01["matches"]  # (N, 2)
+        raw_match_count = int(matches.shape[0])
+        raw_match_total += raw_match_count
+        raw_match_counts.append(raw_match_count)
         kpts0, kpts1 = feats0["keypoints"], feats1["keypoints"],
         m_kpts0, m_kpts1 = kpts0[matches[..., 0]].cpu().numpy(), kpts1[matches[..., 1]].cpu().numpy()
 
@@ -229,6 +251,11 @@ def graph_extract_matches_lightglue(images, points, depth_conf, extrinsic, intri
 
         valid_matches = (error1 < max_reproj_error) & (error2 < max_reproj_error) & valid_mask_1 & valid_mask_2
         # print("Num of Valid Matches: ", valid_matches.sum())
+        valid_match_count = int(valid_matches.sum())
+        valid_match_total += valid_match_count
+        valid_match_counts.append(valid_match_count)
+        if valid_match_count > 0:
+            valid_pair_reproj_errors.append(np.maximum(error1[valid_matches], error2[valid_matches]))
         matches = matches[valid_matches]
 
         for j in range(matches.shape[0]):
@@ -246,29 +273,38 @@ def graph_extract_matches_lightglue(images, points, depth_conf, extrinsic, intri
     final_points = []
     final_points_conf = []
     for subset in all_matches.subsets():
-        
+        curr_point_id = len(final_points)
         point = np.zeros((3))
         conf_sum = 0
+        seen_images = set()
+        observations = []
         for img, point_id in subset:
+            if img in seen_images:
+                continue
+            seen_images.add(img)
             query_point = all_features[img]['keypoints'].squeeze()[point_id]
-            curr_point_id = len(final_points)
-            if len(points_id[img]) == 0 or points_id[img][-1] != curr_point_id:
-                final_track[img].append(query_point.cpu().numpy())
-                points_id[img].append(curr_point_id)
-                
-                query_points_round_long = query_point.squeeze(0).long().cpu().numpy()
-                query_points_3d = points[img][
-                    query_points_round_long[1], query_points_round_long[0]
-                ]
-                query_points_3d_conf = depth_conf[img][
-                    query_points_round_long[1], query_points_round_long[0]
-                ]
+            query_point_np = query_point.cpu().numpy()
 
-                point += query_points_3d * query_points_3d_conf
-                conf_sum += query_points_3d_conf
-        
+            query_points_round_long = query_point.squeeze(0).long().cpu().numpy()
+            query_points_3d = points[img][
+                query_points_round_long[1], query_points_round_long[0]
+            ]
+            query_points_3d_conf = depth_conf[img][
+                query_points_round_long[1], query_points_round_long[0]
+            ]
+
+            point += query_points_3d * query_points_3d_conf
+            conf_sum += query_points_3d_conf
+            observations.append((img, query_point_np))
+
+        if len(seen_images) < 2 or np.any(conf_sum <= 0):
+            continue
         point = point / conf_sum
-        conf = conf_sum / len(subset)
+        conf = conf_sum / len(seen_images)
+
+        for img, query_point_np in observations:
+            final_track[img].append(query_point_np)
+            points_id[img].append(curr_point_id)
 
         final_points.append(point)
         final_points_conf.append(conf)
@@ -281,7 +317,74 @@ def graph_extract_matches_lightglue(images, points, depth_conf, extrinsic, intri
     points_id = [np.stack(idx) if idx else np.array([]) for idx in points_id ]
 
 
-    final_points = np.stack(final_points)
-    final_points_conf = np.stack(final_points_conf)
+    if final_points:
+        final_points = np.stack(final_points)
+        final_points_conf = np.stack(final_points_conf)
+    else:
+        final_points = np.empty((0, 3), dtype=np.float32)
+        final_points_conf = np.empty((0,), dtype=np.float32)
+
+    print_tracking_metrics(
+        "LightGlueGraphBeforePostFilter",
+        final_track,
+        points_id,
+        final_points,
+        extrinsic,
+        intrinsic,
+        points_conf=final_points_conf,
+    )
+    final_track, points_id, final_points, final_points_conf = filter_tracks_by_reprojection(
+        final_track,
+        points_id,
+        final_points,
+        final_points_conf,
+        extrinsic,
+        intrinsic,
+        max_reproj_error=max_reproj_error,
+        min_track_length=2,
+        label="LightGlueGraph",
+    )
+
+    valid_pair_error_values = (
+        np.concatenate(valid_pair_reproj_errors)
+        if valid_pair_reproj_errors
+        else np.empty((0,), dtype=np.float32)
+    )
+    extra_stats = {
+        "pair_count": len(pairs),
+        "raw_matches": raw_match_total,
+        "valid_matches_after_depth_reproj_filter": valid_match_total,
+        "valid_match_ratio": f"{valid_match_total / max(raw_match_total, 1):.3f}",
+        "raw_matches_per_pair": (
+            "n=0"
+            if not raw_match_counts
+            else f"median={np.median(raw_match_counts):.3f}, mean={np.mean(raw_match_counts):.3f}, max={np.max(raw_match_counts):.3f}"
+        ),
+        "valid_matches_per_pair": (
+            "n=0"
+            if not valid_match_counts
+            else f"median={np.median(valid_match_counts):.3f}, mean={np.mean(valid_match_counts):.3f}, max={np.max(valid_match_counts):.3f}"
+        ),
+        "valid_pair_filter_reproj_px": (
+            "n=0"
+            if valid_pair_error_values.size == 0
+            else (
+                f"median={np.median(valid_pair_error_values):.3f}, "
+                f"mean={np.mean(valid_pair_error_values):.3f}, "
+                f"p90={np.percentile(valid_pair_error_values, 90):.3f}, "
+                f"max={np.max(valid_pair_error_values):.3f}"
+            )
+        ),
+    }
+    print_tracking_metrics(
+        "LightGlueGraph",
+        final_track,
+        points_id,
+        final_points,
+        extrinsic,
+        intrinsic,
+        points_conf=final_points_conf,
+        extra_stats=extra_stats,
+    )
 
     return final_track, points_id, final_points, final_points_conf

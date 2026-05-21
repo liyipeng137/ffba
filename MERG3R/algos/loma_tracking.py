@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from scipy.cluster.hierarchy import DisjointSet
 
 from algos.geometry import project_3d_points_to_image_numpy
+from algos.tracking_metrics import filter_tracks_by_reprojection, print_tracking_metrics
 from algos.utils import get_sim_matrix
 
 
@@ -306,10 +307,46 @@ def graph_extract_matches_loma(
 
     print("End LoMA tracking.")
     print("Num of LoMA graph pairs: ", len(pairs))
-    return _build_tracks_from_matches(
+    track, points_id, points_3d, points_conf = _build_tracks_from_matches(
         all_matches,
         all_features,
         points,
         depth_conf,
         num_images,
     )
+    print_tracking_metrics(
+        "LoMAGraphBeforePostFilter",
+        track,
+        points_id,
+        points_3d,
+        extrinsic,
+        intrinsic,
+        points_conf=points_conf,
+    )
+    track, points_id, points_3d, points_conf = filter_tracks_by_reprojection(
+        track,
+        points_id,
+        points_3d,
+        points_conf,
+        extrinsic,
+        intrinsic,
+        max_reproj_error=max_reproj_error,
+        min_track_length=2,
+        label="LoMAGraph",
+    )
+    print_tracking_metrics(
+        "LoMAGraph",
+        track,
+        points_id,
+        points_3d,
+        extrinsic,
+        intrinsic,
+        points_conf=points_conf,
+        extra_stats={
+            "pair_count": len(pairs),
+            "arch": arch,
+            "filter_threshold": filter_threshold,
+            "max_reproj_error": max_reproj_error,
+        },
+    )
+    return track, points_id, points_3d, points_conf
