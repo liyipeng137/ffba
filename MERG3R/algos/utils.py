@@ -25,9 +25,17 @@ from vggt.models.vggt import VGGT
 from vggt.utils.load_fn import load_and_preprocess_images
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 from vggt.utils.geometry import unproject_depth_map_to_point_map
+from vggt_omega.models import VGGTOmega
+from vggt_omega.utils.pose_enc import encoding_to_camera as vggt_omega_encoding_to_camera
 from pi3.models.pi3 import Pi3
 from pi3x_model.models.pi3x import Pi3X
 from pi3x_model.utils.transforms_utils import recover_intrinsics_from_output
+
+VGGT_OMEGA_CKPT = os.path.join(
+    os.path.dirname(os.path.dirname(__file__)),
+    "checkpoints",
+    "vggt_omega_1b_512.pt",
+)
 
 
 def extrinsic_to_colmap_format(extrinsics):
@@ -543,6 +551,20 @@ def load_model(model_name="vggt", device=None):
         #         if isinstance(state_dict, dict) and "model" in state_dict:
         #             state_dict = state_dict["model"]
         #     model.load_state_dict(state_dict, strict=False)
+    elif model_name == 'vggt_omega':
+        if not os.path.isfile(VGGT_OMEGA_CKPT):
+            raise FileNotFoundError(
+                f"VGGT-Omega checkpoint not found: {VGGT_OMEGA_CKPT}. "
+                "Update VGGT_OMEGA_CKPT in algos/utils.py to point to your local weights."
+            )
+        print(f"Loading VGGT-Omega checkpoint: {VGGT_OMEGA_CKPT}")
+        model = VGGTOmega()
+        state_dict = torch.load(VGGT_OMEGA_CKPT, map_location="cpu")
+        if isinstance(state_dict, dict) and "model" in state_dict:
+            state_dict = state_dict["model"]
+        elif isinstance(state_dict, dict) and "state_dict" in state_dict:
+            state_dict = state_dict["state_dict"]
+        model.load_state_dict(state_dict)
     else:
         raise NotImplementedError("Other model backbones are not implemented!")
 
@@ -606,6 +628,41 @@ def run_inference_step_by_step(model, batches, size_hw, device, need_features=Fa
             torch.cuda.empty_cache()
             gc.collect()
         
+    elif isinstance(model, VGGTOmega):
+        for i, images in enumerate(batches):
+            prediction = dict()
+            if images.shape[-2] % 16 != 0 or images.shape[-1] % 16 != 0:
+                raise ValueError(
+                    "VGGT-Omega requires image height and width to be multiples of 16. "
+                    f"Got {tuple(images.shape[-2:])} for subset {i}."
+                )
+
+            with torch.no_grad():
+                images = images.to(device)
+                res = model(images)
+
+            extri, intri = vggt_omega_encoding_to_camera(
+                res["pose_enc"],
+                res["images"].shape[-2:],
+            )
+
+            prediction['depth'] = res['depth'].to(dtype=torch.float32, device='cpu')
+            prediction['depth_conf'] = res['depth_conf'].to(dtype=torch.float32, device='cpu')
+            prediction['pose_enc'] = res['pose_enc'].to(dtype=torch.float32, device='cpu')
+            prediction['extrinsic'] = extri.to(dtype=torch.float32, device='cpu').squeeze(0)
+            prediction['intrinsic'] = intri.to(dtype=torch.float32, device='cpu').squeeze(0)
+            prediction['world_points'] = unproject_depth_map_to_point_map(
+                prediction['depth'].squeeze(0),
+                prediction['extrinsic'],
+                prediction['intrinsic'],
+            )
+
+            predictions.append(prediction)
+
+            del res, images, extri, intri
+            gc.collect()
+            torch.cuda.empty_cache()
+
     elif isinstance(model, Pi3):
         for i, images in enumerate(batches):
             prediction = dict()

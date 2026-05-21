@@ -88,7 +88,7 @@ def parse_args():
     parser.add_argument("--epoch", type=int, default=300)
     parser.add_argument("--max_reproj", type=float, default=8.0)
     parser.add_argument("--stride", type=int, default=10, help="stride of save colmap points")
-    parser.add_argument("--model", type=str, default="pi3x", choices=['vggt', 'pi3', 'pi3x'])
+    parser.add_argument("--model", type=str, default="pi3x", choices=['vggt', 'pi3', 'pi3x', 'vggt_omega'])
     parser.add_argument("--pi3x_intrinsics_method", type=str, default="moge", choices=["lstsq", "moge"])
     parser.add_argument("--multi_dirs", action="store_true")
     parser.add_argument("--point_vis_threshold", type=float, default=20.0)
