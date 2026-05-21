@@ -1855,6 +1855,34 @@ def restore_predictions_order(predictions):
                 predictions[key] = predictions[key][rearrangement]
 
 
+def save_tensor_images(images, image_names, output_dir, prefix_width=6):
+    """Save preprocessed CHW tensor images and return their file paths."""
+    os.makedirs(output_dir, exist_ok=True)
+    if isinstance(images, torch.Tensor):
+        images_cpu = images.detach().cpu()
+    else:
+        images_cpu = torch.as_tensor(images)
+
+    saved_paths = []
+    for idx, image in enumerate(images_cpu):
+        if image.ndim != 3:
+            raise ValueError(f"Expected image tensor shape (C, H, W), got {tuple(image.shape)}")
+        if image.shape[0] == 3:
+            image = image.permute(1, 2, 0)
+        elif image.shape[-1] != 3:
+            raise ValueError(f"Expected 3-channel image tensor, got {tuple(image.shape)}")
+
+        image_np = (image.clamp(0, 1).numpy() * 255.0).round().astype(np.uint8)
+        stem = os.path.splitext(os.path.basename(str(image_names[idx])))[0] if idx < len(image_names) else "image"
+        filename = f"{idx:0{prefix_width}d}_{stem}.png"
+        output_path = os.path.join(output_dir, filename)
+        Image.fromarray(image_np).save(output_path)
+        saved_paths.append(output_path)
+
+    print(f"[UTILS] Saved {len(saved_paths)} processed images to {output_dir}")
+    return saved_paths
+
+
 def extract_frames_from_video(video_path, subsample=1, num_images=-1, output_dir=None):
     """
     Extract frames from a video file and save them as images.
@@ -1915,7 +1943,7 @@ def extract_frames_from_video(video_path, subsample=1, num_images=-1, output_dir
     return image_names, output_dir
 
 
-def process_images(image_dir, subsample, device, num_images, multi_dirs=False):
+def process_images(image_dir, subsample, device, num_images, multi_dirs=False, model="pi3x"):
     """Process images with VGGT and return predictions. Also supports video files."""
     
     # Check if input is a video file
@@ -1945,7 +1973,12 @@ def process_images(image_dir, subsample, device, num_images, multi_dirs=False):
         img = Image.open(img_path).convert('RGB')
         original_images.append(np.array(img))
     
-    images = load_and_preprocess_images(image_names, mode="raw").to(device)
+    if model == "vggt_omega":
+        from vggt_omega.utils.load_fn import load_and_preprocess_images as vggt_omega_load_and_preprocess_images
+        images = vggt_omega_load_and_preprocess_images(image_names, image_resolution=512).to(device)
+    else:
+        from vggt.utils.load_fn import load_and_preprocess_images as vggt_load_and_preprocess_images
+        images = vggt_load_and_preprocess_images(image_names, mode="raw").to(device)
 
     print(f"[UTILS] Preprocessed images shape: {images.shape}")
     

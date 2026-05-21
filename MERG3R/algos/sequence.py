@@ -445,6 +445,19 @@ class ShortestPath(Sequence):
         self.interleave = interleave
         self.save_path = save_path
         self.splitting_type = splitting_type
+
+        if len(self.images) <= self.max_images:
+            self.path = list(range(len(self.images)))
+            self.image_split = [self.images]
+            self.names_split = [self.image_names]
+            self.num_subsets = 1
+            self.subset_to_img_ids = {
+                0: torch.arange(len(self.images), dtype=torch.int, device=self.device)
+            }
+            self.edges = {}
+            print("SUBSET SIZES: ", [len(i) for i in self.image_split])
+            return
+
         self.sim_matrix = get_sim_matrix(self.images, alpha=alpha)
         self.path = most_similar_path(self.sim_matrix)
         self.split()

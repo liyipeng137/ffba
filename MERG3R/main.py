@@ -268,7 +268,13 @@ def main():
     with open(os.path.join(args.output_dir, "config.json"), "w") as f:
         json.dump(args_dict, f, indent=2)
 
-    images, image_names = process_images(args.dataset, subsample, device, args.num_images, args.multi_dirs)
+    images, image_names = process_images(args.dataset, subsample, device, args.num_images, args.multi_dirs, args.model)
+    if args.model == "vggt_omega":
+        image_names = save_tensor_images(
+            images,
+            image_names,
+            os.path.join(args.output_dir, "resized_images"),
+        )
 
     size_hw = images.shape[-2:]
 
