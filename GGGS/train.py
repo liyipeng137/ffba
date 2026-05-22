@@ -416,7 +416,7 @@ def training(
 
         if depth_prior_kick_on and depth_map is not None:
             gt_depth_prior = viewpoint_cam.depth_prior
-            valid_depth_mask = gt_depth_prior > 0.0
+            valid_depth_mask = (gt_depth_prior > 0.001) & (gt_depth_prior < 20.0)
             # confidence_map = None
             # if viewpoint_cam.depth_confidence is not None:
             #     confidence_map = viewpoint_cam.depth_confidence.clamp(0.0, 1.0)
