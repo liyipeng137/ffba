@@ -336,30 +336,6 @@ def training(
         if (iteration - 1) == debug_from:
             pipe.debug = True
 
-        
-        # if reflective_case:
-        #     lambda_multi_view_ncc_cur = 0.1
-        #     if iteration > 15000:
-        #         lambda_multi_view_ncc_cur = 0.0
-        #     if iteration <= 3000:
-        #         lambda_normal_prior_cur = 0.0
-        #     elif iteration <= 7000:
-        #         lambda_normal_prior_cur = 0.15 * (iteration - 3000) / 4000.0
-        #     elif iteration <= 15000:
-        #         lambda_normal_prior_cur = 0.15 + 0.1 * (iteration - 7000) / 8000.0
-        #     else:
-        #         lambda_normal_prior_cur = 0.25
-        # elif scene_case:
-        #     if iteration <= 3000:
-        #         lambda_normal_prior_cur = 0.0
-        #     elif iteration <= 7000:
-        #         lambda_normal_prior_cur = 0.1 * (iteration - 3000) / 4000.0
-        #     elif iteration <= 15000:
-        #         lambda_normal_prior_cur = 0.1 + 0.1 * (iteration - 7000) / 8000.0
-        #     else:
-        #         lambda_normal_prior_cur = 0.2
-        #     lambda_multi_view_ncc_cur = 0.0
-        # else:
         lambda_multi_view_ncc_cur = 0.02
         lambda_normal_prior_cur = 0.0
 
