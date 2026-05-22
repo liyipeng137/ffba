@@ -6,19 +6,25 @@ For each input image, this script applies the same image-space preprocessing as
 
 1. EXIF-transpose and convert to RGB, compositing alpha over white.
 2. Center-crop extreme aspect ratios into [0.5, 2.0].
-3. Resize with VGGT-Omega's `balanced` or `max_size` target-shape rule.
-4. Optionally pad all images in each output set to a common size, matching the
-   VGGT-Omega loader behavior for mixed image shapes.
+3. Resize the low-resolution image with VGGT-Omega's `balanced` or `max_size`
+   target-shape rule, so low width/height are multiples of the patch size.
+4. Resize the high-resolution image to exactly `scale_n` times the low size.
+5. Optionally pad all images in each output set to a common size, matching the
+   VGGT-Omega loader behavior for mixed image shapes. In scaled mode, the high
+   common size is exactly `scale_n` times the low common size.
 
 The high and low outputs are generated from the same cropped source image, so
 they preserve the same scene field-of-view and only differ in sampling density
-and optional per-set padding.
+and optional per-set padding. With the default `--scale-n 2`, every high image
+can be downsampled by exactly 2x in both axes to recover the low image size.
 
 Example:
   python scripts/preprocess_vggt_omega_images.py \
     --images ./images \
-    --high-out ./images_vggt_omega_512 \
-    --low-out ./images_vggt_omega_256
+    --high-out ./images_vggt_omega_high \
+    --low-out ./images_vggt_omega_low \
+    --low-resolution 512 \
+    --scale-n 2
 """
 
 from __future__ import annotations
@@ -155,11 +161,14 @@ def _pad_to_size(image: Image.Image, target_size: Tuple[int, int]) -> Image.Imag
 def _build_plans(
     files: list[Path],
     images_dir: Path,
-    high_resolution: int,
     low_resolution: int,
     patch_size: int,
     mode: str,
+    scale_n: int,
 ) -> list[ImagePlan]:
+    if scale_n <= 0:
+        raise ValueError("scale_n must be positive")
+
     plans = []
     for path in files:
         with _load_rgb_image(path) as image:
@@ -167,8 +176,9 @@ def _build_plans(
             crop_box = _supported_aspect_crop_box(width, height)
             cropped_w = crop_box[2] - crop_box[0]
             cropped_h = crop_box[3] - crop_box[1]
-            high_h, high_w = _target_shape(cropped_w, cropped_h, high_resolution, patch_size, mode)
             low_h, low_w = _target_shape(cropped_w, cropped_h, low_resolution, patch_size, mode)
+            high_w = low_w * scale_n
+            high_h = low_h * scale_n
 
         plans.append(
             ImagePlan(
@@ -234,8 +244,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--images", required=True, type=Path, help="Input images directory")
     parser.add_argument("--high-out", required=True, type=Path, help="Output directory for high-res images")
     parser.add_argument("--low-out", required=True, type=Path, help="Output directory for low-res images")
-    parser.add_argument("--high-resolution", default=1024, type=int, help="VGGT-Omega high image_resolution")
     parser.add_argument("--low-resolution", default=512, type=int, help="VGGT-Omega low image_resolution")
+    parser.add_argument(
+        "--scale-n",
+        default=2,
+        type=int,
+        help="High-res size is exactly low-res size multiplied by this factor.",
+    )
     parser.add_argument("--patch-size", default=16, type=int, help="VGGT-Omega patch size")
     parser.add_argument(
         "--mode",
@@ -270,15 +285,19 @@ def main() -> None:
     plans = _build_plans(
         files,
         images_dir,
-        high_resolution=args.high_resolution,
         low_resolution=args.low_resolution,
         patch_size=args.patch_size,
         mode=args.mode,
+        scale_n=args.scale_n,
     )
 
     pad_to_common = not args.no_pad_to_common
-    high_common_size = _common_size(plans, "high_size") if pad_to_common else None
     low_common_size = _common_size(plans, "low_size") if pad_to_common else None
+    high_common_size = (
+        (low_common_size[0] * args.scale_n, low_common_size[1] * args.scale_n)
+        if pad_to_common
+        else None
+    )
 
     _process_images(
         files,
@@ -300,8 +319,8 @@ def main() -> None:
             {
                 "mode": args.mode,
                 "patch_size": args.patch_size,
-                "high_resolution": args.high_resolution,
                 "low_resolution": args.low_resolution,
+                "scale_n": args.scale_n,
                 "pad_to_common": pad_to_common,
                 "high_common_size": high_common_size,
                 "low_common_size": low_common_size,
