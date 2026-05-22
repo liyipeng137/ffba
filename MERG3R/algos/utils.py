@@ -1984,45 +1984,6 @@ def scale_intrinsics_between_image_sets(intrinsic, low_images, high_images, requ
     return intrinsic_np
 
 
-def resize_prediction_maps_for_image_size(predictions, image_size_hw):
-    """Return a shallow prediction copy with depth/conf maps resized to image_size_hw."""
-    target_h, target_w = image_size_hw
-    output = dict(predictions)
-
-    for key in ("depth", "depth_conf"):
-        if key not in output:
-            continue
-        value = output[key]
-        if isinstance(value, torch.Tensor):
-            value = value.detach().cpu().numpy()
-        value = np.asarray(value, dtype=np.float32)
-        has_channel = value.ndim == 4 and value.shape[-1] == 1
-        if has_channel:
-            value_2d = value[..., 0]
-        elif value.ndim == 3:
-            value_2d = value
-        else:
-            raise ValueError(f"Expected {key} shape (N,H,W) or (N,H,W,1), got {value.shape}")
-
-        if value_2d.shape[1:3] == (target_h, target_w):
-            resized = value_2d
-        else:
-            interpolation = cv2.INTER_LINEAR if key == "depth" else cv2.INTER_NEAREST
-            resized = np.stack(
-                [
-                    cv2.resize(frame, (target_w, target_h), interpolation=interpolation)
-                    for frame in value_2d
-                ],
-                axis=0,
-            ).astype(np.float32, copy=False)
-
-        output[key] = resized[..., None] if has_channel or key == "depth" else resized
-
-    output.pop("world_points", None)
-    output.pop("world_points_from_depth", None)
-    return output
-
-
 def extract_frames_from_video(video_path, subsample=1, num_images=-1, output_dir=None):
     """
     Extract frames from a video file and save them as images.

@@ -490,24 +490,25 @@ def main():
     )
     single_frame_depth_end = time.time()
 
-    output_images = sequence.images
-    output_image_names = sequence.image_names
-    output_intrinsic = final_predictions['intrinsic']
+    low_intrinsic = np.asarray(final_predictions['intrinsic'], dtype=np.float32).copy()
+    high_output_images = None
+    high_output_image_names = None
+    high_output_intrinsic = None
     high_output_enabled = args.high_dataset is not None
     if high_output_enabled:
-        output_images, output_image_names = load_images_matching_names(
+        high_output_images, high_output_image_names = load_images_matching_names(
             args.high_dataset,
             sequence.image_names,
             device=sequence.images.device,
         )
-        output_intrinsic = scale_intrinsics_between_image_sets(
-            final_predictions['intrinsic'],
+        high_output_intrinsic = scale_intrinsics_between_image_sets(
+            low_intrinsic,
             sequence.images,
-            output_images,
+            high_output_images,
         )
         print(
             "[MAIN] High-resolution output enabled: "
-            f"low={tuple(sequence.images.shape[-2:])}, high={tuple(output_images.shape[-2:])}"
+            f"low={tuple(sequence.images.shape[-2:])}, high={tuple(high_output_images.shape[-2:])}"
         )
 
     dense_debug_stats = None
@@ -618,10 +619,13 @@ def main():
             raise RuntimeError("LingBot-Depth refinement requires projected dense depth outputs, but none were produced.")
         lingbot_start = time.time()
         lingbot_output_dir = args.lingbot_output_dir or os.path.join(args.output_dir, "lingbot_depth")
-        shared_intrinsic = np.mean(np.asarray(output_intrinsic, dtype=np.float32), axis=0)
+        lingbot_images = high_output_images if high_output_enabled else sequence.images
+        lingbot_image_names = high_output_image_names if high_output_enabled else sequence.image_names
+        lingbot_intrinsic = high_output_intrinsic if high_output_enabled else low_intrinsic
+        shared_intrinsic = np.mean(np.asarray(lingbot_intrinsic, dtype=np.float32), axis=0)
         lingbot_stats = run_lingbot_depth_refinement(
-            output_images,
-            output_image_names,
+            lingbot_images,
+            lingbot_image_names,
             # os.path.join(dense_depth_dir, "depth_npy"),
             os.path.join(args.output_dir, "single_frame_depth", "depth_npy"),
             lingbot_output_dir,
@@ -630,20 +634,26 @@ def main():
             depth_image_names=sequence.image_names,
         )
         lingbot_end = time.time()
-        lingbot_refined_ply_start = time.time()
-        lingbot_refined_ply_stats = export_depth_npy_world_points_ply(
-            os.path.join(args.output_dir, "dense_lingbot_refined_points.ply"),
-            os.path.join(lingbot_output_dir, "depth_npy"),
-            output_image_names,
-            output_images,
-            final_predictions['extrinsic'],
-            shared_intrinsic,
-            stride=args.dense_depth_stride,
-            max_points=args.dense_max_points if args.dense_max_points > 0 else None,
-            valid_mask_depth_npy_dir=os.path.join(dense_depth_dir, "depth_npy"),
-            valid_mask_image_names=sequence.image_names,
-        )
-        lingbot_refined_ply_end = time.time()
+        if high_output_enabled:
+            print(
+                "[OUTPUT WRITING] Skipping dense_lingbot_refined_points.ply in high-resolution "
+                "refine mode; high-resolution refined depths were written by LingBot-Depth."
+            )
+        else:
+            lingbot_refined_ply_start = time.time()
+            lingbot_refined_ply_stats = export_depth_npy_world_points_ply(
+                os.path.join(args.output_dir, "dense_lingbot_refined_points.ply"),
+                os.path.join(lingbot_output_dir, "depth_npy"),
+                sequence.image_names,
+                sequence.images,
+                final_predictions['extrinsic'],
+                shared_intrinsic,
+                stride=args.dense_depth_stride,
+                max_points=args.dense_max_points if args.dense_max_points > 0 else None,
+                valid_mask_depth_npy_dir=os.path.join(dense_depth_dir, "depth_npy"),
+                valid_mask_image_names=sequence.image_names,
+            )
+            lingbot_refined_ply_end = time.time()
 
     if torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -689,7 +699,7 @@ def main():
             f.write(f"Dense Depth Output Dir: {dense_depth_stats['output_dir']}\n")
         if high_output_enabled:
             f.write(f"High Dataset: {args.high_dataset}\n")
-            f.write(f"High Output Image Shape: {tuple(output_images.shape[-2:])}\n")
+            f.write(f"High Output Image Shape: {tuple(high_output_images.shape[-2:])}\n")
         if lingbot_stats is not None:
             f.write(f"LingBot Depth Model: {lingbot_stats['model']}\n")
             f.write(f"LingBot Depth Processed: {lingbot_stats['num_processed']}\n")
@@ -708,24 +718,25 @@ def main():
         f.write(f"LingBot Refined PLY Time: {lingbot_refined_ply_end - lingbot_refined_ply_start} seconds\n")
         f.write(f"Peak GPU memory: {peak_mem:.2f} MiB\n")
 
-    colmap_predictions = final_predictions
-    if high_output_enabled:
-        colmap_predictions = resize_prediction_maps_for_image_size(
-            final_predictions,
-            tuple(output_images.shape[-2:]),
-        )
-        colmap_predictions['intrinsic'] = output_intrinsic
-
     write_recon_to_colmap(
         args.output_dir,
-        colmap_predictions,
-        output_images,
-        output_image_names,
+        final_predictions,
+        sequence.images,
+        sequence.image_names,
         stride=args.stride,
         conf_threshold=args.point_vis_threshold,
         format=args.format,
         shared_camera=args.global_ba,
     )
+
+    if high_output_enabled:
+        high_colmap_intrinsic = high_output_intrinsic
+        if args.global_ba:
+            high_colmap_intrinsic = np.mean(high_colmap_intrinsic, axis=0, keepdims=True)
+        high_h, high_w = tuple(high_output_images.shape[-2:])
+        high_cameras_path = os.path.join(args.output_dir, "colmap", "high_cameras.txt")
+        write_colmap_cameras_txt(high_cameras_path, high_colmap_intrinsic, high_w, high_h)
+        print(f"[OUTPUT WRITING] Wrote high-resolution camera intrinsics to {high_cameras_path}")
     
 
 if __name__ == "__main__":
