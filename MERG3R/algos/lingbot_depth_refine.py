@@ -102,14 +102,17 @@ def run_lingbot_depth_refinement(
     intrinsic,
     model_name=DEFAULT_LINGBOT_MODEL,
     device="cuda",
+    use_fp16=True,
     enable_depth_mask=True,
+    depth_image_names=None,
 ):
     """
     Refine projected dense depth maps with LingBot-Depth.
 
     Args:
         images: Tensor/array/list of images in RGB order, shape (N, 3, H, W) or (N, H, W, 3).
-        image_names: Names used to match depth_npy files by stem.
+        image_names: Names used for output refined depth stems.
+        depth_image_names: Optional names used to match input depth_npy files by stem.
         depth_npy_dir: Directory containing projected input depths as float32 .npy files.
         output_dir: Output directory; writes depth_npy, depth_vis, and depth_png.
         intrinsic: Final BA intrinsics, either shared (3, 3) or per-frame (N, 3, 3).
@@ -130,6 +133,13 @@ def run_lingbot_depth_refinement(
             "[LINGBOT DEPTH] Warning: image_names length does not match images; "
             f"names={len(image_names)}, images={num_frames}"
         )
+    if depth_image_names is None:
+        depth_image_names = image_names
+    if len(depth_image_names) != num_frames:
+        print(
+            "[LINGBOT DEPTH] Warning: depth_image_names length does not match images; "
+            f"names={len(depth_image_names)}, images={num_frames}"
+        )
 
     intrinsic = np.asarray(intrinsic, dtype=np.float32)
     if intrinsic.ndim == 2:
@@ -145,7 +155,13 @@ def run_lingbot_depth_refinement(
     skipped = 0
     for frame_idx in range(num_frames):
         image_name = image_names[frame_idx] if frame_idx < len(image_names) else f"frame_{frame_idx:04d}.png"
-        depth_path, stem = _depth_path_for_image(depth_npy_dir, image_name, frame_idx)
+        depth_image_name = (
+            depth_image_names[frame_idx]
+            if frame_idx < len(depth_image_names)
+            else image_name
+        )
+        depth_path, _ = _depth_path_for_image(depth_npy_dir, depth_image_name, frame_idx)
+        stem = os.path.splitext(os.path.basename(str(image_name)))[0]
         if not depth_path.exists():
             print(f"[LINGBOT DEPTH] skip {stem}: missing input depth {depth_path}")
             skipped += 1
@@ -170,7 +186,7 @@ def run_lingbot_depth_refinement(
             image_t,
             depth_in=depth_t,
             enable_depth_mask=enable_depth_mask,
-            use_fp16=True,
+            use_fp16=use_fp16,
             intrinsics=intrinsics_t,
         )
         depth_pred = output["depth"].squeeze().detach().cpu().numpy()

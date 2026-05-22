@@ -82,6 +82,7 @@ def parse_args():
     parser.add_argument("--alignment_type", type=str, default="weighted_iterative")
     parser.add_argument("--global_ba", action="store_true", default=True)
     parser.add_argument("--dataset", type=str)
+    parser.add_argument("--high-dataset", dest="high_dataset", type=str, default=None)
     parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument("--sequence_type", type=str, default="shortest_path")
     parser.add_argument("--lr", type=float, default=3e-3)  # 3e-4
@@ -269,12 +270,12 @@ def main():
         json.dump(args_dict, f, indent=2)
 
     images, image_names = process_images(args.dataset, subsample, device, args.num_images, args.multi_dirs, args.model)
-    if args.model == "vggt_omega":
-        image_names = save_tensor_images(
-            images,
-            image_names,
-            os.path.join(args.output_dir, "resized_images"),
-        )
+    # if args.model == "vggt_omega":
+    #     image_names = save_tensor_images(
+    #         images,
+    #         image_names,
+    #         os.path.join(args.output_dir, "resized_images"),
+    #     )
 
     size_hw = images.shape[-2:]
 
@@ -489,6 +490,26 @@ def main():
     )
     single_frame_depth_end = time.time()
 
+    output_images = sequence.images
+    output_image_names = sequence.image_names
+    output_intrinsic = final_predictions['intrinsic']
+    high_output_enabled = args.high_dataset is not None
+    if high_output_enabled:
+        output_images, output_image_names = load_images_matching_names(
+            args.high_dataset,
+            sequence.image_names,
+            device=sequence.images.device,
+        )
+        output_intrinsic = scale_intrinsics_between_image_sets(
+            final_predictions['intrinsic'],
+            sequence.images,
+            output_images,
+        )
+        print(
+            "[MAIN] High-resolution output enabled: "
+            f"low={tuple(sequence.images.shape[-2:])}, high={tuple(output_images.shape[-2:])}"
+        )
+
     dense_debug_stats = None
     if args.dense_debug and args.global_ba:
         dense_debug_stats = export_dense_debug_outputs(
@@ -597,28 +618,30 @@ def main():
             raise RuntimeError("LingBot-Depth refinement requires projected dense depth outputs, but none were produced.")
         lingbot_start = time.time()
         lingbot_output_dir = args.lingbot_output_dir or os.path.join(args.output_dir, "lingbot_depth")
-        shared_intrinsic = np.mean(np.asarray(final_predictions['intrinsic'], dtype=np.float32), axis=0)
+        shared_intrinsic = np.mean(np.asarray(output_intrinsic, dtype=np.float32), axis=0)
         lingbot_stats = run_lingbot_depth_refinement(
-            sequence.images,
-            sequence.image_names,
+            output_images,
+            output_image_names,
             # os.path.join(dense_depth_dir, "depth_npy"),
             os.path.join(args.output_dir, "single_frame_depth", "depth_npy"),
             lingbot_output_dir,
             shared_intrinsic,
             device=device,
+            depth_image_names=sequence.image_names,
         )
         lingbot_end = time.time()
         lingbot_refined_ply_start = time.time()
         lingbot_refined_ply_stats = export_depth_npy_world_points_ply(
             os.path.join(args.output_dir, "dense_lingbot_refined_points.ply"),
             os.path.join(lingbot_output_dir, "depth_npy"),
-            sequence.image_names,
-            sequence.images,
+            output_image_names,
+            output_images,
             final_predictions['extrinsic'],
             shared_intrinsic,
             stride=args.dense_depth_stride,
             max_points=args.dense_max_points if args.dense_max_points > 0 else None,
             valid_mask_depth_npy_dir=os.path.join(dense_depth_dir, "depth_npy"),
+            valid_mask_image_names=sequence.image_names,
         )
         lingbot_refined_ply_end = time.time()
 
@@ -664,6 +687,9 @@ def main():
             f.write(f"Dense Depth Merged Points: {dense_depth_stats['num_merged_points']}\n")
             f.write(f"Dense Depth Nonzero Pixels: {dense_depth_stats['num_nonzero_depth_pixels']}\n")
             f.write(f"Dense Depth Output Dir: {dense_depth_stats['output_dir']}\n")
+        if high_output_enabled:
+            f.write(f"High Dataset: {args.high_dataset}\n")
+            f.write(f"High Output Image Shape: {tuple(output_images.shape[-2:])}\n")
         if lingbot_stats is not None:
             f.write(f"LingBot Depth Model: {lingbot_stats['model']}\n")
             f.write(f"LingBot Depth Processed: {lingbot_stats['num_processed']}\n")
@@ -682,11 +708,19 @@ def main():
         f.write(f"LingBot Refined PLY Time: {lingbot_refined_ply_end - lingbot_refined_ply_start} seconds\n")
         f.write(f"Peak GPU memory: {peak_mem:.2f} MiB\n")
 
+    colmap_predictions = final_predictions
+    if high_output_enabled:
+        colmap_predictions = resize_prediction_maps_for_image_size(
+            final_predictions,
+            tuple(output_images.shape[-2:]),
+        )
+        colmap_predictions['intrinsic'] = output_intrinsic
+
     write_recon_to_colmap(
         args.output_dir,
-        final_predictions,
-        sequence.images,
-        sequence.image_names,
+        colmap_predictions,
+        output_images,
+        output_image_names,
         stride=args.stride,
         conf_threshold=args.point_vis_threshold,
         format=args.format,

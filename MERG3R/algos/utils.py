@@ -1076,6 +1076,7 @@ def collect_depth_npy_world_points(
     min_depth=1e-6,
     max_depth=None,
     valid_mask_depth_npy_dir=None,
+    valid_mask_image_names=None,
     valid_mask_min_depth=1e-6,
 ):
     """
@@ -1097,6 +1098,8 @@ def collect_depth_npy_world_points(
         raise ValueError(f"stride must be >= 1, got {stride}")
     if max_points is not None and max_points <= 0:
         raise ValueError(f"max_points must be positive or None, got {max_points}")
+    if valid_mask_image_names is None:
+        valid_mask_image_names = image_names
 
     frame_items = []
     valid_counts = []
@@ -1117,7 +1120,12 @@ def collect_depth_npy_world_points(
         if max_depth is not None:
             valid &= depth_s <= max_depth
         if valid_mask_depth_npy_dir is not None:
-            mask_path, _ = _depth_npy_path_for_image(valid_mask_depth_npy_dir, image_name, frame_idx)
+            mask_image_name = (
+                valid_mask_image_names[frame_idx]
+                if frame_idx < len(valid_mask_image_names)
+                else image_name
+            )
+            mask_path, _ = _depth_npy_path_for_image(valid_mask_depth_npy_dir, mask_image_name, frame_idx)
             if os.path.exists(mask_path):
                 mask_depth = np.load(mask_path).astype(np.float32)
                 mask_depth = np.nan_to_num(mask_depth, nan=0.0, posinf=0.0, neginf=0.0)
@@ -1174,8 +1182,12 @@ def collect_depth_npy_world_points(
         if max_depth is not None:
             valid &= depth_s <= max_depth
         if valid_mask_depth_npy_dir is not None:
-            image_name = image_names[frame_idx] if frame_idx < len(image_names) else f"frame_{frame_idx:04d}.png"
-            mask_path, _ = _depth_npy_path_for_image(valid_mask_depth_npy_dir, image_name, frame_idx)
+            mask_image_name = (
+                valid_mask_image_names[frame_idx]
+                if frame_idx < len(valid_mask_image_names)
+                else image_names[frame_idx] if frame_idx < len(image_names) else f"frame_{frame_idx:04d}.png"
+            )
+            mask_path, _ = _depth_npy_path_for_image(valid_mask_depth_npy_dir, mask_image_name, frame_idx)
             if os.path.exists(mask_path):
                 mask_depth = np.load(mask_path).astype(np.float32)
                 mask_depth = np.nan_to_num(mask_depth, nan=0.0, posinf=0.0, neginf=0.0)
@@ -1222,6 +1234,7 @@ def export_depth_npy_world_points_ply(
     min_depth=1e-6,
     max_depth=None,
     valid_mask_depth_npy_dir=None,
+    valid_mask_image_names=None,
     valid_mask_min_depth=1e-6,
 ):
     world_points, colors, stats = collect_depth_npy_world_points(
@@ -1235,6 +1248,7 @@ def export_depth_npy_world_points_ply(
         min_depth=min_depth,
         max_depth=max_depth,
         valid_mask_depth_npy_dir=valid_mask_depth_npy_dir,
+        valid_mask_image_names=valid_mask_image_names,
         valid_mask_min_depth=valid_mask_min_depth,
     )
     if len(world_points) == 0:
@@ -1881,6 +1895,132 @@ def save_tensor_images(images, image_names, output_dir, prefix_width=6):
 
     print(f"[UTILS] Saved {len(saved_paths)} processed images to {output_dir}")
     return saved_paths
+
+
+def _list_image_files(image_dir):
+    image_paths = glob.glob(os.path.join(image_dir, "**", "*"), recursive=True)
+    return sorted(
+        path
+        for path in image_paths
+        if os.path.isfile(path) and path.lower().endswith((".png", ".jpg", ".jpeg"))
+    )
+
+
+def load_images_matching_names(image_dir, reference_names, device="cpu"):
+    """Load raw RGB images from image_dir in the same order as reference_names."""
+    image_files = _list_image_files(image_dir)
+    if not image_files:
+        raise ValueError(f"No images found in high-resolution dataset: {image_dir}")
+
+    by_name = {}
+    by_stem = {}
+    for path in image_files:
+        name = os.path.basename(path)
+        stem = os.path.splitext(name)[0]
+        by_name.setdefault(name, path)
+        by_stem.setdefault(stem, path)
+
+    matched_paths = []
+    tensors = []
+    shapes = set()
+    for reference_name in reference_names:
+        reference_base = os.path.basename(str(reference_name))
+        reference_stem = os.path.splitext(reference_base)[0]
+        path = (
+            by_name.get(reference_base)
+            or by_stem.get(reference_stem)
+        )
+        if path is None:
+            raise FileNotFoundError(
+                f"Could not match high-resolution image for {reference_name} in {image_dir}"
+            )
+
+        with Image.open(path) as image:
+            image = image.convert("RGB")
+            arr = np.asarray(image, dtype=np.float32) / 255.0
+        tensor = torch.from_numpy(arr).permute(2, 0, 1)
+        tensors.append(tensor)
+        matched_paths.append(path)
+        shapes.add(tuple(tensor.shape[-2:]))
+
+    if len(shapes) != 1:
+        raise ValueError(
+            "High-resolution images must have a common shape for this pipeline. "
+            f"Got shapes: {sorted(shapes)}"
+        )
+
+    images = torch.stack(tensors).to(device)
+    print(f"[UTILS] Loaded {len(matched_paths)} high-resolution images from {image_dir}: {images.shape}")
+    return images, matched_paths
+
+
+def scale_intrinsics_between_image_sets(intrinsic, low_images, high_images, require_uniform_scale=True):
+    """Scale pinhole intrinsics from low image coordinates to high image coordinates."""
+    if isinstance(intrinsic, torch.Tensor):
+        intrinsic_np = intrinsic.detach().cpu().numpy()
+    else:
+        intrinsic_np = np.asarray(intrinsic)
+    intrinsic_np = intrinsic_np.astype(np.float32, copy=True)
+
+    if intrinsic_np.ndim == 2:
+        intrinsic_np = np.repeat(intrinsic_np[None], len(low_images), axis=0)
+    if intrinsic_np.ndim != 3 or intrinsic_np.shape[-2:] != (3, 3):
+        raise ValueError(f"Expected intrinsic shape (3, 3) or (N, 3, 3), got {intrinsic_np.shape}")
+
+    low_h, low_w = tuple(low_images.shape[-2:])
+    high_h, high_w = tuple(high_images.shape[-2:])
+    scale_x = float(high_w) / float(low_w)
+    scale_y = float(high_h) / float(low_h)
+    if require_uniform_scale and not np.isclose(scale_x, scale_y, rtol=1e-5, atol=1e-6):
+        raise ValueError(
+            "High/low image sizes do not share one uniform scale: "
+            f"low={low_w}x{low_h}, high={high_w}x{high_h}, sx={scale_x}, sy={scale_y}"
+        )
+
+    intrinsic_np[:, 0, 0] *= scale_x
+    intrinsic_np[:, 0, 2] *= scale_x
+    intrinsic_np[:, 1, 1] *= scale_y
+    intrinsic_np[:, 1, 2] *= scale_y
+    return intrinsic_np
+
+
+def resize_prediction_maps_for_image_size(predictions, image_size_hw):
+    """Return a shallow prediction copy with depth/conf maps resized to image_size_hw."""
+    target_h, target_w = image_size_hw
+    output = dict(predictions)
+
+    for key in ("depth", "depth_conf"):
+        if key not in output:
+            continue
+        value = output[key]
+        if isinstance(value, torch.Tensor):
+            value = value.detach().cpu().numpy()
+        value = np.asarray(value, dtype=np.float32)
+        has_channel = value.ndim == 4 and value.shape[-1] == 1
+        if has_channel:
+            value_2d = value[..., 0]
+        elif value.ndim == 3:
+            value_2d = value
+        else:
+            raise ValueError(f"Expected {key} shape (N,H,W) or (N,H,W,1), got {value.shape}")
+
+        if value_2d.shape[1:3] == (target_h, target_w):
+            resized = value_2d
+        else:
+            interpolation = cv2.INTER_LINEAR if key == "depth" else cv2.INTER_NEAREST
+            resized = np.stack(
+                [
+                    cv2.resize(frame, (target_w, target_h), interpolation=interpolation)
+                    for frame in value_2d
+                ],
+                axis=0,
+            ).astype(np.float32, copy=False)
+
+        output[key] = resized[..., None] if has_channel or key == "depth" else resized
+
+    output.pop("world_points", None)
+    output.pop("world_points_from_depth", None)
+    return output
 
 
 def extract_frames_from_video(video_path, subsample=1, num_images=-1, output_dir=None):
