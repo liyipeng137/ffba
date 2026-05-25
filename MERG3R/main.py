@@ -764,13 +764,13 @@ def main():
             f.write(f"LingBot Depth Processed: {lingbot_stats['num_processed']}\n")
             f.write(f"LingBot Depth Skipped: {lingbot_stats['num_skipped']}\n")
             f.write(f"LingBot Depth Output Dir: {lingbot_stats['output_dir']}\n")
-        if infinidepth_stats is not None:
-            f.write(f"InfiniDepth Model: {infinidepth_stats['model']}\n")
-            f.write(f"InfiniDepth Processed: {infinidepth_stats['num_processed']}\n")
-            f.write(f"InfiniDepth Skipped: {infinidepth_stats['num_skipped']}\n")
-            f.write(f"InfiniDepth Input Size: {infinidepth_stats['input_size']}\n")
-            f.write(f"InfiniDepth Output Resolution Mode: {infinidepth_stats['output_resolution_mode']}\n")
-            f.write(f"InfiniDepth Output Dir: {infinidepth_stats['output_dir']}\n")
+        # if infinidepth_stats is not None:
+        #     f.write(f"InfiniDepth Model: {infinidepth_stats['model']}\n")
+        #     f.write(f"InfiniDepth Processed: {infinidepth_stats['num_processed']}\n")
+        #     f.write(f"InfiniDepth Skipped: {infinidepth_stats['num_skipped']}\n")
+        #     f.write(f"InfiniDepth Input Size: {infinidepth_stats['input_size']}\n")
+        #     f.write(f"InfiniDepth Output Resolution Mode: {infinidepth_stats['output_resolution_mode']}\n")
+        #     f.write(f"InfiniDepth Output Dir: {infinidepth_stats['output_dir']}\n")
         if lingbot_refined_ply_stats is not None:
             f.write(f"LingBot Refined PLY Points: {lingbot_refined_ply_stats['num_points']}\n")
             f.write(f"LingBot Refined PLY Valid Before Cap: {lingbot_refined_ply_stats['num_valid_points_before_cap']}\n")
@@ -782,7 +782,7 @@ def main():
         f.write(f"Dense Depth Time: {dense_depth_end - dense_depth_start} seconds\n")
         f.write(f"LingBot Depth Time: {lingbot_end - lingbot_start} seconds\n")
         f.write(f"LingBot Refined PLY Time: {lingbot_refined_ply_end - lingbot_refined_ply_start} seconds\n")
-        f.write(f"InfiniDepth Time: {infinidepth_end - infinidepth_start} seconds\n")
+        # f.write(f"InfiniDepth Time: {infinidepth_end - infinidepth_start} seconds\n")
         f.write(f"Peak GPU memory: {peak_mem:.2f} MiB\n")
 
     write_recon_to_colmap(

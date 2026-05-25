@@ -272,6 +272,21 @@ def training(
     if has_depth_dir and not has_loaded_depth_prior:
         print("[Pipeline][Warn] depth directory exists but no valid depth priors were loaded.")
     print(f"[Pipeline] depth_prior_ready={has_loaded_depth_prior} (depth_dir={depth_root})")
+    if dataset.depth_confidence_dir.strip():
+        if os.path.isabs(dataset.depth_confidence_dir):
+            depth_confidence_root = dataset.depth_confidence_dir
+        else:
+            depth_confidence_root = os.path.join(dataset.source_path, dataset.depth_confidence_dir)
+    else:
+        depth_confidence_root = None
+    has_depth_confidence_dir = depth_confidence_root is not None and os.path.isdir(depth_confidence_root)
+    has_loaded_depth_confidence = any(cam.depth_confidence is not None for cam in scene.getTrainCameras())
+    if has_depth_confidence_dir and not has_loaded_depth_confidence:
+        print("[Pipeline][Warn] confidence directory exists but no valid depth confidence masks were loaded.")
+    print(
+        f"[Pipeline] depth_confidence_ready={has_loaded_depth_confidence} "
+        f"(confidence_dir={depth_confidence_root})"
+    )
 
     scene_case = has_normal_dir and has_loaded_depth_prior
     reflective_case = has_normal_dir and not has_loaded_depth_prior
@@ -417,11 +432,11 @@ def training(
         if depth_prior_kick_on and depth_map is not None:
             gt_depth_prior = viewpoint_cam.depth_prior
             valid_depth_mask = (gt_depth_prior > 0.001) & (gt_depth_prior < 20.0)
-            # confidence_map = None
-            # if viewpoint_cam.depth_confidence is not None:
-            #     confidence_map = viewpoint_cam.depth_confidence.clamp(0.0, 1.0)
-            #     # keep conf>0 as validity gate, and use confidence as soft weights.
-            #     valid_depth_mask = valid_depth_mask & (confidence_map > 0)
+            confidence_map = None
+            if viewpoint_cam.depth_confidence is not None:
+                confidence_map = viewpoint_cam.depth_confidence.clamp(0.0, 1.0)
+                # Confidence masks are white/high-confidence = keep, black/low-confidence = drop.
+                valid_depth_mask = valid_depth_mask & (confidence_map > 0.5)
 
             if valid_depth_mask.any().item():
                 # if iteration <= 7000:

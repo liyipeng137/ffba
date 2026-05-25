@@ -100,8 +100,10 @@ def _load_depth_confidence(args, cam_info, resolution):
         return None
 
     confidence_img = Image.open(confidence_path).convert("L")
-    depth_confidence = PILtoTorch(confidence_img, resolution)[:1]
-    return depth_confidence.clamp(0.0, 1.0)
+    confidence_img = confidence_img.resize(resolution, Image.NEAREST)
+    confidence_np = np.asarray(confidence_img, dtype=np.float32) / 255.0
+    depth_confidence = torch.from_numpy(confidence_np)[None]
+    return (depth_confidence > 0.5).float()
 
 
 # def _load_delight_image(args, cam_info, resolution):
@@ -155,7 +157,7 @@ def loadCam(args, id, cam_info, resolution_scale):
 
     normal_prior = _load_normal_prior(args, cam_info, resolution)
     depth_prior = _load_depth_prior(args, cam_info, resolution)
-    # depth_confidence = _load_depth_confidence(args, cam_info, resolution)
+    depth_confidence = _load_depth_confidence(args, cam_info, resolution)
 
     return Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T, 
                   FoVx=cam_info.FovX, FoVy=cam_info.FovY, 
@@ -163,7 +165,7 @@ def loadCam(args, id, cam_info, resolution_scale):
                   image_name=cam_info.image_name, uid=id,
                   normal_prior=normal_prior,
                   depth_prior=depth_prior,
-                  depth_confidence=None,
+                  depth_confidence=depth_confidence,
                   data_device=args.data_device)
 
 def cameraList_from_camInfos(cam_infos, resolution_scale, args):
