@@ -88,14 +88,72 @@ def _save_refined_depth(depth_pred, stem, output_dir):
     cv2.imwrite(str(out_png / f"{stem}.png"), depth_u16)
 
 
-def _write_temp_image(image_rgb, image_name, frame_idx, image_dir):
-    stem = os.path.splitext(os.path.basename(str(image_name)))[0] if image_name else f"frame_{frame_idx:04d}"
-    image_path = image_dir / f"{frame_idx:06d}_{stem}.png"
-    image_dir.mkdir(parents=True, exist_ok=True)
-    image_bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
-    if not cv2.imwrite(str(image_path), image_bgr):
-        raise RuntimeError(f"Failed to write temporary InfiniDepth RGB input: {image_path}")
-    return image_path
+def _image_to_infinidepth_tensors(image_rgb, input_size, device):
+    org_h, org_w = image_rgb.shape[:2]
+    resized = cv2.resize(image_rgb, (int(input_size[1]), int(input_size[0])), interpolation=cv2.INTER_AREA)
+    org_img = torch.as_tensor(image_rgb / 255.0, dtype=torch.float32, device=device).permute(2, 0, 1)[None]
+    image = torch.as_tensor(resized / 255.0, dtype=torch.float32, device=device).permute(2, 0, 1)[None]
+    return org_img, image, org_h, org_w
+
+
+def _depth_to_disparity(depth):
+    disp = depth.clone()
+    valid = disp > 0
+    disp[valid] = 1.0 / disp[valid]
+    return disp
+
+
+def _make_2d_uniform_query(height, width, device):
+    ys = ((torch.arange(height, device=device, dtype=torch.float32) + 0.5) / max(float(height), 1.0)) * 2.0 - 1.0
+    xs = ((torch.arange(width, device=device, dtype=torch.float32) + 0.5) / max(float(width), 1.0)) * 2.0 - 1.0
+    grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
+    return torch.stack([grid_y, grid_x], dim=-1).reshape(1, -1, 2).contiguous()
+
+
+def _load_sensor_depth_prompt(
+    depth_path,
+    input_size,
+    device,
+    min_prompt=0.01,
+    max_prompt=100.0,
+    num_samples=1500,
+):
+    depth = np.load(depth_path).astype(np.float32)
+    depth = np.squeeze(depth)
+    if depth.ndim != 2:
+        raise ValueError(f"Expected sensor depth shape (H, W), got {depth.shape} from {depth_path}")
+    depth = np.nan_to_num(depth, nan=0.0, posinf=0.0, neginf=0.0)
+    depth = cv2.resize(depth, (int(input_size[1]), int(input_size[0])), interpolation=cv2.INTER_NEAREST)
+
+    depth_mask = ((depth > float(min_prompt)) & (depth < float(max_prompt))).astype(np.float32)
+    valid_depth = depth * depth_mask
+    if int((valid_depth > float(min_prompt)).sum()) > int(num_samples):
+        sample_depth = valid_depth.reshape(-1).copy()
+        nonzero_index = np.flatnonzero(sample_depth > float(min_prompt))
+        keep_index = np.random.permutation(nonzero_index)[: int(num_samples)]
+        sampled = np.zeros_like(sample_depth)
+        sampled[keep_index] = sample_depth[keep_index]
+        sample_depth = sampled.reshape(depth.shape)
+    else:
+        sample_depth = valid_depth
+
+    depth_t = torch.as_tensor(depth, dtype=torch.float32, device=device)[None, None]
+    sample_depth_t = torch.as_tensor(sample_depth, dtype=torch.float32, device=device)[None, None]
+    depth_mask_t = torch.as_tensor(depth_mask, dtype=torch.float32, device=device)[None, None]
+    return depth_t, sample_depth_t, depth_mask_t
+
+
+def _load_infinidepth_model(model_path, device):
+    _ensure_infinidepth_import_path()
+    from InfiniDepth.utils.model_utils import build_model
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required to run InfiniDepth refinement.")
+    model = build_model("InfiniDepth_DepthSensor", model_path=str(model_path))
+    model = model.to(device)
+    model.eval()
+    print(f"[INFINIDEPTH] Loaded model: {model.__class__.__name__}")
+    return model
 
 
 @torch.no_grad()
@@ -121,14 +179,9 @@ def run_infinidepth_refinement(
         output_dir: Output directory; writes depth_npy, depth_vis, and depth_png.
         intrinsic: Camera intrinsics in the RGB image coordinate system, shape (3, 3) or (N, 3, 3).
     """
-    _ensure_infinidepth_import_path()
-    from inference_depth import DepthInferenceArgs, load_depth_model, run_depth_inference
-
     depth_npy_dir = Path(depth_npy_dir)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    temp_image_dir = output_dir / "_inputs" / "image"
-    temp_image_dir.mkdir(parents=True, exist_ok=True)
 
     if isinstance(images, torch.Tensor):
         num_frames = int(images.shape[0])
@@ -153,21 +206,8 @@ def run_infinidepth_refinement(
     if intrinsic.shape != (num_frames, 3, 3):
         raise ValueError(f"Expected intrinsic shape (3, 3) or ({num_frames}, 3, 3), got {intrinsic.shape}")
 
-    frame_args = DepthInferenceArgs(
-        input_image_path="",
-        input_depth_path=None,
-        depth_output_dir=None,
-        pcd_output_dir=None,
-        save_pcd=False,
-        model_type="InfiniDepth_DepthSensor",
-        depth_model_path=str(model_path),
-        input_size=tuple(input_size),
-        output_resolution_mode="original",
-        upsample_ratio=1,
-    )
-    model, inf_device = load_depth_model(frame_args)
-    if str(device).startswith("cuda") and not torch.cuda.is_available():
-        print("[INFINIDEPTH] CUDA requested but unavailable; using InfiniDepth-selected device.")
+    inf_device = torch.device(device)
+    model = _load_infinidepth_model(model_path, inf_device)
 
     processed = 0
     skipped = 0
@@ -186,32 +226,31 @@ def run_infinidepth_refinement(
             continue
 
         image_rgb = _image_to_numpy_rgb(images[frame_idx])
-        image_path = _write_temp_image(image_rgb, image_name, frame_idx, temp_image_dir)
-        K = intrinsic[frame_idx]
-
-        result = run_depth_inference(
-            frame_args,
-            model=model,
-            device=inf_device,
-            input_image_path=str(image_path),
-            input_depth_path=str(depth_path),
-            fx_org=float(K[0, 0]),
-            fy_org=float(K[1, 1]),
-            cx_org=float(K[0, 2]),
-            cy_org=float(K[1, 2]),
+        _, image_t, org_h, org_w = _image_to_infinidepth_tensors(image_rgb, input_size, inf_device)
+        gt_depth, prompt_depth, gt_depth_mask = _load_sensor_depth_prompt(
+            depth_path,
+            input_size,
+            inf_device,
         )
-        depth_pred = result.pred_depthmap.squeeze().detach().cpu().numpy()
-        if depth_pred.shape != image_rgb.shape[:2]:
-            depth_pred = cv2.resize(
-                depth_pred.astype(np.float32, copy=False),
-                (image_rgb.shape[1], image_rgb.shape[0]),
-                interpolation=cv2.INTER_LINEAR,
-            )
+
+        query_coord = _make_2d_uniform_query(org_h, org_w, inf_device)
+        gt_disp = _depth_to_disparity(gt_depth)
+        prompt_disp = _depth_to_disparity(prompt_depth)
+        pred_2d_uniform_depth, _ = model.inference(
+            image=image_t,
+            query_coord=query_coord,
+            gt_depth=gt_disp,
+            gt_depth_mask=gt_depth_mask,
+            prompt_depth=prompt_disp,
+            prompt_mask=prompt_disp > 0,
+        )
+        depth_pred = pred_2d_uniform_depth.permute(0, 2, 1).view(1, 1, org_h, org_w)
+        depth_pred = depth_pred.squeeze().detach().cpu().numpy()
         _save_refined_depth(depth_pred, stem, output_dir)
         processed += 1
         print(f"[INFINIDEPTH] refined {stem}")
 
-        del result
+        del gt_depth, prompt_depth, gt_depth_mask, gt_disp, prompt_disp, pred_2d_uniform_depth
 
     print(f"[INFINIDEPTH] Done -> {output_dir} (processed={processed}, skipped={skipped})")
     return {
