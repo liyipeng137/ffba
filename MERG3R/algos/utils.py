@@ -1531,6 +1531,7 @@ def export_prediction_depth_maps(predictions, image_names, output_dir, conf_thre
 
     masked_pixels = 0
     conf_threshold_value = None
+    valid_conf = None
     if conf_threshold is not None:
         if "depth_conf" not in predictions:
             raise ValueError("predictions must contain 'depth_conf' when conf_threshold is provided")
@@ -1543,12 +1544,23 @@ def export_prediction_depth_maps(predictions, image_names, output_dir, conf_thre
         if conf_np.shape != depth_np.shape:
             raise ValueError(f"Expected depth_conf shape {depth_np.shape}, got {conf_np.shape}")
 
-        conf_threshold_value = 0.0 if conf_threshold == 0.0 else float(np.percentile(conf_np, 5))
+        conf_threshold_value = 0.0 if conf_threshold == 0.0 else float(np.percentile(conf_np, conf_threshold))
         valid_conf = np.isfinite(conf_np) & (conf_np >= conf_threshold_value) & (conf_np > 1e-5)
         masked_pixels = int(depth_np.size - np.count_nonzero(valid_conf))
         depth_np = np.where(valid_conf, depth_np, 0.0).astype(np.float32, copy=False)
 
     save_depth_pngs(depth_np=depth_np, image_names=image_names, output_dir=output_dir)
+    if valid_conf is not None:
+        confidence_dir = os.path.join(output_dir, "confidence")
+        os.makedirs(confidence_dir, exist_ok=True)
+        for idx in range(valid_conf.shape[0]):
+            if idx < len(image_names):
+                stem = os.path.splitext(os.path.basename(str(image_names[idx])))[0]
+            else:
+                stem = f"frame_{idx:04d}"
+            confidence_mask = (valid_conf[idx].astype(np.uint8) * 255)
+            cv2.imwrite(os.path.join(confidence_dir, stem + ".png"), confidence_mask)
+
     nonzero_pixels = int(np.count_nonzero(np.isfinite(depth_np) & (depth_np > 0)))
     print(
         f"[DEPTH EXPORT] Saved single-frame prediction depth maps to {output_dir} "

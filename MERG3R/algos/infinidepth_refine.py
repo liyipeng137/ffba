@@ -53,6 +53,21 @@ def _depth_path_for_image(depth_dir, image_name, frame_idx):
     return path, stem
 
 
+def _confidence_path_for_image(confidence_dir, image_name, frame_idx):
+    if confidence_dir is None:
+        return None
+    confidence_dir = Path(confidence_dir)
+    stem = os.path.splitext(os.path.basename(str(image_name)))[0]
+    path = confidence_dir / f"{stem}.png"
+    if path.exists():
+        return path
+
+    fallback = confidence_dir / f"frame_{frame_idx:04d}.png"
+    if fallback.exists():
+        return fallback
+    return path
+
+
 def _depth_to_color_opencv(depth_map, vmin=None, vmax=None, colormap=cv2.COLORMAP_TURBO):
     valid_mask = np.isfinite(depth_map) & (depth_map > 0)
     depth_clean = depth_map.copy()
@@ -114,6 +129,7 @@ def _load_sensor_depth_prompt(
     depth_path,
     input_size,
     device,
+    confidence_path=None,
     min_prompt=0.01,
     max_prompt=100.0,
     num_samples=1500,
@@ -126,6 +142,21 @@ def _load_sensor_depth_prompt(
     depth = cv2.resize(depth, (int(input_size[1]), int(input_size[0])), interpolation=cv2.INTER_NEAREST)
 
     depth_mask = ((depth > float(min_prompt)) & (depth < float(max_prompt))).astype(np.float32)
+    if confidence_path is not None:
+        confidence_path = Path(confidence_path)
+        if confidence_path.exists():
+            conf_mask = cv2.imread(str(confidence_path), cv2.IMREAD_GRAYSCALE)
+            if conf_mask is None:
+                raise ValueError(f"Failed to read confidence mask: {confidence_path}")
+            conf_mask = cv2.resize(
+                conf_mask,
+                (int(input_size[1]), int(input_size[0])),
+                interpolation=cv2.INTER_NEAREST,
+            )
+            depth_mask *= (conf_mask > 0).astype(np.float32)
+        else:
+            print(f"[INFINIDEPTH] Warning: missing confidence mask {confidence_path}; using depth range mask only")
+
     valid_depth = depth * depth_mask
     if int((valid_depth > float(min_prompt)).sum()) > int(num_samples):
         sample_depth = valid_depth.reshape(-1).copy()
@@ -166,6 +197,7 @@ def run_infinidepth_refinement(
     model_path=DEFAULT_INFINIDEPTH_MODEL_PATH,
     device="cuda",
     depth_image_names=None,
+    confidence_dir=None,
     input_size=(768, 1024),
 ):
     """
@@ -176,10 +208,12 @@ def run_infinidepth_refinement(
         image_names: Names used for output refined depth stems.
         depth_image_names: Optional names used to match low-resolution input depth by stem.
         depth_npy_dir: Directory containing float32 sparse/sensor depth .npy files.
+        confidence_dir: Optional directory containing confidence mask PNGs matched by depth_image_names.
         output_dir: Output directory; writes depth_npy, depth_vis, and depth_png.
         intrinsic: Camera intrinsics in the RGB image coordinate system, shape (3, 3) or (N, 3, 3).
     """
     depth_npy_dir = Path(depth_npy_dir)
+    confidence_dir = None if confidence_dir is None else Path(confidence_dir)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -219,6 +253,7 @@ def run_infinidepth_refinement(
             else image_name
         )
         depth_path, _ = _depth_path_for_image(depth_npy_dir, depth_image_name, frame_idx)
+        confidence_path = _confidence_path_for_image(confidence_dir, depth_image_name, frame_idx)
         stem = os.path.splitext(os.path.basename(str(image_name)))[0]
         if not depth_path.exists():
             print(f"[INFINIDEPTH] skip {stem}: missing input depth {depth_path}")
@@ -231,6 +266,7 @@ def run_infinidepth_refinement(
             depth_path,
             input_size,
             inf_device,
+            confidence_path=confidence_path,
         )
 
         query_coord = _make_2d_uniform_query(org_h, org_w, inf_device)

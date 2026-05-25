@@ -120,7 +120,7 @@ def parse_args():
         "--save_dense_depth",
         dest="save_dense_depth",
         action="store_true",
-        default=True,
+        default=False,
         help="Save per-camera depth maps projected from the merged dense point cloud.",
     )
     parser.add_argument(
@@ -521,7 +521,7 @@ def main():
         final_predictions,
         sequence.image_names,
         os.path.join(args.output_dir, "single_frame_depth"),
-        conf_threshold=args.point_vis_threshold,
+        conf_threshold=5.0,
     )
     single_frame_depth_end = time.time()
 
@@ -547,17 +547,17 @@ def main():
         )
 
     dense_debug_stats = None
-    if args.dense_debug and args.global_ba:
-        dense_debug_stats = export_dense_debug_outputs(
-            args.output_dir,
-            final_predictions,
-            sequence.images,
-            sequence.image_names,
-            track,
-            points_id,
-            valid_track_mask=valid_track_mask,
-            dense_max_points=args.dense_debug_max_points if args.dense_debug_max_points > 0 else None,
-        )
+    # if args.dense_debug and args.global_ba:
+    #     dense_debug_stats = export_dense_debug_outputs(
+    #         args.output_dir,
+    #         final_predictions,
+    #         sequence.images,
+    #         sequence.image_names,
+    #         track,
+    #         points_id,
+    #         valid_track_mask=valid_track_mask,
+    #         dense_max_points=args.dense_debug_max_points if args.dense_debug_max_points > 0 else None,
+    #     )
 
     dense_correction_stats = None
     if args.dense_correction == "invz_affine":
@@ -709,6 +709,7 @@ def main():
             model_path=args.infinidepth_model_path,
             device=device,
             depth_image_names=sequence.image_names,
+            confidence_dir=os.path.join(args.output_dir, "single_frame_depth", "confidence"),
             input_size=(args.infinidepth_input_height, args.infinidepth_input_width),
         )
         infinidepth_end = time.time()
