@@ -1465,13 +1465,13 @@ def project_world_points_to_depth_torch(
     return depth_maps
 
 
-def save_depth_pngs(depth_np, image_names, output_dir):
-    """
-    Save depth maps in three formats:
-      1) uint16 millimeter PNGs under depth_u16
-      2) uint8 pseudo-color PNGs under depth_vis
-      3) float32 NPY files under depth_npy
-    """
+def _depth_stem_for_image(image_names, idx):
+    if idx < len(image_names):
+        return os.path.splitext(os.path.basename(str(image_names[idx])))[0]
+    return f"frame_{idx:04d}"
+
+
+def _save_depth_frame_pngs(depth_frame, stem, output_dir):
     depth_u16_dir = os.path.join(output_dir, "depth_u16")
     depth_vis_dir = os.path.join(output_dir, "depth_vis")
     depth_npy_dir = os.path.join(output_dir, "depth_npy")
@@ -1479,37 +1479,42 @@ def save_depth_pngs(depth_np, image_names, output_dir):
     os.makedirs(depth_vis_dir, exist_ok=True)
     os.makedirs(depth_npy_dir, exist_ok=True)
 
+    depth_frame = np.nan_to_num(depth_frame, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
+    depth_u16 = np.clip(depth_frame * 1000.0, 0, np.iinfo(np.uint16).max).astype(np.uint16)
+    base_name = stem + ".png"
+
+    cv2.imwrite(os.path.join(depth_u16_dir, base_name), depth_u16)
+    np.save(os.path.join(depth_npy_dir, stem + ".npy"), depth_frame.astype(np.float32, copy=False))
+
+    valid_mask = np.isfinite(depth_frame) & (depth_frame > 0)
+    if np.any(valid_mask):
+        d = depth_frame[valid_mask]
+        d_min = np.percentile(d, 2.0)
+        d_max = np.percentile(d, 98.0)
+        if d_max <= d_min:
+            d_max = d_min + 1e-6
+
+        depth_norm = (depth_frame - d_min) / (d_max - d_min)
+        depth_norm = np.clip(depth_norm, 0.0, 1.0)
+        depth_vis_u8 = (depth_norm * 255.0).astype(np.uint8)
+        depth_vis_u8[~valid_mask] = 0
+        depth_color = cv2.applyColorMap(depth_vis_u8, cv2.COLORMAP_TURBO)
+    else:
+        h, w = depth_frame.shape[:2]
+        depth_color = np.zeros((h, w, 3), dtype=np.uint8)
+
+    cv2.imwrite(os.path.join(depth_vis_dir, base_name), depth_color)
+
+
+def save_depth_pngs(depth_np, image_names, output_dir):
+    """
+    Save depth maps in three formats:
+      1) uint16 millimeter PNGs under depth_u16
+      2) uint8 pseudo-color PNGs under depth_vis
+      3) float32 NPY files under depth_npy
+    """
     for idx in range(depth_np.shape[0]):
-        depth_frame = np.nan_to_num(depth_np[idx], nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
-        depth_u16 = np.clip(depth_frame * 1000.0, 0, np.iinfo(np.uint16).max).astype(np.uint16)
-
-        if idx < len(image_names):
-            stem = os.path.splitext(os.path.basename(str(image_names[idx])))[0]
-        else:
-            stem = f"frame_{idx:04d}"
-        base_name = stem + ".png"
-
-        cv2.imwrite(os.path.join(depth_u16_dir, base_name), depth_u16)
-        np.save(os.path.join(depth_npy_dir, stem + ".npy"), depth_frame.astype(np.float32, copy=False))
-
-        valid_mask = np.isfinite(depth_frame) & (depth_frame > 0)
-        if np.any(valid_mask):
-            d = depth_frame[valid_mask]
-            d_min = np.percentile(d, 2.0)
-            d_max = np.percentile(d, 98.0)
-            if d_max <= d_min:
-                d_max = d_min + 1e-6
-
-            depth_norm = (depth_frame - d_min) / (d_max - d_min)
-            depth_norm = np.clip(depth_norm, 0.0, 1.0)
-            depth_vis_u8 = (depth_norm * 255.0).astype(np.uint8)
-            depth_vis_u8[~valid_mask] = 0
-            depth_color = cv2.applyColorMap(depth_vis_u8, cv2.COLORMAP_TURBO)
-        else:
-            h, w = depth_frame.shape[:2]
-            depth_color = np.zeros((h, w, 3), dtype=np.uint8)
-
-        cv2.imwrite(os.path.join(depth_vis_dir, base_name), depth_color)
+        _save_depth_frame_pngs(depth_np[idx], _depth_stem_for_image(image_names, idx), output_dir)
 
 
 def export_prediction_depth_maps(predictions, image_names, output_dir, conf_threshold=None):
@@ -1520,56 +1525,80 @@ def export_prediction_depth_maps(predictions, image_names, output_dir, conf_thre
     if "depth" not in predictions:
         raise ValueError("predictions must contain a 'depth' entry")
 
-    depth_np = predictions["depth"]
-    if isinstance(depth_np, torch.Tensor):
-        depth_np = depth_np.detach().cpu().numpy()
-    depth_np = np.asarray(depth_np, dtype=np.float32)
-    if depth_np.ndim == 4 and depth_np.shape[-1] == 1:
-        depth_np = depth_np[..., 0]
-    if depth_np.ndim != 3:
-        raise ValueError(f"Expected prediction depth shape (N, H, W) or (N, H, W, 1), got {depth_np.shape}")
+    depth_src = predictions["depth"]
+    depth_shape = tuple(depth_src.shape) if isinstance(depth_src, torch.Tensor) else np.asarray(depth_src).shape
+    if len(depth_shape) == 4 and depth_shape[-1] == 1:
+        depth_shape_3d = depth_shape[:3]
+    else:
+        depth_shape_3d = depth_shape
+    if len(depth_shape_3d) != 3:
+        raise ValueError(f"Expected prediction depth shape (N, H, W) or (N, H, W, 1), got {depth_shape}")
+    num_frames = int(depth_shape_3d[0])
 
     masked_pixels = 0
     conf_threshold_value = None
-    valid_conf = None
+    conf_src = None
     if conf_threshold is not None:
         if "depth_conf" not in predictions:
             raise ValueError("predictions must contain 'depth_conf' when conf_threshold is provided")
-        conf_np = predictions["depth_conf"]
-        if isinstance(conf_np, torch.Tensor):
-            conf_np = conf_np.detach().cpu().numpy()
-        conf_np = np.asarray(conf_np, dtype=np.float32)
-        if conf_np.ndim == 4 and conf_np.shape[-1] == 1:
-            conf_np = conf_np[..., 0]
-        if conf_np.shape != depth_np.shape:
-            raise ValueError(f"Expected depth_conf shape {depth_np.shape}, got {conf_np.shape}")
+        conf_src = predictions["depth_conf"]
+        conf_shape = tuple(conf_src.shape) if isinstance(conf_src, torch.Tensor) else np.asarray(conf_src).shape
+        if len(conf_shape) == 4 and conf_shape[-1] == 1:
+            conf_shape_3d = conf_shape[:3]
+        else:
+            conf_shape_3d = conf_shape
+        if tuple(conf_shape_3d) != tuple(depth_shape_3d):
+            raise ValueError(f"Expected depth_conf shape {depth_shape_3d}, got {conf_shape}")
+        if conf_threshold == 0.0:
+            conf_threshold_value = 0.0
+        else:
+            conf_for_percentile = conf_src.detach().cpu().numpy() if isinstance(conf_src, torch.Tensor) else np.asarray(conf_src)
+            if conf_for_percentile.ndim == 4 and conf_for_percentile.shape[-1] == 1:
+                conf_for_percentile = conf_for_percentile[..., 0]
+            conf_threshold_value = float(np.percentile(conf_for_percentile, conf_threshold))
+            del conf_for_percentile
 
-        conf_threshold_value = 0.0 if conf_threshold == 0.0 else float(np.percentile(conf_np, conf_threshold))
-        valid_conf = np.isfinite(conf_np) & (conf_np >= conf_threshold_value) & (conf_np > 1e-5)
-        masked_pixels = int(depth_np.size - np.count_nonzero(valid_conf))
-        depth_np = np.where(valid_conf, depth_np, 0.0).astype(np.float32, copy=False)
-
-    save_depth_pngs(depth_np=depth_np, image_names=image_names, output_dir=output_dir)
-    if valid_conf is not None:
+    if conf_src is not None:
         confidence_dir = os.path.join(output_dir, "confidence")
         os.makedirs(confidence_dir, exist_ok=True)
-        for idx in range(valid_conf.shape[0]):
-            if idx < len(image_names):
-                stem = os.path.splitext(os.path.basename(str(image_names[idx])))[0]
+
+    nonzero_pixels = 0
+    for idx in range(num_frames):
+        if isinstance(depth_src, torch.Tensor):
+            depth_frame = depth_src[idx].detach().cpu().numpy()
+        else:
+            depth_frame = np.asarray(depth_src[idx])
+        if depth_frame.ndim == 3 and depth_frame.shape[-1] == 1:
+            depth_frame = depth_frame[..., 0]
+        depth_frame = np.asarray(depth_frame, dtype=np.float32)
+
+        if conf_src is not None:
+            if isinstance(conf_src, torch.Tensor):
+                conf_frame = conf_src[idx].detach().cpu().numpy()
             else:
-                stem = f"frame_{idx:04d}"
-            confidence_mask = (valid_conf[idx].astype(np.uint8) * 255)
+                conf_frame = np.asarray(conf_src[idx])
+            if conf_frame.ndim == 3 and conf_frame.shape[-1] == 1:
+                conf_frame = conf_frame[..., 0]
+            conf_frame = np.asarray(conf_frame, dtype=np.float32)
+            valid_conf = np.isfinite(conf_frame) & (conf_frame >= conf_threshold_value) & (conf_frame > 1e-5)
+            masked_pixels += int(valid_conf.size - np.count_nonzero(valid_conf))
+            depth_frame = np.where(valid_conf, depth_frame, 0.0).astype(np.float32, copy=False)
+
+            stem = _depth_stem_for_image(image_names, idx)
+            confidence_mask = valid_conf.astype(np.uint8) * 255
             cv2.imwrite(os.path.join(confidence_dir, stem + ".png"), confidence_mask)
 
-    nonzero_pixels = int(np.count_nonzero(np.isfinite(depth_np) & (depth_np > 0)))
+        nonzero_pixels += int(np.count_nonzero(np.isfinite(depth_frame) & (depth_frame > 0)))
+        _save_depth_frame_pngs(depth_frame, _depth_stem_for_image(image_names, idx), output_dir)
+
     print(
         f"[DEPTH EXPORT] Saved single-frame prediction depth maps to {output_dir} "
-        f"(frames={depth_np.shape[0]}, nonzero_pixels={nonzero_pixels}, "
+        f"(frames={num_frames}, nonzero_pixels={nonzero_pixels}, "
         f"conf_percentile={conf_threshold}, conf_threshold_value={conf_threshold_value}, "
         f"masked_pixels={masked_pixels})"
     )
     return {
-        "num_depth_frames": int(depth_np.shape[0]),
+        "num_depth_frames": int(num_frames),
         "num_nonzero_depth_pixels": nonzero_pixels,
         "conf_threshold": conf_threshold,
         "conf_threshold_value": conf_threshold_value,
@@ -2087,8 +2116,10 @@ def process_images(image_dir, subsample, device, num_images, multi_dirs=False, m
         original_images.append(np.array(img))
     
     if model == "vggt_omega":
-        from vggt_omega.utils.load_fn import load_and_preprocess_images as vggt_omega_load_and_preprocess_images
-        images = vggt_omega_load_and_preprocess_images(image_names, image_resolution=512).to(device)
+        # from vggt_omega.utils.load_fn import load_and_preprocess_images as vggt_omega_load_and_preprocess_images
+        # images = vggt_omega_load_and_preprocess_images(image_names, image_resolution=512).to(device)
+        from vggt.utils.load_fn import load_and_preprocess_images as vggt_load_and_preprocess_images
+        images = vggt_load_and_preprocess_images(image_names, mode="raw").to(device)
     else:
         from vggt.utils.load_fn import load_and_preprocess_images as vggt_load_and_preprocess_images
         images = vggt_load_and_preprocess_images(image_names, mode="raw").to(device)
