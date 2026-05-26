@@ -971,7 +971,7 @@ class GaussianModel:
             metric_mask = importance_score > importance_threshold
 
         before = self._xyz.shape[0]
-        if before <= 2500000:
+        if before <= 2000000:
             self.densify_and_clone(grads, max_grad, grads_abs, Q, extent, metric_mask=metric_mask)
             clone = self._xyz.shape[0]
             self.densify_and_split(grads, max_grad, grads_abs, Q, extent, metric_mask=metric_mask)

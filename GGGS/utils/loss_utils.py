@@ -124,7 +124,17 @@ def L1_loss_appearance(image, gt_image, gaussians, view_idx):
 
 
 class PatchMatch:
-    def __init__(self, patch_size, pixel_noise_th, kernel_size, pipe, debug=True, model_path=None):
+    def __init__(
+        self,
+        patch_size,
+        pixel_noise_th,
+        kernel_size,
+        pipe,
+        debug=True,
+        model_path=None,
+        optimize_geo=True,
+        optimize_ncc=True,
+    ):
         self.patch_size = patch_size
         self.total_patch_size = (patch_size * 2 + 1) ** 2
         self.pixel_noise_th = pixel_noise_th
@@ -134,6 +144,8 @@ class PatchMatch:
         self.pipe = pipe
         self.debug = debug
         self.model_path = model_path
+        self.optimize_geo = optimize_geo
+        self.optimize_ncc = optimize_ncc
         if debug:
             os.makedirs(os.path.join(model_path, "debug"), exist_ok=True)
 
@@ -150,41 +162,42 @@ class PatchMatch:
             )
             nearest_to_view_R = nearest_cam.R.transpose(1, 0) @ viewpoint_cam.world_view_transform[:3, :3]
 
-        # pts = (rays_d * render_pkg["median_depth"].squeeze().unsqueeze(-1)).reshape(-1, 3)
-        depth_reshape = render_pkg["median_depth"].squeeze().unsqueeze(-1)
-        pts = torch.cat([depth_reshape * ix[None, :, None], depth_reshape * iy[:, None, None], depth_reshape], dim=-1)
+        with torch.set_grad_enabled(self.optimize_geo):
+            # Skip building geometry gradients when this branch is disabled.
+            depth_reshape = render_pkg["median_depth"].squeeze().unsqueeze(-1)
+            pts = torch.cat([depth_reshape * ix[None, :, None], depth_reshape * iy[:, None, None], depth_reshape], dim=-1)
 
-        R = viewpoint_cam.R
-        T = viewpoint_cam.T
-        pts = (pts - T) @ R.T
-        sampled_pkg = sample_depth(
-            pts,
-            nearest_cam,
-            gaussians,
-            self.pipe,
-            self.kernel_size,
-        )
+            R = viewpoint_cam.R
+            T = viewpoint_cam.T
+            pts = (pts - T) @ R.T
+            sampled_pkg = sample_depth(
+                pts,
+                nearest_cam,
+                gaussians,
+                self.pipe,
+                self.kernel_size,
+            )
 
-        pts_in_nearest_cam = sampled_pkg["sampled_depth"]
-        R = nearest_cam.R
-        T = nearest_cam.T
+            pts_in_nearest_cam = sampled_pkg["sampled_depth"]
+            R = nearest_cam.R
+            T = nearest_cam.T
 
-        pts_in_view_cam = view_to_nearest_T + pts_in_nearest_cam @ nearest_to_view_R
-        pts_projections = pts_in_view_cam[..., :2] / torch.clamp_min(pts_in_view_cam[..., 2:], 1e-7)
-        pts_projections = torch.addcmul(
-            pts_projections.new_tensor([viewpoint_cam.Cx, viewpoint_cam.Cy]),
-            pts_projections.new_tensor([viewpoint_cam.Fx, viewpoint_cam.Fy]),
-            pts_projections,
-        )
+            pts_in_view_cam = view_to_nearest_T + pts_in_nearest_cam @ nearest_to_view_R
+            pts_projections = pts_in_view_cam[..., :2] / torch.clamp_min(pts_in_view_cam[..., 2:], 1e-7)
+            pts_projections = torch.addcmul(
+                pts_projections.new_tensor([viewpoint_cam.Cx, viewpoint_cam.Cy]),
+                pts_projections.new_tensor([viewpoint_cam.Fx, viewpoint_cam.Fy]),
+                pts_projections,
+            )
 
-        ix, iy = torch.meshgrid(
-            torch.arange(W, device="cuda", dtype=torch.int32),
-            torch.arange(H, device="cuda", dtype=torch.int32),
-            indexing="xy",
-        )
-        pixels = torch.stack([ix, iy], dim=-1)
-        pixel_f = pixels.type(torch.float32).requires_grad_(False)
-        pixel_noise = torch.pairwise_distance(pts_projections, pixel_f)
+            ix, iy = torch.meshgrid(
+                torch.arange(W, device="cuda", dtype=torch.int32),
+                torch.arange(H, device="cuda", dtype=torch.int32),
+                indexing="xy",
+            )
+            pixels = torch.stack([ix, iy], dim=-1)
+            pixel_f = pixels.type(torch.float32).requires_grad_(False)
+            pixel_noise = torch.pairwise_distance(pts_projections, pixel_f)
 
         with torch.no_grad():
             d_mask = (

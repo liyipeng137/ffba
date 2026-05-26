@@ -118,6 +118,7 @@ def training(
     checkpoint_iterations,
     checkpoint,
     debug_from,
+    is_reflection
 ):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
@@ -161,7 +162,7 @@ def training(
     has_mask_dir = os.path.exists(os.path.join(dataset.source_path, dataset.mask_dir))
     has_loaded_normal_prior = any(cam.normal_prior is not None for cam in low_res_train_cameras)
     has_loaded_mask = any(cam.gt_mask is not None for cam in low_res_train_cameras)
-    reflective_case = has_loaded_normal_prior
+    reflective_case = is_reflection
 
 
     if reflective_case and not has_loaded_normal_prior:
@@ -227,7 +228,7 @@ def training(
             pipe.debug = True
 
         # Custom fine-tuning for reflective case
-        if reflective_case:
+        if is_reflection:
             lambda_multi_view_ncc_cur = 0.1 if iteration < 15000 else 0.0
             if iteration < 3000:
                 lambda_normal_prior_cur = 0.0
@@ -239,7 +240,12 @@ def training(
                 lambda_normal_prior_cur = 0.3
         else:
             lambda_multi_view_ncc_cur = 0.6
-            lambda_normal_prior_cur = 0.0
+            if iteration < 7000:
+                lambda_normal_prior_cur = 0.0
+            elif 7000 <= iteration < 15000:
+                lambda_normal_prior_cur = 0.2 * (iteration - 7000) / 8000.0
+            elif 15000 <= iteration:
+                lambda_normal_prior_cur = 0.25
 
         reg_kick_on = (iteration >= opt.regularization_from_iter)  # 7k~2w
         normal_prior_kick_on = reflective_case and lambda_normal_prior_cur > 0  # 3k~2w if reflective case
@@ -448,7 +454,7 @@ def training(
                     gaussians.reset_opacity()
 
             # FastGS-style final-stage pruning: every 3k iterations after 15k.
-            if opt.vcp_enable and iteration % 3000 == 0 and iteration > 15_000 and iteration < 30_000:
+            if (opt.vcp_enable and iteration == 18000) or iteration == 12000:
                 camlist = sample_vcd_cameras(scene.getTrainCameras().copy(), 20)
                 _, final_pruning_score = compute_vcd_vcp_scores(
                     camlist=camlist,
@@ -607,6 +613,7 @@ if __name__ == "__main__":
     lp = ModelParams(parser)
     op = OptimizationParams(parser)
     pp = PipelineParams(parser)
+    parser.add_argument("--is_reflection", action="store_true", default=False)
     parser.add_argument("--ip", type=str, default="127.0.0.1")
     parser.add_argument("--port", type=int, default=6009)
     parser.add_argument("--debug_from", type=int, default=-1)
@@ -636,6 +643,7 @@ if __name__ == "__main__":
         checkpoint_iterations=args.checkpoint_iterations,
         checkpoint=args.start_checkpoint,
         debug_from=args.debug_from,
+        is_reflection=args.is_reflection,
     )
 
     # All done

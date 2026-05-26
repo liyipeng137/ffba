@@ -13,6 +13,7 @@ import os
 import sys
 import uuid
 from argparse import ArgumentParser, Namespace
+from dataclasses import dataclass
 from random import randint, sample
 from typing import Any, Sequence, TypedDict, Union
 
@@ -40,13 +41,65 @@ from utils.loss_utils import L1_loss_appearance, PatchMatch, l1_loss, ssim
 from utils.vcd_utils import compute_vcd_vcp_scores, sample_vcd_cameras
 
 
-def should_use_background_rgb(dataset, scene: Scene, reflective_case: bool, iteration: int, has_train_mask: bool) -> bool:
-    if not dataset.train_with_background_rgb or not scene.should_train_with_bg:
-        return False
-    if has_train_mask:
-        return False
-    cutoff = 3000 if reflective_case else 7000
-    return iteration < cutoff
+@dataclass(frozen=True)
+class StageConfig:
+    name: str
+    start_iter: int                 # 开始迭代次数
+    end_iter: int                   # 结束迭代次数
+    resolution_scale: float         # 分辨率缩放因子
+    use_background_rgb: bool        # 是否使用背景RGB
+    enable_depth_normal_loss: bool  # 是否启用深度法线损失
+    enable_normal_prior: bool       # 是否启用法线先验
+    enable_ncc_geo: bool            # 是否启用NCC几何损失
+
+
+def build_stage_configs(
+    stage1_end_iter: int,
+    stage2_end_iter: int,
+    opt_iterations: int,
+    # stage3_use_depth_normal: bool,
+) -> tuple[StageConfig, ...]:
+    # stage3_start_iter = stage2_end_iter + 1
+    # stage3_end_iter = max(stage3_start_iter, opt_iterations)
+    return (
+        StageConfig(
+            name="init",
+            start_iter=1,
+            end_iter=stage1_end_iter,
+            resolution_scale=1.0,
+            use_background_rgb=False,
+            enable_depth_normal_loss=False,
+            enable_normal_prior=True,
+            enable_ncc_geo=False,
+        ),
+        StageConfig(
+            name="geometry",
+            start_iter=stage1_end_iter + 1,
+            end_iter=stage2_end_iter,
+            resolution_scale=1.0,
+            use_background_rgb=False,
+            enable_depth_normal_loss=True,
+            enable_normal_prior=True,
+            enable_ncc_geo=True,
+        ),
+        # StageConfig(
+        #     name="render",
+        #     start_iter=stage3_start_iter,
+        #     end_iter=stage3_end_iter,
+        #     resolution_scale=1.0,
+        #     use_background_rgb=False,
+        #     enable_depth_normal_loss=stage3_use_depth_normal,
+        #     enable_normal_prior=False,
+        #     enable_ncc_geo=False,
+        # ),
+    )
+
+
+def get_stage_config(iteration: int, stage_configs: tuple[StageConfig, ...]) -> StageConfig:
+    for stage in stage_configs:
+        if stage.start_iter <= iteration <= stage.end_iter:
+            return stage
+    return stage_configs[-1]
 
 
 def get_low_resolution(dataset) -> float:
@@ -61,6 +114,50 @@ def get_training_resolution_scales(dataset) -> list[float]:
     if np.isclose(low_resolution, 1.0):
         return [1.0]
     return [1.0, low_resolution]
+
+
+def edge_aware_normal_smoothness_loss(
+    normals: torch.Tensor,
+    guidance_prior_normal: torch.Tensor,
+    guidance_image: torch.Tensor | None = None,
+    valid_mask: torch.Tensor | None = None,
+    edge_scale: float = 10.0,
+    image_grad_mix_ratio: float = 0.2,
+) -> torch.Tensor:
+    # normals: [3, H, W], guidance_prior_normal: [3, H, W], guidance_image: [3, H, W] or None
+    n_dx = torch.linalg.norm(normals[:, :, 1:] - normals[:, :, :-1], dim=0)
+    n_dy = torch.linalg.norm(normals[:, 1:, :] - normals[:, :-1, :], dim=0)
+
+    prior = guidance_prior_normal.to(normals.dtype)
+    prior_dx = torch.linalg.norm(prior[:, :, 1:] - prior[:, :, :-1], dim=0)
+    prior_dy = torch.linalg.norm(prior[:, 1:, :] - prior[:, :-1, :], dim=0)
+
+    if guidance_image is not None:
+        gray = 0.299 * guidance_image[0] + 0.587 * guidance_image[1] + 0.114 * guidance_image[2]
+        i_dx = torch.abs(gray[:, 1:] - gray[:, :-1])
+        i_dy = torch.abs(gray[1:, :] - gray[:-1, :])
+        mixed_dx = torch.maximum(prior_dx, image_grad_mix_ratio * i_dx)
+        mixed_dy = torch.maximum(prior_dy, image_grad_mix_ratio * i_dy)
+    else:
+        mixed_dx = prior_dx
+        mixed_dy = prior_dy
+
+    w_dx = torch.exp(-edge_scale * mixed_dx)
+    w_dy = torch.exp(-edge_scale * mixed_dy)
+
+    if valid_mask is None:
+        return (w_dx * n_dx).mean() + (w_dy * n_dy).mean()
+
+    mask_dx = valid_mask[:, 1:] & valid_mask[:, :-1]
+    mask_dy = valid_mask[1:, :] & valid_mask[:-1, :]
+    mask_dx_f = mask_dx.float()
+    mask_dy_f = mask_dy.float()
+
+    denom_x = mask_dx_f.sum().clamp_min(1.0)
+    denom_y = mask_dy_f.sum().clamp_min(1.0)
+    loss_x = (w_dx * n_dx * mask_dx_f).sum() / denom_x
+    loss_y = (w_dy * n_dy * mask_dy_f).sum() / denom_y
+    return loss_x + loss_y
 
 
 def training_bg(dataset, opt, pipe, scene: Scene, background: torch.Tensor, kernel_size: float) -> None:
@@ -118,12 +215,14 @@ def training(
     checkpoint_iterations,
     checkpoint,
     debug_from,
+    stage_schedule,
 ):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree, dataset.sg_degree)
     bg_gaussians = GaussianBackgroundModel(dataset.sh_degree) if dataset.enable_background_sphere else None
-    scene = Scene(dataset, gaussians, bg_gaussians, resolution_scales=get_training_resolution_scales(dataset))
+    # bg_gaussians = None
+    scene = Scene(dataset, gaussians, bg_gaussians, resolution_scales=[1.0])
     gaussians.training_setup(opt)
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
@@ -138,40 +237,75 @@ def training(
     iter_start = torch.cuda.Event(enable_timing=True)
     iter_end = torch.cuda.Event(enable_timing=True)
 
-    low_resolution = get_low_resolution(dataset)
-    low_res_train_cameras = scene.getTrainCameras(scale=low_resolution).copy()
-    trainCameras = scene.getTrainCameras(scale=1.0).copy()
+    # low_resolution = get_low_resolution(dataset)
+    stage1_end_iter = max(1, min(int(stage_schedule["stage1_end_iter"]), int(opt.iterations)))
+    stage2_end_iter = max(stage1_end_iter, min(int(stage_schedule["stage2_end_iter"]), int(opt.iterations)))
+    # stage3_start_iter = stage2_end_iter + 1
+    # stage3_use_depth_normal = bool(stage_schedule["stage3_use_depth_normal"])
+
+    # set stage configs
+    stage_configs = build_stage_configs(
+        stage1_end_iter=stage1_end_iter,
+        stage2_end_iter=stage2_end_iter,
+        opt_iterations=int(opt.iterations),
+        # stage3_use_depth_normal=stage3_use_depth_normal,
+    )
+
+    # set final prune iterations
+    final_prune_iterations = sorted(
+        {
+            int(it)
+            for it in stage_schedule["final_prune_iterations"]
+        }
+    )
+
+    # low_res_train_cameras = scene.getTrainCameras(scale=low_resolution).copy()
+    full_res_train_cameras = scene.getTrainCameras(scale=1.0).copy()
     if dataset.disable_filter3D:
         gaussians.reset_3D_filter()
     else:
-        gaussians.compute_3D_filter(cameras=trainCameras)
+        gaussians.compute_3D_filter(cameras=full_res_train_cameras)
 
-    if opt.lambda_multi_view_ncc > 0 or opt.lambda_multi_view_geo > 0:
-        patchmatch = PatchMatch(
-            opt.multi_view_patch_size,
-            opt.multi_view_pixel_noise_th,
-            kernel_size=kernel_size,
-            pipe=pipe,
-            debug=True,
-            model_path=dataset.model_path,
-        )
-
+    # 多视角几何损失
+    patchmatch = PatchMatch(
+        opt.multi_view_patch_size,
+        opt.multi_view_pixel_noise_th,
+        kernel_size=kernel_size,
+        pipe=pipe,
+        debug=True,
+        model_path=dataset.model_path,
+    )
 
     has_normal_dir = os.path.exists(os.path.join(dataset.source_path, dataset.normal_prior_dir))
     has_mask_dir = os.path.exists(os.path.join(dataset.source_path, dataset.mask_dir))
-    has_loaded_normal_prior = any(cam.normal_prior is not None for cam in low_res_train_cameras)
-    has_loaded_mask = any(cam.gt_mask is not None for cam in low_res_train_cameras)
-    reflective_case = has_loaded_normal_prior
+    has_loaded_normal_prior = any(cam.normal_prior is not None for cam in full_res_train_cameras)
+    has_loaded_mask_prior = any(cam.gt_mask is not None for cam in full_res_train_cameras)
 
-
-    if reflective_case and not has_loaded_normal_prior:
+    #----------------------------------打印训练信息----------------------------------
+    if has_normal_dir and not has_loaded_normal_prior:
         print("[Pipeline][Warn] normals directory exists but no valid normal priors were loaded.")
-    if has_mask_dir and not has_loaded_mask:
+    if has_mask_dir and not has_loaded_mask_prior:
         print("[Pipeline][Warn] masks directory exists but no valid mask priors were loaded.")
-
     print(f"[Pipeline] has_normal_dir={has_normal_dir} (loaded_priors={has_loaded_normal_prior})")
-    print(f"[Pipeline] has_mask_dir={has_mask_dir} (loaded_masks={has_loaded_mask}), lambda_mask={opt.lambda_mask}")
-    print(f"[Pipeline] low_resolution={low_resolution}")
+    print(f"[Pipeline] has_mask_dir={has_mask_dir} (loaded_masks={has_loaded_mask_prior}), lambda_mask={opt.lambda_mask}")
+    # print(f"[Pipeline] low_resolution={low_resolution}")
+    for stage in stage_configs:
+        if stage.start_iter <= stage.end_iter and stage.start_iter <= int(opt.iterations):
+            print(
+                f"[Pipeline] Stage {stage.name}: [{stage.start_iter}, {stage.end_iter}], "
+                f"scale={stage.resolution_scale}, bg_rgb={stage.use_background_rgb}, "
+                f"depth_normal={stage.enable_depth_normal_loss}, normal_prior={stage.enable_normal_prior}, "
+                f"ncc_geo={stage.enable_ncc_geo}"
+            )
+    print(f"[Pipeline] Densify follows original schedule: from>{opt.densify_from_iter} until<{opt.densify_until_iter}, interval={opt.densification_interval}")
+    print(f"[Pipeline] NCC/GEO enabled only when iteration <= densify_until_iter ({opt.densify_until_iter})")
+
+    print(f"[Pipeline] Fixed final_prune_fastgs iters={final_prune_iterations} (full-res all cameras)")
+    if final_prune_iterations and not opt.vcp_enable:
+        print("[Pipeline][Warn] vcp_enable=False, final_prune_fastgs will be skipped.")
+    #----------------------------------打印训练信息----------------------------------
+
+
 
     viewpoint_stacks: dict[float, list[Camera] | None] = {scale: None for scale in get_training_resolution_scales(dataset)}
     ema_loss_for_log = 0.0
@@ -183,34 +317,34 @@ def training(
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
     for iteration in range(first_iter, opt.iterations + 1):
-        if network_gui.conn == None:
-            network_gui.try_connect()
-        while network_gui.conn != None:
-            try:
-                net_image_bytes = None
-                (
-                    custom_cam,
-                    do_training,
-                    pipe.convert_SHs_python,
-                    pipe.compute_cov3D_python,
-                    keep_alive,
-                    scaling_modifer,
-                ) = network_gui.receive()
-                if custom_cam != None:
-                    net_image = render(
-                        custom_cam,
-                        gaussians,
-                        pipe,
-                        background,
-                        kernel_size,
-                        scaling_modifer,
-                    )["render"]
-                    net_image_bytes = memoryview((torch.clamp(net_image, min=0, max=1.0) * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy())
-                network_gui.send(net_image_bytes, dataset.source_path)
-                if do_training and ((iteration < int(opt.iterations)) or not keep_alive):
-                    break
-            except Exception as e:
-                network_gui.conn = None
+        # if network_gui.conn == None:
+        #     network_gui.try_connect()
+        # while network_gui.conn != None:
+        #     try:
+        #         net_image_bytes = None
+        #         (
+        #             custom_cam,
+        #             do_training,
+        #             pipe.convert_SHs_python,
+        #             pipe.compute_cov3D_python,
+        #             keep_alive,
+        #             scaling_modifer,
+        #         ) = network_gui.receive()
+        #         if custom_cam != None:
+        #             net_image = render(
+        #                 custom_cam,
+        #                 gaussians,
+        #                 pipe,
+        #                 background,
+        #                 kernel_size,
+        #                 scaling_modifer,
+        #             )["render"]
+        #             net_image_bytes = memoryview((torch.clamp(net_image, min=0, max=1.0) * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy())
+        #         network_gui.send(net_image_bytes, dataset.source_path)
+        #         if do_training and ((iteration < int(opt.iterations)) or not keep_alive):
+        #             break
+        #     except Exception as e:
+        #         network_gui.conn = None
 
         iter_start.record()
 
@@ -226,27 +360,37 @@ def training(
         if (iteration - 1) == debug_from:
             pipe.debug = True
 
-        # Custom fine-tuning for reflective case
-        if reflective_case:
-            lambda_multi_view_ncc_cur = 0.1 if iteration < 15000 else 0.0
-            if iteration < 3000:
-                lambda_normal_prior_cur = 0.0
-            elif 3000 <= iteration < 7000:
-                lambda_normal_prior_cur = 0.2 * (iteration - 3000) / 4000.0
-            elif 7000 <= iteration < 15000:
-                lambda_normal_prior_cur = 0.2 + 0.1 * (iteration - 7000) / 8000.0
+        # set normal prior loss lambda and ncc geo loss lambda
+        # ------------------------------SET UP----------------------------------
+        stage_cfg = get_stage_config(iteration, stage_configs)
+        in_stage_geometry = stage_cfg.name == "geometry"
+        in_stage_init = stage_cfg.name == "init"
+
+        # ncc_geo_kick_on = stage_cfg.enable_ncc_geo and iteration <= int(opt.densify_until_iter)
+        ncc_geo_kick_on = stage_cfg.enable_ncc_geo
+        if in_stage_init:
+            lambda_normal_prior_cur = 0.15
+            lambda_multi_view_ncc_cur = 0.0
+        elif in_stage_geometry:
+            if has_loaded_normal_prior:
+                ramp_denom = max(stage_cfg.end_iter - stage_cfg.start_iter, 1)
+                stage_progress = (iteration - stage_cfg.start_iter) / ramp_denom
+                lambda_multi_view_ncc_cur = 0.2 + (0.2 - 0.3) * stage_progress
+                lambda_normal_prior_cur = 0.2 + (0.3 - 0.2) * stage_progress
             else:
-                lambda_normal_prior_cur = 0.3
+                lambda_multi_view_ncc_cur = 0.6 if ncc_geo_kick_on else 0.0
+                lambda_normal_prior_cur = 0.0
         else:
-            lambda_multi_view_ncc_cur = 0.6
+            lambda_multi_view_ncc_cur = 0.0
             lambda_normal_prior_cur = 0.0
 
-        reg_kick_on = (iteration >= opt.regularization_from_iter)  # 7k~2w
-        normal_prior_kick_on = reflective_case and lambda_normal_prior_cur > 0  # 3k~2w if reflective case
-        mask_kick_on = opt.lambda_mask > 0 and iteration >= opt.mask_from_iter and has_loaded_mask  # if load mask, then use mask loss
+        # set kick on
+        depth_normal_loss_kick_on = stage_cfg.enable_depth_normal_loss
+        normal_prior_kick_on = stage_cfg.enable_normal_prior and has_loaded_normal_prior and lambda_normal_prior_cur > 0
+        mask_kick_on = opt.lambda_mask > 0 and iteration >= opt.mask_from_iter and has_loaded_mask_prior  # if load mask, then use mask loss
+        depth_render_on = depth_normal_loss_kick_on or normal_prior_kick_on or ncc_geo_kick_on
+        active_scale = stage_cfg.resolution_scale
 
-        depth_render_on = reg_kick_on or normal_prior_kick_on
-        active_scale = low_resolution if depth_render_on else 1.0
 
         if viewpoint_stacks[active_scale] is None or len(viewpoint_stacks[active_scale]) == 0:
             viewpoint_stacks[active_scale] = scene.getTrainCameras(scale=active_scale).copy()
@@ -254,9 +398,18 @@ def training(
         viewpoint_cam = viewpoint_stacks[active_scale].pop(
             randint(0, len(viewpoint_stacks[active_scale]) - 1)
         )
-        # normal_prior_kick_on = normal_prior_phase_on and viewpoint_cam.normal_prior is not None
 
-        bg_model = scene.bg_gaussians if should_use_background_rgb(dataset, scene, reflective_case, iteration, has_loaded_mask) else None
+        # set background model
+        use_background_rgb = (
+            stage_cfg.use_background_rgb
+            and dataset.train_with_background_rgb
+            and scene.should_train_with_bg
+            and not has_loaded_mask_prior
+        )
+        bg_model = scene.bg_gaussians if use_background_rgb else None
+        # ------------------------------SET UP----------------------------------
+
+        # render
         render_pkg = render(
             viewpoint_cam,
             gaussians,
@@ -273,16 +426,13 @@ def training(
             render_pkg["visibility_filter"],
             render_pkg["radii"],
         )
-        gt_image = viewpoint_cam.original_image.cuda()
-
-        Ll1_render = L1_loss_appearance(rendered_image, gt_image, gaussians, viewpoint_cam.uid)
 
         # normal consistency / depth-derived normal
         if depth_render_on:
             depth_map: torch.Tensor = render_pkg["median_depth"]
             rendered_normal: torch.Tensor = render_pkg["normal"]
             depth_normal, valid_points = depth_to_normal(viewpoint_cam, depth_map)
-            if reg_kick_on and opt.lambda_depth_normal > 0:
+            if depth_normal_loss_kick_on and opt.lambda_depth_normal > 0:
                 normal_error_map = 1 - torch.linalg.vecdot(rendered_normal, depth_normal, dim=0)
                 depth_normal_loss = torch.where(valid_points.squeeze(), normal_error_map, torch.zeros_like(normal_error_map)).mean()
             else:
@@ -321,7 +471,7 @@ def training(
 
 
         # patch match loss
-        if reg_kick_on and (lambda_multi_view_ncc_cur > 0 or opt.lambda_multi_view_geo):
+        if patchmatch is not None and ncc_geo_kick_on and (lambda_multi_view_ncc_cur > 0 or opt.lambda_multi_view_geo > 0):
             nearest_cam = (
                 None
                 if len(viewpoint_cam.nearest_id) == 0
@@ -333,6 +483,8 @@ def training(
             geo_loss = torch.tensor([0], dtype=torch.float32, device="cuda")
 
         # rgb loss
+        gt_image = viewpoint_cam.original_image.cuda()
+        Ll1_render = L1_loss_appearance(rendered_image, gt_image, gaussians, viewpoint_cam.uid)
         rgb_loss = (1.0 - opt.lambda_dssim) * Ll1_render + opt.lambda_dssim * (1.0 - ssim(rendered_image.unsqueeze(0), gt_image.unsqueeze(0)))
 
         # mask loss
@@ -352,6 +504,15 @@ def training(
             + opt.lambda_multi_view_geo * geo_loss
         )
         loss.backward()
+
+        if bg_model is not None:
+            foreground_count = gaussians.get_xyz.shape[0]
+            radii = radii[:foreground_count]
+            foreground_viewspace = viewspace_point_tensor[:foreground_count]
+            if viewspace_point_tensor.grad is not None:
+                foreground_viewspace.grad = viewspace_point_tensor.grad[:foreground_count]
+            viewspace_point_tensor = foreground_viewspace
+            visibility_filter = visibility_filter[:foreground_count]
 
         iter_end.record()
 
@@ -442,14 +603,14 @@ def training(
                     if dataset.disable_filter3D:
                         gaussians.reset_3D_filter()
                     else:
-                        gaussians.compute_3D_filter(cameras=trainCameras)
+                        gaussians.compute_3D_filter(cameras=full_res_train_cameras)
 
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
 
-            # FastGS-style final-stage pruning: every 3k iterations after 15k.
-            if opt.vcp_enable and iteration % 3000 == 0 and iteration > 15_000 and iteration < 30_000:
-                camlist = sample_vcd_cameras(scene.getTrainCameras().copy(), 20)
+            # Fixed final pruning for render-oriented point count control.
+            if opt.vcp_enable and iteration in final_prune_iterations:
+                camlist = scene.getTrainCameras(scale=1.0).copy()
                 _, final_pruning_score = compute_vcd_vcp_scores(
                     camlist=camlist,
                     gaussians=gaussians,
@@ -463,18 +624,18 @@ def training(
                 gaussians.final_prune_fastgs(
                     min_opacity=0.1,
                     pruning_score=final_pruning_score,
-                    score_threshold=0.85,
+                    score_threshold=0.9,
                     outside_prune_radius=(scene.scene_scale * 1.5) if scene.scene_scale is not None else None,
                 )
                 if dataset.disable_filter3D:
                     gaussians.reset_3D_filter()
                 else:
-                    gaussians.compute_3D_filter(cameras=trainCameras)
+                    gaussians.compute_3D_filter(cameras=full_res_train_cameras)
 
             if iteration % 100 == 0 and iteration > opt.densify_until_iter and not dataset.disable_filter3D:
                 if iteration < opt.iterations - 100:
                     # don't update in the end of training
-                    gaussians.compute_3D_filter(cameras=trainCameras)
+                    gaussians.compute_3D_filter(cameras=full_res_train_cameras)
 
             # Optimizer step
             if iteration < opt.iterations:
@@ -611,18 +772,37 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=6009)
     parser.add_argument("--debug_from", type=int, default=-1)
     parser.add_argument("--detect_anomaly", action="store_true", default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[30000])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[20000])
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[15000])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default=[15000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[30000])
     parser.add_argument("--start_checkpoint", type=str, default=None)
     args = parser.parse_args(sys.argv[1:])
-    args.save_iterations.append(args.iterations)
+
+    # 第一阶段：初始化   0 - 5000
+    # 第二阶段：几何优化 5001 - 12000
+    # 致密化 500 - 12000
+    # 最终修剪 12000
+    stage1_end_iter = 5000
+    stage2_end_iter = 15000
+    fixed_final_prune_iterations = [12000]
+
+    milestones = [stage1_end_iter, stage2_end_iter, args.iterations]
+    milestones = [it for it in milestones if 1 <= it <= args.iterations]
+    args.test_iterations = sorted(set(args.test_iterations + milestones))
+    # args.save_iterations = sorted(set(args.save_iterations + milestones))
+    # args.checkpoint_iterations = sorted(set(args.checkpoint_iterations + milestones))
 
     print("Optimizing " + args.model_path)
 
     # Initialize system state (RNG)
     safe_state(args.quiet)
+
+    stage_schedule = {
+        "stage1_end_iter": stage1_end_iter,
+        "stage2_end_iter": stage2_end_iter,
+        "final_prune_iterations": fixed_final_prune_iterations,
+    }
 
     # Start GUI server, configure and run training
     # network_gui.init(args.ip, args.port)
@@ -636,6 +816,7 @@ if __name__ == "__main__":
         checkpoint_iterations=args.checkpoint_iterations,
         checkpoint=args.start_checkpoint,
         debug_from=args.debug_from,
+        stage_schedule=stage_schedule,
     )
 
     # All done

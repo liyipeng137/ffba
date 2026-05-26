@@ -19,7 +19,7 @@ namespace cg = cooperative_groups;
 
 // refer to gsplat https://github.com/nerfstudio-project/gsplat/blob/65042cc501d1cdbefaf1d6f61a9a47575eec8c71/gsplat/cuda/include/Utils.cuh#L94
 template <uint32_t DIM, class WarpT>
-__forceinline__ __device__ void warpSum(float* val, WarpT& warp) {
+__forceinline__ __device__ void warpSum(float (&val)[DIM], WarpT& warp) {
 #pragma unroll
     for (uint32_t i = 0; i < DIM; i++) {
         val[i] = cg::reduce(warp, val[i], cg::plus<float>());
@@ -778,13 +778,12 @@ __global__ void __launch_bounds__(BLOCK_X* BLOCK_Y)
     // Gaussian is known from each pixel from the forward.
     const int last_contributor = inside ? n_contrib[pix_id] : 0;
 
-    float accum_rec[C] = {0};
+    float accum_color_dot = 0;
     float dL_dpixel[C];
     float dL_dfinalT;
-    [[maybe_unused]] float accum_t_rec = 0;
     [[maybe_unused]] float dL_dpixel_t;
     [[maybe_unused]] float dL_dpixel_mt;
-    [[maybe_unused]] float accum_normal_rec[3] = {0};
+    [[maybe_unused]] float accum_normal_dot = 0;
     [[maybe_unused]] float dL_dpixel_normal[3];
 
     if (inside) {
@@ -802,12 +801,12 @@ __global__ void __launch_bounds__(BLOCK_X* BLOCK_Y)
             const float rln   = rnorm3df(pixnf.x, pixnf.y, 1.f);
             dL_dpixel_mt      = dL_dpixel_mdepths[pix_id] * rln;
 
-            glm::vec3 dL_dpixel_normaln = glm::vec3(dL_dpixel_normals[pix_id],
-                                                    dL_dpixel_normals[H * W + pix_id],
-                                                    dL_dpixel_normals[2 * H * W + pix_id]);
-            glm::vec3 normaln           = glm::vec3(normalmap[pix_id],
-                                                    normalmap[H * W + pix_id],
-                                                    normalmap[2 * H * W + pix_id]);
+            float dL_dpixel_normaln[3] = {dL_dpixel_normals[pix_id],
+                                          dL_dpixel_normals[H * W + pix_id],
+                                          dL_dpixel_normals[2 * H * W + pix_id]};
+            float normaln[3]           = {normalmap[pix_id],
+                                          normalmap[H * W + pix_id],
+                                          normalmap[2 * H * W + pix_id]};
 #ifdef NORMALIZED_NORMAL
             float normal_len          = normal_length[pix_id];
             const float small         = static_cast<float>(normal_len < NORMALIZE_EPS);
@@ -830,7 +829,7 @@ __global__ void __launch_bounds__(BLOCK_X* BLOCK_Y)
     }
 
     [[maybe_unused]] float dL_dmt_dT_dtm = 0.f;
-    const int rounds     = (max_contributor + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    const int rounds                     = (max_contributor + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
     if constexpr (GEOMETRY) {
         float dT_dtm    = 0.f;
@@ -883,10 +882,10 @@ __global__ void __launch_bounds__(BLOCK_X* BLOCK_Y)
     int toDo             = max_contributor;
     uint32_t contributor = toDo;
 
-    float last_alpha                      = 0;
-    float last_color[C]                   = {0};
-    [[maybe_unused]] float last_t         = 0;
-    [[maybe_unused]] float last_normal[3] = {0};
+    float last_alpha                       = 0;
+    float last_color_dot                   = 0;
+    [[maybe_unused]] float last_t          = 0;
+    [[maybe_unused]] float last_normal_dot = 0;
 
     // Gradient of pixel coordinate w.r.t. normalized
     // screen-space viewport corrdinates (-1 to 1)
@@ -949,34 +948,37 @@ __global__ void __launch_bounds__(BLOCK_X* BLOCK_Y)
                 // Propagate gradients to per-Gaussian colors and keep
                 // gradients w.r.t. alpha (blending factor for a Gaussian/pixel
                 // pair).
-                float dL_dopa = 0.0f;
-                for (int ch = 0; ch < C; ch++) {
-                    const float c = collected_colors[ch * BLOCK_SIZE + j];
-                    // Update last color (to be used in the next iteration)
-                    accum_rec[ch]  = last_alpha * last_color[ch] + (1.f - last_alpha) * accum_rec[ch];
-                    last_color[ch] = c;
+                float dL_dopa   = 0.0f;
+                accum_color_dot = last_alpha * last_color_dot + (1.f - last_alpha) * accum_color_dot;
 
-                    const float dL_dchannel = dL_dpixel[ch];
-                    dL_dopa += (c - accum_rec[ch]) * dL_dchannel;
-                    dL_dcolors_local[ch] = blending_weight * dL_dchannel;
+                float c_dot = 0.f;
+#pragma unroll
+                for (int ch = 0; ch < C; ++ch) {
+                    const float c        = collected_colors[ch * BLOCK_SIZE + j];
+                    const float g        = dL_dpixel[ch];
+                    c_dot                = fmaf(c, g, c_dot);
+                    dL_dcolors_local[ch] = blending_weight * g;
                 }
+
+                dL_dopa += (c_dot - accum_color_dot);
+                last_color_dot = c_dot;
 
                 [[maybe_unused]] float dL_dt;
                 [[maybe_unused]] float4 ray_plane;
                 [[maybe_unused]] float dL_dopa_sigma;
                 if constexpr (GEOMETRY) {
-                    const float3 normal          = collected_normals[j];
-                    const float* normal_ptr      = reinterpret_cast<const float*>(&normal);
-                    float* dL_dnormals_local_ptr = reinterpret_cast<float*>(&dL_dnormals_local);
-#pragma unroll
-                    for (int ch = 0; ch < 3; ch++) {
-                        const float n           = normal_ptr[ch];
-                        accum_normal_rec[ch]    = last_alpha * last_normal[ch] + (1.f - last_alpha) * accum_normal_rec[ch];
-                        last_normal[ch]         = n;
-                        const float dL_dchannel = dL_dpixel_normal[ch];
-                        dL_dopa += (n - accum_normal_rec[ch]) * dL_dchannel;
-                        dL_dnormals_local_ptr[ch] = blending_weight * dL_dchannel;
-                    }
+                    const float3 normal = collected_normals[j];
+
+                    accum_normal_dot    = last_alpha * last_normal_dot + (1.f - last_alpha) * accum_normal_dot;
+                    const float n_dot_g = fmaf(normal.x, dL_dpixel_normal[0],
+                                               fmaf(normal.y, dL_dpixel_normal[1],
+                                                    normal.z * dL_dpixel_normal[2]));
+                    dL_dopa += (n_dot_g - accum_normal_dot);
+                    last_normal_dot     = n_dot_g;
+                    dL_dnormals_local.x = blending_weight * dL_dpixel_normal[0];
+                    dL_dnormals_local.y = blending_weight * dL_dpixel_normal[1];
+                    dL_dnormals_local.z = blending_weight * dL_dpixel_normal[2];
+
                     ray_plane          = collected_ray_planes[j];
                     const float t_peak = ray_plane.x * d.x + ray_plane.y * d.y + ray_plane.z;
                     const float rsigma = ray_plane.w;
@@ -1032,7 +1034,7 @@ __global__ void __launch_bounds__(BLOCK_X* BLOCK_Y)
                 dL_dconic2D_local.z = -0.5f * gdy * d.y * dL_dG;
                 dL_dconic2D_local.w = G * dL_dopa;
             }
-            warpSum<C>(dL_dcolors_local, warp);
+            warpSum(dL_dcolors_local, warp);
             warpSum(dL_dmean2D_local, warp);
             warpSum(dL_dconic2D_local, warp);
             if constexpr (GEOMETRY) {
