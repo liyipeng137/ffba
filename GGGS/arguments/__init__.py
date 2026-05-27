@@ -73,7 +73,7 @@ class ModelParams(ParamGroup):
         self.depth_prior_scale = 1000.0
         self.depth_confidence_dir = "confidence"
         self.depth_confidence_format = "png"
-        self.disable_rgbd_init_ply = True
+        self.disable_rgbd_init_ply = False
         self.low_resolution = 2.0
         self.enable_background_sphere = True
         self.train_with_background_rgb = False
