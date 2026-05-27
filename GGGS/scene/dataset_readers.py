@@ -22,7 +22,7 @@ import trimesh
 from PIL import Image
 from plyfile import PlyData, PlyElement
 from scipy.spatial.transform import Rotation
-
+from utils.pd_utils import generate_ply_from_rgbd
 from scene.colmap_loader import (
     qvec2rotmat,
     read_extrinsics_binary,
@@ -196,7 +196,7 @@ def storePly(path, xyz, rgb):
     ply_data = PlyData([vertex_element])
     ply_data.write(path)
 
-def readColmapSceneInfo(path, images, eval, llffhold=8):
+def readColmapSceneInfo(path, images, eval, llffhold=8, use_rgbd_init_ply=False):
     try:
         cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.bin")
         cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.bin")
@@ -222,26 +222,54 @@ def readColmapSceneInfo(path, images, eval, llffhold=8):
     nerf_normalization = getNerfppNorm(train_cam_infos)
     print(f'cameras extent: {nerf_normalization["radius"]}')
 
-    ply_path = os.path.join(path, "sparse/0/points3D.ply")
-    bin_path = os.path.join(path, "sparse/0/points3D.bin")
-    txt_path = os.path.join(path, "sparse/0/points3D.txt")
-    if not os.path.exists(ply_path):
-        print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
+    pcd = None
+    ply_path = None
+    if use_rgbd_init_ply:
+        rgbd_ply_path = os.path.join(path, "rgbd_init_points3D.ply")
+        if not os.path.exists(rgbd_ply_path):
+            try:
+                generate_ply_from_rgbd(
+                    train_cam_infos=train_cam_infos,
+                    num_points=200_000,
+                    ply_path=rgbd_ply_path,
+                    cam_intrinsics=cam_intrinsics,
+                )
+            except Exception as e:
+                print(f"[Warn] RGBD init ply generation failed, fallback to sparse point cloud. Reason: {e}")
+        if os.path.exists(rgbd_ply_path):
+            try:
+                ply_o3d = o3d.io.read_point_cloud(rgbd_ply_path)
+                if not ply_o3d.has_normals():
+                    ply_o3d.estimate_normals()
+                positions = np.asarray(ply_o3d.points)
+                colors = np.asarray(ply_o3d.colors)
+                normals = np.asarray(ply_o3d.normals) if ply_o3d.has_normals() else np.zeros_like(positions)
+                pcd = BasicPointCloud(points=positions, colors=colors, normals=normals)
+                ply_path = rgbd_ply_path
+                print(f"Loaded RGBD init point cloud: {ply_path}, points={positions.shape[0]}")
+            except Exception as e:
+                print(f"[Warn] Failed to load RGBD init point cloud, fallback to sparse point cloud. Reason: {e}")
+
+    if pcd is None:
+        ply_path = os.path.join(path, "sparse/0/points3D.ply")
+        bin_path = os.path.join(path, "sparse/0/points3D.bin")
+        txt_path = os.path.join(path, "sparse/0/points3D.txt")
+        if not os.path.exists(ply_path):
+            print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
+            try:
+                xyz, rgb, _ = read_points3D_binary(bin_path)
+            except:
+                xyz, rgb, _ = read_points3D_text(txt_path)
+            storePly(ply_path, xyz, rgb)
         try:
-            xyz, rgb, _ = read_points3D_binary(bin_path)
+            pcd = fetchPly(ply_path)
         except:
-            xyz, rgb, _ = read_points3D_text(txt_path)
-        storePly(ply_path, xyz, rgb)
-    try:
-        pcd = fetchPly(ply_path)
-    except:
-        # pcd = None
-        try:
-            pcd = trimesh.load(ply_path)
-            point_id = np.random.choice(np.arange(len(pcd.vertices)), 1200000)
-            pcd = BasicPointCloud(points=pcd.vertices[point_id], colors=pcd.colors[point_id][:,:3].astype(np.float32)/255, normals=None)
-        except:
-            pcd = None
+            try:
+                pcd = trimesh.load(ply_path)
+                point_id = np.random.choice(np.arange(len(pcd.vertices)), 1200000)
+                pcd = BasicPointCloud(points=pcd.vertices[point_id], colors=pcd.colors[point_id][:,:3].astype(np.float32)/255, normals=None)
+            except:
+                pcd = None
 
     scene_info = SceneInfo(point_cloud=pcd,
                            train_cameras=train_cam_infos,
@@ -249,6 +277,7 @@ def readColmapSceneInfo(path, images, eval, llffhold=8):
                            nerf_normalization=nerf_normalization,
                            ply_path=ply_path)
     return scene_info
+
 
 def readCamerasFromTransforms(path, transformsfile, white_background, extension=".png"):
     cam_infos = []
