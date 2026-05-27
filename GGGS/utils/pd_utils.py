@@ -34,19 +34,12 @@ def generate_ply_from_rgbd(
     print("Generating dense init ply from RGBD ...")
     if len(train_cam_infos) == 0:
         raise ValueError("No cameras provided for RGBD point cloud generation.")
-    # if cam_intrinsics is None:
-    #     raise ValueError("cam_intrinsics is required for RGBD point cloud generation.")
 
     train_example = train_cam_infos[0]
     w, h = train_example.width, train_example.height
-    # fx, fy, cx, cy = _parse_colmap_intrinsics(cam_intrinsics)
-    # "fl_x": 1435.1975781999997,
-    # "fl_y": 1435.1975781999997,
-    # "cx": 700.0,
-    # "cy": 952.0,
-    # "w": 1400,
-    # "h": 1904,
-    fx, fy, cx, cy = 1435.1975781999997, 1435.1975781999997, 700.0, 952.0
+    fx, fy, cx, cy = _parse_colmap_intrinsics(cam_intrinsics)
+    print(f"[PD_UTILS] fx: {fx}, fy: {fy}, cx: {cx}, cy: {cy}")
+
     samples_per_frame = max((num_points + len(train_cam_infos) - 1) // len(train_cam_infos), 1)
 
     volume = o3d.pipelines.integration.ScalableTSDFVolume(
@@ -59,7 +52,6 @@ def generate_ply_from_rgbd(
     colors_list = []
     depth_acc = 1000.0
     camera_intrinsics = o3d.camera.PinholeCameraIntrinsic(w, h, fx, fy, cx, cy)
-    print(f"fx: {fx}, fy: {fy}, cx: {cx}, cy: {cy}")
 
     source_path = os.path.dirname(ply_path)
     for train_cam in train_cam_infos:
