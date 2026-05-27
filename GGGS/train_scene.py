@@ -179,7 +179,7 @@ def build_stage_configs(
             enable_depth_normal_loss=False,
             enable_normal_prior=False,
             enable_ncc_geo=False,
-            enable_depth_prior=False,
+            enable_depth_prior=True,
         ),
         StageConfig(
             name="geometry",
@@ -190,7 +190,7 @@ def build_stage_configs(
             enable_depth_normal_loss=True,
             enable_normal_prior=False,
             enable_ncc_geo=False,
-            enable_depth_prior=False,
+            enable_depth_prior=True,
         ),
         # StageConfig(
         #     name="render",
@@ -546,8 +546,7 @@ def training(
         normal_prior_kick_on = stage_cfg.enable_normal_prior and has_loaded_normal_prior and lambda_normal_prior_cur > 0
         depth_plane_kick_on = stage_cfg.enable_normal_prior and has_loaded_normal_prior and lambda_depth_plane_cur > 0
         depth_prior_kick_on = stage_cfg.enable_depth_prior and has_loaded_depth_prior and lambda_depth_prior_cur > 0
-        mask_kick_on = opt.lambda_mask > 0 and iteration >= opt.mask_from_iter and has_loaded_mask_prior  # if load mask, then use mask loss
-        depth_render_on = depth_normal_loss_kick_on or normal_prior_kick_on or depth_plane_kick_on or ncc_geo_kick_on
+        depth_render_on = depth_normal_loss_kick_on or normal_prior_kick_on or depth_plane_kick_on or depth_prior_kick_on or ncc_geo_kick_on
         active_scale = stage_cfg.resolution_scale
 
 
@@ -682,13 +681,6 @@ def training(
         Ll1_render = L1_loss_appearance(rendered_image, gt_image, gaussians, viewpoint_cam.uid)
         rgb_loss = (1.0 - opt.lambda_dssim) * Ll1_render + opt.lambda_dssim * (1.0 - ssim(rendered_image.unsqueeze(0), gt_image.unsqueeze(0)))
 
-        # mask loss
-        if mask_kick_on:
-            opacity = 1.0 - render_pkg["mask"].clamp(1e-6, 1.0 - 1e-6)
-            bg = 1.0 - viewpoint_cam.gt_mask
-            mask_loss = (-bg * torch.log(opacity)).mean()
-        else:
-            mask_loss = torch.tensor([0], dtype=torch.float32, device="cuda")
 
         loss = (
             rgb_loss
@@ -719,7 +711,6 @@ def training(
             ema_normal_prior_loss_for_log = 0.4 * normal_prior_loss.item() + 0.6 * ema_normal_prior_loss_for_log
             ema_depth_plane_loss_for_log = 0.4 * depth_plane_loss.item() + 0.6 * ema_depth_plane_loss_for_log
             ema_ncc_loss_for_log = 0.4 * ncc_loss.item() + 0.6 * ema_ncc_loss_for_log
-            ema_mask_loss_for_log = 0.4 * mask_loss.item() + 0.6 * ema_mask_loss_for_log
             # depth prior
             ema_depth_prior_loss_for_log = 0.4 * depth_prior_loss.item() + 0.6 * ema_depth_prior_loss_for_log
 
@@ -727,7 +718,6 @@ def training(
                 progress_bar.set_postfix(
                     {
                         "Loss": f"{ema_loss_for_log:.{4}f}",
-                        "loss_mask": f"{ema_mask_loss_for_log:.{4}f}",
                         "loss_normal": f"{ema_normal_loss_for_log:.{4}f}",
                         "loss_normal_prior": f"{ema_normal_prior_loss_for_log:.{4}f}",
                         "loss_depth_plane": f"{ema_depth_plane_loss_for_log:.{4}f}",
@@ -748,8 +738,8 @@ def training(
                 depth_normal_loss,
                 normal_prior_loss,
                 depth_plane_loss,
+                depth_prior_loss,
                 ncc_loss,
-                mask_loss,
                 l1_loss,
                 iter_start.elapsed_time(iter_end),
                 testing_iterations,
@@ -882,8 +872,8 @@ def training_report(
     normal_loss,
     normal_prior_loss,
     depth_plane_loss,
+    depth_prior_loss,
     ncc_loss,
-    mask_loss,
     l1_loss,
     elapsed,
     testing_iterations,
@@ -896,8 +886,8 @@ def training_report(
         tb_writer.add_scalar("train_loss_patches/normal_loss", normal_loss.item(), iteration)
         tb_writer.add_scalar("train_loss_patches/normal_prior_loss", normal_prior_loss.item(), iteration)
         tb_writer.add_scalar("train_loss_patches/depth_plane_loss", depth_plane_loss.item(), iteration)
+        tb_writer.add_scalar("train_loss_patches/depth_prior_loss", depth_prior_loss.item(), iteration)
         tb_writer.add_scalar("train_loss_patches/ncc_loss", ncc_loss.item(), iteration)
-        tb_writer.add_scalar("train_loss_patches/mask_loss", mask_loss.item(), iteration)
         tb_writer.add_scalar("train_loss_patches/total_loss", loss.item(), iteration)
         tb_writer.add_scalar("iter_time", elapsed, iteration)
 
@@ -976,8 +966,8 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=6009)
     parser.add_argument("--debug_from", type=int, default=-1)
     parser.add_argument("--detect_anomaly", action="store_true", default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[15000])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[15000])
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[7000, 15000])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default=[7000, 15000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[30000])
     parser.add_argument("--start_checkpoint", type=str, default=None)
