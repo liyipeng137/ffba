@@ -522,7 +522,7 @@ def main():
         final_predictions,
         sequence.image_names,
         os.path.join(args.output_dir, "single_frame_depth"),
-        conf_threshold=5.0,
+        conf_threshold=2.0,
     )
     single_frame_depth_end = time.time()
 

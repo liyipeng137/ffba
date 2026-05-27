@@ -162,7 +162,7 @@ class Scene:
     def save(self, iteration):
         point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))
         self.gaussians.save_ply(os.path.join(point_cloud_path, "point_cloud.ply"))
-        if self.gaussians.app_model == GaussianModel.App_model.PGSR:
+        if self.gaussians.app_model in {GaussianModel.App_model.NO, GaussianModel.App_model.GS, GaussianModel.App_model.PGSR}:
             self.gaussians.save_3dgsviewer_ply(os.path.join(point_cloud_path, "point_cloud_3dgsviewer.ply"))
 
     def save_bg(self, iteration):

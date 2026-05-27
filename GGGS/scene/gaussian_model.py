@@ -562,12 +562,43 @@ class GaussianModel:
         el = PlyElement.describe(elements, "vertex")
         PlyData([el]).write(path)
 
+    @staticmethod
+    def _robust_camera_mean(values: torch.Tensor, z_thresh: float = 3.5) -> torch.Tensor:
+        if values.shape[0] == 1:
+            return values[0]
+
+        median = torch.median(values, dim=0).values
+        if values.shape[0] < 4:
+            return median
+
+        deviation = torch.abs(values - median)
+        mad = torch.median(deviation, dim=0).values
+        threshold = torch.clamp(1.4826 * mad * z_thresh, min=1e-6)
+        keep = deviation <= threshold
+        count = keep.sum(dim=0).clamp_min(1)
+        return (values * keep).sum(dim=0) / count
+
+    @staticmethod
+    def _bake_rgb_affine_into_sh(
+        features_dc: torch.Tensor,
+        features_rest: torch.Tensor,
+        linear: torch.Tensor,
+        bias: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        features_dc = torch.matmul(features_dc, linear.transpose(0, 1))
+        features_rest = torch.matmul(features_rest, linear.transpose(0, 1))
+
+        rgb_center = torch.full((3,), 0.5, dtype=features_dc.dtype, device=features_dc.device)
+        dc_offset = (linear @ rgb_center + bias - rgb_center) / C0
+        features_dc = features_dc + dc_offset
+        return features_dc, features_rest
+
     def save_3dgsviewer_ply(self, path):
         """
         Export a viewer-compatible 3DGS PLY.
         This bakes:
         1) the GGGS 3D filter into scale/opacity parameters
-        2) a global PGSR appearance correction using robust (median) a,b over all training cameras.
+        2) global affine appearance corrections for GS/PGSR into SH coefficients.
         """
         mkdir_p(os.path.dirname(path))
 
@@ -580,10 +611,18 @@ class GaussianModel:
         scales_param = torch.log(torch.clamp_min(scales_baked, 1e-12))
         opacities_param = inverse_sigmoid(opacities_baked.clamp(1e-6, 1.0 - 1e-6))
 
-        # Start from SH coefficients and bake global PGSR appearance if available.
+        # Start from SH coefficients and bake global appearance if available.
         features_dc = self._features_dc.detach().clone()
         features_rest = self._features_rest.detach().clone()
-        if self.app_model == self.App_model.PGSR and self._appearance_embeddings is not None and self._appearance_embeddings.numel() > 0:
+        if self.app_model == self.App_model.GS and self._appearance_embeddings is not None and self._appearance_embeddings.numel() > 0:
+            exposure = self._robust_camera_mean(self._appearance_embeddings.detach())
+            features_dc, features_rest = self._bake_rgb_affine_into_sh(
+                features_dc,
+                features_rest,
+                exposure[:3, :3],
+                exposure[:3, 3],
+            )
+        elif self.app_model == self.App_model.PGSR and self._appearance_embeddings is not None and self._appearance_embeddings.numel() > 0:
             appearance = self._appearance_embeddings.detach()
             a = torch.median(appearance[:, 0])
             b = torch.median(appearance[:, 1])
