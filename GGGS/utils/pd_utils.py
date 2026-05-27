@@ -23,13 +23,18 @@ def _parse_colmap_intrinsics(cam_intrinsics):
     return fx, fy, cx, cy
 
 
+def get_confidence_path(image_path):
+    image_filename = os.path.basename(image_path)
+    parent_dir = os.path.dirname(os.path.dirname(image_path))
+    confidence_path = os.path.join(parent_dir, "confidence", image_filename.replace(".jpg", ".png"))
+    return confidence_path
+
 def generate_ply_from_rgbd(
     train_cam_infos,
     num_points,
     ply_path,
     cam_intrinsics=None,
-    depth_trunc=4.0,
-    conf_threshold=200.0 / 255.0,
+    depth_trunc=4.0
 ):
     print("Generating dense init ply from RGBD ...")
     if len(train_cam_infos) == 0:
@@ -58,7 +63,10 @@ def generate_ply_from_rgbd(
         image_path = train_cam.image_path
         image_name = train_cam.image_name
         depth_path = os.path.join(source_path, "depth", f"{image_name}.png")
-        # confidence_path = os.path.join(source_path, "confidence", f"{image_name}.png")
+
+        confidence_path = get_confidence_path(image_path)
+        conf = cv2.imread(confidence_path, cv2.IMREAD_UNCHANGED)
+        conf = cv2.resize(conf, (w, h))
 
         color_np = cv2.imread(image_path, cv2.IMREAD_COLOR)
         if color_np is None:
@@ -86,6 +94,12 @@ def generate_ply_from_rgbd(
         #     conf_mask = confidence > conf_threshold
         #     depth_u16 = np.where(conf_mask, depth_u16, 0).astype(np.uint16)
         # depth cut 0~10.0
+
+        # 二值化处理
+        _, binary_conf = cv2.threshold(conf, 200, 255, cv2.THRESH_BINARY)
+        conf_mask = binary_conf // 255 
+        # 应用confidence
+        depth_u16 = depth_u16 * conf_mask
 
 
         depth = o3d.geometry.Image(depth_u16)
