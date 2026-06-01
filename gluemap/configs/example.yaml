@@ -1,0 +1,12 @@
+# Demo config for single image collections (demo.py / demo_lamar.py).
+# All pipeline defaults live in base.yaml — this file only carries
+# demo-specific overrides.
+
+_base_: base.yaml
+
+# IO
+images_path: /path/to/images
+write_path: results/
+
+# Ground truth intrinsics
+gt_intrinsics_path: null

@@ -1,0 +1,319 @@
+import logging
+
+import numpy as np
+import pyceres
+import pycolmap
+import pygluemap
+
+logger = logging.getLogger(__name__)
+
+
+def _update_poses_from_reconstruction(
+    source_recon: pycolmap.Reconstruction,
+    target_recon: pycolmap.Reconstruction,
+) -> None:
+    """
+    Copy BA-optimized poses and camera intrinsics from source to target
+    reconstruction. Matches images by name.
+    """
+    source_by_name = {
+        img.name: (img_id, img) for img_id, img in source_recon.images.items()
+    }
+    for target_id, target_img in target_recon.images.items():
+        if target_img.name in source_by_name:
+            src_id, src_img = source_by_name[target_img.name]
+            target_recon.frames[
+                target_id
+            ].rig_from_world = src_img.cam_from_world()
+    # Copy camera intrinsics
+    for cam_id, cam in source_recon.cameras.items():
+        if cam_id in target_recon.cameras:
+            target_recon.cameras[cam_id].params = cam.params
+
+
+def _pycolmap_loss_type(name: str) -> pycolmap.LossFunctionType:
+    """
+    Map a loss type name to a pycolmap.LossFunctionType enum value.
+
+    Args:
+        name: One of ``"trivial"``, ``"huber"``, ``"cauchy"``.
+
+    Returns:
+        Matching ``pycolmap.LossFunctionType`` enum value.
+    """
+    mapping = {
+        "trivial": pycolmap.LossFunctionType.TRIVIAL,
+        "huber": pycolmap.LossFunctionType.HUBER,
+        "cauchy": pycolmap.LossFunctionType.CAUCHY,
+    }
+    if name not in mapping:
+        raise ValueError(
+            f"Unknown loss type '{name}', "
+            f"expected one of {list(mapping.keys())}"
+        )
+    return mapping[name]
+
+
+def _pyceres_loss_function(name: str) -> pyceres.LossFunction | None:
+    """
+    Map a loss type name to a pyceres.LossFunction (or None for trivial).
+
+    Args:
+        name: One of ``"trivial"``, ``"huber"``, ``"arctan"``, ``"cauchy"``.
+
+    Returns:
+        Configured ``pyceres.LossFunction``, or ``None`` for the trivial
+        (squared) loss.
+    """
+    configs = {
+        "trivial": None,
+        "huber": {"name": "huber", "params": [1.0], "magnitude": 1.0},
+        "arctan": {"name": "arctan", "params": [5.0], "magnitude": 1.0},
+        "cauchy": {"name": "cauchy", "params": [1.0], "magnitude": 1.0},
+    }
+    if name not in configs:
+        raise ValueError(
+            f"Unknown loss type '{name}', "
+            f"expected one of {list(configs.keys())}"
+        )
+    cfg = configs[name]
+    return pyceres.LossFunction(cfg) if cfg is not None else None
+
+
+# Sentinel: when callers pass no explicit loss_function, fall back to Arctan.
+# ``None`` itself is a valid Ceres value (trivial / squared loss), so we need
+# a distinct sentinel to distinguish "caller wants trivial" from "caller wants
+# the default".
+_DEFAULT_LOSS = object()
+
+
+def _add_virtual_track_residuals(
+    problem: pyceres.Problem,
+    virtual_reconstruction: pycolmap.Reconstruction | None,
+    reference_reconstruction: pycolmap.Reconstruction,
+    negative_depth_observations: dict[int, set[int]],
+    loss_function: pyceres.LossFunction | None | object = _DEFAULT_LOSS,
+) -> None:
+    """
+    Add reprojection residuals for virtual tracks to an existing ceres problem.
+
+    Pose and intrinsic parameter blocks are resolved through
+    ``reference_reconstruction`` (the real reconstruction handed to
+    ``pycolmap.create_default_ceres_bundle_adjuster``) so that their numpy
+    buffers are the same ones pycolmap is already optimizing -- the virtual
+    residuals thus contribute to the same parameter blocks rather than
+    detached copies.
+
+    Virtual points3D are read from ``virtual_reconstruction``; their xyz
+    arrays become new parameter blocks in ``problem`` via the residual block.
+
+    Args:
+        problem: Ceres problem owned by the active bundle adjuster; new
+            residual blocks are appended to it in place.
+        virtual_reconstruction: Reconstruction whose points3D are virtual.
+            ``None`` or empty is a no-op.
+        reference_reconstruction: Real reconstruction whose pose and
+            intrinsics buffers are already parameter blocks of ``problem``.
+        negative_depth_observations: ``{image_id: {point2D_idx, ...}}``
+            marking observations that should use the negative-depth cost.
+        loss_function: ``pyceres.LossFunction`` to apply to virtual
+            residuals, or ``None`` for the trivial (squared) loss. If left
+            at the sentinel ``_DEFAULT_LOSS``, defaults to Arctan for
+            backward compatibility.
+    """
+    if (
+        virtual_reconstruction is None
+        or len(virtual_reconstruction.points3D) == 0
+    ):
+        return
+
+    # Default to Arctan loss for backward compatibility.
+    if loss_function is _DEFAULT_LOSS:
+        loss_function = _pyceres_loss_function("arctan")
+
+    # Match virtual images to reference images by name so the function is
+    # independent of the image-ID convention used by each reconstruction.
+    name_to_ref_id = {
+        img.name: img_id
+        for img_id, img in reference_reconstruction.images.items()
+    }
+
+    num_constraints = 0
+    num_negative = 0
+    num_skipped = 0
+    num_none = 0
+
+    for point3D in virtual_reconstruction.points3D.values():
+        world_point = point3D.xyz
+        if world_point is None or np.all(world_point == 0):
+            num_none += 1
+            continue
+
+        for elem in point3D.track.elements:
+            image_id, pt_idx = elem.image_id, elem.point2D_idx
+
+            if image_id not in virtual_reconstruction.images:
+                num_skipped += 1
+                continue
+
+            image = virtual_reconstruction.images[image_id]
+            ref_id = name_to_ref_id.get(image.name)
+            if ref_id is None:
+                num_skipped += 1
+                continue
+
+            if pt_idx >= len(image.points2D):
+                num_skipped += 1
+                continue
+            point2D = image.points2D[pt_idx].xy
+
+            camera_id = reference_reconstruction.images[ref_id].camera_id
+
+            # Pose & intrinsics come from the reference reconstruction so the
+            # underlying numpy buffers are shared with pycolmap's residuals.
+            cam_pose = reference_reconstruction.frames[
+                ref_id
+            ].rig_from_world.params
+            camera_params = reference_reconstruction.cameras[camera_id].params
+            active_model_id = reference_reconstruction.cameras[camera_id].model
+
+            is_negative = (
+                image_id in negative_depth_observations
+                and pt_idx in negative_depth_observations[image_id]
+            )
+            if is_negative:
+                cost = pygluemap.ReprojErrorCostWithNegativeDepth(
+                    active_model_id, point2D
+                )
+                num_negative += 1
+            else:
+                cost = pygluemap.ReprojErrorCost(active_model_id, point2D)
+
+            problem.add_residual_block(
+                cost,
+                loss_function,
+                [world_point, cam_pose, camera_params],
+            )
+            num_constraints += 1
+
+    logger.info(
+        f"Added {num_constraints} virtual reprojection constraints "
+        f"({num_negative} with negative depth, "
+        f"{num_skipped} skipped, {num_none} with no xyz)"
+    )
+
+
+def bundle_adjustment(
+    reconstruction: pycolmap.Reconstruction,
+    virtual_reconstruction: pycolmap.Reconstruction | None,
+    negative_depth_observations: dict[int, set[int]],
+    max_num_iterations: int = 200,
+    loss_type_normal: str = "huber",
+    loss_type_virtual: str = "arctan",
+) -> tuple[
+    pycolmap.Reconstruction,
+    pycolmap.Reconstruction | None,
+    pyceres.SolverSummary,
+]:
+    """
+    Bundle adjustment over real + virtual reconstructions.
+
+    The real reconstruction is optimized via pycolmap's built-in ceres
+    bundle adjuster (handles manifolds, gauge fixing, solver selection).
+    Virtual residuals are appended manually to the same ceres problem via
+    ``_add_virtual_track_residuals`` so that they share the pose/intrinsic
+    parameter blocks with the real residuals.
+
+    Args:
+        reconstruction: pycolmap.Reconstruction holding the real tracks
+            plus authoritative poses and intrinsics. Optimized in-place.
+        virtual_reconstruction: pycolmap.Reconstruction whose points3D
+            are virtual; may be None or empty for a pure real BA. Its
+            points3D.xyz values are optimized in-place as part of the
+            joint solve.
+        negative_depth_observations: Dict[image_id, Set[point2D_idx]]
+            marking observations that should use the negative-depth cost.
+        max_num_iterations: Max Ceres iterations.
+        loss_type_normal: Loss function for real tracks. One of
+            ``"trivial"``, ``"huber"``, ``"cauchy"``.
+        loss_type_virtual: Loss function for virtual tracks. One of
+            ``"trivial"``, ``"huber"``, ``"arctan"``, ``"cauchy"``.
+
+    Returns:
+        (reconstruction, virtual_reconstruction, summary) with parameters
+        updated in-place and the Ceres solver summary.
+    """
+    num_virtual = (
+        len(virtual_reconstruction.points3D)
+        if virtual_reconstruction is not None
+        else 0
+    )
+    logger.info(
+        f"Bundle adjustment: {len(reconstruction.points3D)} real tracks, "
+        f"{num_virtual} virtual tracks"
+    )
+
+    # --- Build pycolmap BA over the real reconstruction --------------------
+    ba_options = pycolmap.BundleAdjustmentOptions()
+    # Restore stock Ceres convergence tolerances.
+    ba_options.ceres.solver_options = pyceres.SolverOptions()
+    ba_options.ceres.solver_options.max_num_iterations = max_num_iterations
+    ba_options.ceres.auto_select_solver_type = True
+    ba_options.ceres.loss_function_type = _pycolmap_loss_type(loss_type_normal)
+
+    ba_config = pycolmap.BundleAdjustmentConfig()
+    for image_id in reconstruction.images:
+        ba_config.add_image(image_id)
+    for point3D_id in reconstruction.points3D:
+        ba_config.add_variable_point(point3D_id)
+    ba_config.fix_gauge(pycolmap.BundleAdjustmentGauge.TWO_CAMS_FROM_WORLD)
+
+    bundle_adjuster = pycolmap.create_default_ceres_bundle_adjuster(
+        ba_options, ba_config, reconstruction
+    )
+    problem = bundle_adjuster.problem
+
+    logger.info(
+        f"After pycolmap BA construction: "
+        f"{problem.num_residual_blocks()} residual blocks, "
+        f"{problem.num_parameter_blocks()} parameter blocks, "
+        f"{problem.num_residuals()} residuals"
+    )
+
+    # --- Append virtual residuals to the same problem ----------------------
+    _add_virtual_track_residuals(
+        problem,
+        virtual_reconstruction=virtual_reconstruction,
+        reference_reconstruction=reconstruction,
+        negative_depth_observations=negative_depth_observations,
+        loss_function=_pyceres_loss_function(loss_type_virtual),
+    )
+
+    logger.info(
+        f"After virtual residual add: "
+        f"{problem.num_residual_blocks()} residual blocks, "
+        f"{problem.num_parameter_blocks()} parameter blocks, "
+        f"{problem.num_residuals()} residuals"
+    )
+
+    # --- Solve -------------------------------------------------------------
+    solver_options = ba_options.ceres.create_solver_options(ba_config, problem)
+    summary = pyceres.SolverSummary()
+    pygluemap.solve_cuda(solver_options, problem, summary)
+    logger.info(summary.BriefReport())
+
+    # --- Sync poses/intrinsics into the virtual reconstruction -------------
+    # Only the real reconstruction's numpy buffers flowed into the ceres
+    # problem (see ``_add_virtual_track_residuals``); the virtual
+    # reconstruction still holds the pre-solve values. Copy optimized
+    # poses and per-camera intrinsics over so downstream consumers
+    # reading from virtual_reconstruction observe consistent state.
+    if virtual_reconstruction is not None:
+        # Lazy import to avoid a circular estimators -> controllers import
+        # at module load time.
+
+        _update_poses_from_reconstruction(
+            reconstruction, virtual_reconstruction
+        )
+
+    return reconstruction, virtual_reconstruction, summary

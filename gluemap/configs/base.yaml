@@ -1,0 +1,51 @@
+# Shared GLUEMAP pipeline defaults.
+# Reused by demo configs (configs/example.yaml) and benchmark configs
+# (via configs/benchmark_base.yaml). Inherit with: _base_: "base.yaml".
+# All keys are flat and match cli.py / get_args_parser() arg names.
+
+# Model selection
+chosen_model: pi3   # pi3, pi3x, vggt, map_anything
+
+# Model paths
+path_feedforward: checkpoints/pi3.safetensors
+path_retrieval:   checkpoints/dino_salad.ckpt
+path_tracker:     checkpoints/vggsfm_v2_0_0_track_predictor.bin
+path_dg:          checkpoints/checkpoint-dg+visym.pth
+
+# IO (images_path / write_path are set in the demo or benchmark config)
+temp_path: ./tmp
+
+# Processing
+num_track_per_img: 1024
+max_num_tracks: null
+camera_model: SIMPLE_PINHOLE
+intrinsics_mode: SHARED
+num_neighbors: 100
+num_neighbors_sequential: 30
+
+# Inference
+batch_size: 30
+retrieval_batch_size: 30
+num_workers: 4
+
+# Thresholds
+valid_pose_threshold: 0.05
+valid_dg_threshold: 0.8
+
+# Pipeline control
+force_load: true
+rerun_from: null      # retrieval | twoview | star | null (no forced rerun)
+coarse_only: false
+use_dummy_tracks: false
+skip_doppelgangers: false
+
+# Ground truth intrinsics
+use_gt_intrinsics: false
+
+# Sequential mode
+is_sequential: false
+sample_frequency: 1
+
+# Multi-sequence mode (e.g. LaMAR via run_benchmark.py)
+is_multi_sequence: false
+subfolder_regex: null

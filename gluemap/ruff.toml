@@ -1,0 +1,23 @@
+line-length = 80
+extend-exclude = ["thirdparty/"]
+force-exclude = true
+
+[lint]
+select = [
+    # pycodestyle
+    "E",
+    # Pyflakes
+    "F",
+    # pyupgrade
+    "UP",
+    # flake8-bugbear
+    "B",
+    # flake8-simplify
+    "SIM",
+    # isort
+    "I",
+]
+ignore = ["SIM117"]
+
+[lint.per-file-ignores]
+"scripts/python/*.py" = ["E", "SIM", "UP", "B"]

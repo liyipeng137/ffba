@@ -1,0 +1,15 @@
+[submodule "thirdparty/salad"]
+	path = thirdparty/salad
+	url = https://github.com/serizba/salad.git
+[submodule "thirdparty/doppelgangers-plusplus"]
+	path = thirdparty/doppelgangers-plusplus
+	url = https://github.com/doppelgangers25/doppelgangers-plusplus.git
+[submodule "thirdparty/pi3"]
+	path = thirdparty/pi3
+	url = https://github.com/yyfz/Pi3
+[submodule "thirdparty/vggt"]
+	path = thirdparty/vggt
+	url = https://github.com/facebookresearch/vggt.git
+[submodule "thirdparty/mapanything"]
+	path = thirdparty/mapanything
+	url = https://github.com/facebookresearch/map-anything.git

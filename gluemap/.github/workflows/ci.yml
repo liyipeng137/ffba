@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  format:
+    name: Format
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: .github/workflows/ci.yml
+
+      - name: Install formatters
+        run: pip install ruff==0.15.0 clang-format==21.1.8
+
+      - name: ruff format (check)
+        run: |
+          files=$(git ls-files '*.py')
+          ruff format --check --config ruff.toml $files
+
+      - name: ruff lint
+        run: |
+          files=$(git ls-files '*.py')
+          ruff check --config ruff.toml $files
+
+      - name: clang-format (check)
+        run: |
+          files=$(git ls-files 'gluemap/pybind/*.cc' 'gluemap/pybind/*.cpp' 'gluemap/pybind/*.h' 'gluemap/pybind/*.hpp' 'gluemap/pybind/*.cu' \
+            | grep -v '^gluemap/pybind/vendor/' || true)
+          if [ -n "$files" ]; then
+            clang-format --dry-run --Werror $files
+          fi
+
+  test:
+    name: Tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake \
+            ninja-build \
+            libeigen3-dev \
+            libceres-dev \
+            libboost-all-dev \
+            libomp-dev
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Set up ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: pygluemap-${{ runner.os }}
+          max-size: 500M
+
+      - name: Install gluemap (builds pygluemap C++ extension)
+        env:
+          CMAKE_ARGS: "-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache"
+        run: pip install --verbose .[dev]
+
+      - name: Run pytest
+        run: python -m pytest tests/ -v

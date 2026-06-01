@@ -1,0 +1,29 @@
+# LaMAR full-frame benchmark configuration
+# Processes ALL frames from ALL ios folders per scene using MultiSequencePairs
+# Inherits shared settings from base.yaml
+
+_base_: "base.yaml"
+
+# Pipeline options (flat keys — nested `pipeline:` blocks are ignored by run_benchmark.py)
+intrinsics_mode: PER_CAMERA
+is_sequential: true
+is_multi_sequence: true
+subfolder_regex: "^ios"  # regex to filter subfolders for multi-sequence
+max_num_tracks: 4_000_000
+
+# Dataset groups: one per LaMAR scene (CAB, HGE, LIN)
+dataset_groups:
+  - name: "LaMAR"
+    images_pattern: "../datasets/lamar/{dataset}/map/"
+    gt_pattern: "../datasets/lamar/{dataset}/sfm_empty"
+    output_pattern: "results/lamar/{dataset}"
+
+# Benchmark options
+benchmark:
+  datasets: null
+  continue_on_error: true
+
+# Evaluation settings for pose comparison
+evaluation:
+  match_by_basename: true
+  pose_thresholds: [3, 5, 10, 30]
