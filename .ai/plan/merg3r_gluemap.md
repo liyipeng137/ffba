@@ -515,6 +515,46 @@ Merg3r aligned coarse pose
 - SelectTrack + reprojection filter 是当前最明确有效的增益点。
 - 最终质量仍需以 Gaussian 训练结果判断，不应只看 BA reprojection cost。
 
+## Depth 与 refined pose 的同源性
+
+A 脚本现在会导出 Merg3r `align_extrinsics()` 后的全局尺度 depth：
+
+```text
+<artifact_dir>/single_frame_depth/
+```
+
+该 depth 与 A 阶段的 coarse pose 是同源的，因此用于 TSDF 初始 mesh 时，`coarse` pose + A 阶段 depth 通常会比 `refined_pycolmap` pose + A 阶段 depth 更一致。
+
+当前观察：
+
+- 使用 B 阶段 `refined_pycolmap` pose 搭配 A 阶段 depth 做 TSDF 时，局部出现分层。
+- 已确认 refined reconstruction 的 intrinsics 可能发生变化。
+- 即使固定全局 scale，也不足以保证 refined pose 与旧 depth 匹配；BA 会改变每帧 pose/intrinsics，并且 BA 优化目标只约束 sparse tracks，不约束 dense depth。
+
+当前判断：
+
+- 这是符合预期的 pose-depth mismatch，不应直接用 TSDF 分层判断 refined pose 一定更差。
+- 现阶段先专注 pose 优化，不把 depth/TSDF consistency 纳入主优化目标。
+- 若后续需要使用 refined pose + dense depth 生成 mesh，应做 BA 后的 per-frame depth correction。
+
+候选 correction 方向：
+
+```text
+refined pose + refined sparse points
+-> per-frame project sparse points
+-> sample old Merg3r depth at sparse observations
+-> fit per-frame depth correction
+-> corrected depth + refined pose -> TSDF
+```
+
+优先考虑：
+
+- per-frame scale correction：`z_refined ~= s_i * d_old`
+- per-frame scale+bias：`z_refined ~= s_i * d_old + b_i`
+- per-frame inverse-depth affine：`1 / z_refined ~= a_i * (1 / d_old) + b_i`
+
+其中 inverse-depth affine 更可能适配 feed-forward depth 的尺度/偏置误差，但暂不实现。
+
 ## 使用示例
 
 A 脚本：
@@ -581,10 +621,12 @@ python -m py_compile gluemap/gluemap/estimators/track_snapping.py
 - 观察 0.5deg filter 是否导致局部覆盖不足或 pose connectivity 变弱。
 - 对 BA 前后 track length、每帧 points coverage 做进一步 debug。
 - 如果 Gaussian 训练需要原图文件名，修复 artifact image naming。
+- 暂不处理 TSDF/depth-pose mismatch；当前只记录现象，主线仍专注 pose。
 
 中期：
 
 - 尝试增大 `neighbors_per_center` 到 16/24，评估 P coverage、filter 后剩余 tracks、BA 稳定性与下游质量。
+- 评估 BA 后 per-frame depth correction，用 refined sparse geometry 校正 A 阶段 dense depth，再用于 TSDF/mesh。
 - 给 B 脚本加入简化多轮 refinement：
 
 ```text

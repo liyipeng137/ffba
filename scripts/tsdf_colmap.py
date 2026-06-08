@@ -10,6 +10,7 @@ Input:
 
 Output:
   - mesh.ply
+  - sampled point cloud ply (per-frame random sampling from TSDF volume)
 """
 
 import argparse
@@ -148,7 +149,11 @@ def main():
     parser.add_argument("--depth", required=True, help="Path to depth directory")
     parser.add_argument("--image", required=True, help="Path to image directory")
     parser.add_argument("--output",    default="mesh.ply",   help="Output mesh path")
-    parser.add_argument("--pcd_output", default="",          help="Output point cloud (optional)")
+    parser.add_argument("--pcd_output", default="",          help="Output full point cloud (optional)")
+    parser.add_argument("--sampled_pcd_output", default="",
+                        help="Output sampled point cloud (default: <output_stem>_points.ply)")
+    parser.add_argument("--num_points", type=int, default=200_000,
+                        help="Total points to sample across frames (0=disable)")
     parser.add_argument("--voxel_size", type=float, default=0.01,  help="Voxel size in meters")
     parser.add_argument("--depth_scale", type=float, default=1000.0,
                         help="Divide depth pixel value by this to get meters (default 1000)")
@@ -167,6 +172,10 @@ def main():
 
     integrated = 0
     skipped = 0
+    sample_points = args.num_points > 0
+    samples_per_frame = max((args.num_points + len(frames) - 1) // len(frames), 1) if sample_points else 0
+    points_list = []
+    colors_list = []
 
     for frame in tqdm(frames, desc="Integrating"):
         color_name = Path(frame["name"]).name
@@ -212,6 +221,14 @@ def main():
         tsdf.integrate(color, depth_filtered, intrinsic, extrinsic, depth_trunc=args.depth_max)
         integrated += 1
 
+        if sample_points:
+            pcd = tsdf.extract_pcd()
+            if len(pcd.points) > 0:
+                pick_num = min(samples_per_frame, len(pcd.points))
+                idx = np.random.choice(len(pcd.points), size=pick_num, replace=False)
+                points_list.append(np.asarray(pcd.points)[idx])
+                colors_list.append(np.asarray(pcd.colors)[idx])
+
     print(f"Integrated {integrated} frames, skipped {skipped}")
 
     mesh = tsdf.extract_mesh()
@@ -223,6 +240,15 @@ def main():
     output_path.parent.mkdir(parents=True, exist_ok=True)
     o3d.io.write_triangle_mesh(str(output_path), mesh)
     print(f"Mesh saved: {output_path}  ({len(mesh.vertices):,} verts, {len(mesh.triangles):,} faces)")
+
+    if sample_points and points_list:
+        sampled_pcd = o3d.geometry.PointCloud()
+        sampled_pcd.points = o3d.utility.Vector3dVector(np.concatenate(points_list, axis=0))
+        sampled_pcd.colors = o3d.utility.Vector3dVector(np.concatenate(colors_list, axis=0))
+        sampled_path = Path(args.sampled_pcd_output) if args.sampled_pcd_output else output_path.with_name(f"{output_path.stem}_points.ply")
+        sampled_path.parent.mkdir(parents=True, exist_ok=True)
+        o3d.io.write_point_cloud(str(sampled_path), sampled_pcd)
+        print(f"Sampled point cloud saved: {sampled_path}  ({len(sampled_pcd.points):,} pts)")
 
     if args.pcd_output:
         pcd = tsdf.extract_pcd()

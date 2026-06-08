@@ -11,6 +11,7 @@ from lightglue import LightGlue, SuperPoint
 from algos.alignment import align_extrinsics
 from algos.sequence import create_sequence
 from algos.utils import (
+    export_prediction_depth_maps,
     get_sim_matrix,
     load_model,
     process_images,
@@ -55,6 +56,12 @@ def parse_args():
     parser.add_argument("--pair_pose_rotation_threshold", type=float, default=30.0)
     parser.add_argument("--max_num_keypoints", type=int, default=4096)
     parser.add_argument("--artifact_dir", type=str, default=None)
+    parser.add_argument(
+        "--export_depth_maps",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument("--depth_conf_threshold", type=float, default=2.0)
     parser.add_argument("--device", type=str, default="cuda")
     return parser.parse_args()
 
@@ -281,6 +288,14 @@ def main():
     )
 
     artifact_image_names = save_images(images, artifact_dir / "images")
+    depth_stats = None
+    if args.export_depth_maps:
+        depth_stats = export_prediction_depth_maps(
+            final_predictions,
+            artifact_image_names,
+            str(artifact_dir / "single_frame_depth"),
+            conf_threshold=args.depth_conf_threshold,
+        )
     match_counts = export_lightglue_features_and_matches(
         images,
         pairs,
@@ -310,6 +325,7 @@ def main():
             "max_num_keypoints": args.max_num_keypoints,
             "match_counts": match_counts,
         },
+        "depth_export": depth_stats,
         "timing": {"total_export_seconds": time.time() - t_start},
         "config": vars(args),
     }
