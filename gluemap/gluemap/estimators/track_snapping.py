@@ -46,15 +46,26 @@ class TrackSnapping:
         image_name_to_standard_path = [str(Path(x)) for x in images_list]
 
         query_points_full = []
+        target_keypoint_counts = []
         for idx in range(len(image_name_to_standard_path)):
             image_name = image_name_to_standard_path[idx]
             image_id = images[image_name_to_idx_db[image_name]].image_id
             query_keypoints = database.read_keypoints(image_id)
+            target_keypoint_counts.append(int(len(query_keypoints)))
             query_points_full.append(
                 torch.from_numpy(query_keypoints)[:, :2].float().unsqueeze(0)
             )
 
         logger.info("Finish loading keypoints from the database")
+        if target_keypoint_counts:
+            logger.info(
+                "Track snapping target keypoints: "
+                f"images={len(target_keypoint_counts)}, "
+                f"total={sum(target_keypoint_counts)}, "
+                f"min={min(target_keypoint_counts)}, "
+                f"median={float(np.median(target_keypoint_counts)):.1f}, "
+                f"max={max(target_keypoint_counts)}"
+            )
 
         snapping_thres_dict = {}
         for image_idx in range(len(images_shape_ori)):
@@ -125,6 +136,13 @@ class TrackSnapping:
         indexes = range(len(predictions_dict["indexes"]))
         counter_valid = 0
         predictions_dict["is_close"] = {}
+        snap_stats = {
+            "center_valid": 0,
+            "center_snapped": 0,
+            "neighbor_valid": 0,
+            "neighbor_snapped": 0,
+        }
+        nearest_distances = []
         logger.info("Indexing and snapping points...")
         for idx in tqdm(indexes):
             is_close_all = []
@@ -152,9 +170,26 @@ class TrackSnapping:
                     query_points_full[idx_inner][0, indices[is_close, 0]]
                 )
 
-                counter_valid += (
-                    predictions_dict["scores"][idx][0, i] > 0
-                ).sum()
+                valid_scores = (
+                    (predictions_dict["scores"][idx][0, i] > 0)
+                    .cpu()
+                    .numpy()
+                    .reshape(-1)
+                )
+                valid_count = int(valid_scores.sum())
+                snapped_count = int((is_close & valid_scores).sum())
+                counter_valid += valid_count
+                if i == 0:
+                    snap_stats["center_valid"] += valid_count
+                    snap_stats["center_snapped"] += snapped_count
+                else:
+                    snap_stats["neighbor_valid"] += valid_count
+                    snap_stats["neighbor_snapped"] += snapped_count
+
+                if distances is not None and valid_count > 0:
+                    nearest_distances.append(
+                        np.sqrt(distances.reshape(-1)[valid_scores])
+                    )
 
                 predictions_dict["scores"][idx][0, i, ~is_close] /= 2
 
@@ -165,3 +200,38 @@ class TrackSnapping:
             ).unsqueeze(0)
 
         logger.info(f"Total points snapped {counter} / {counter_valid}")
+        total_valid = snap_stats["center_valid"] + snap_stats["neighbor_valid"]
+        total_snapped = (
+            snap_stats["center_snapped"] + snap_stats["neighbor_snapped"]
+        )
+        total_rate = total_snapped / total_valid if total_valid else 0.0
+        center_rate = (
+            snap_stats["center_snapped"] / snap_stats["center_valid"]
+            if snap_stats["center_valid"]
+            else 0.0
+        )
+        neighbor_rate = (
+            snap_stats["neighbor_snapped"] / snap_stats["neighbor_valid"]
+            if snap_stats["neighbor_valid"]
+            else 0.0
+        )
+        logger.info(
+            "Track snapping rate: "
+            f"total={total_snapped}/{total_valid} ({total_rate:.2%}), "
+            f"center={snap_stats['center_snapped']}/"
+            f"{snap_stats['center_valid']} ({center_rate:.2%}), "
+            f"neighbor={snap_stats['neighbor_snapped']}/"
+            f"{snap_stats['neighbor_valid']} ({neighbor_rate:.2%})"
+        )
+        if nearest_distances:
+            nearest_distances = np.concatenate(nearest_distances)
+            p50, p75, p90, p95, p99 = np.percentile(
+                nearest_distances, [50, 75, 90, 95, 99]
+            )
+            logger.info(
+                "Track snapping nearest-keypoint distance: "
+                f"mean={float(np.mean(nearest_distances)):.3f}, "
+                f"p50={p50:.3f}, p75={p75:.3f}, p90={p90:.3f}, "
+                f"p95={p95:.3f}, p99={p99:.3f}, "
+                f"max={float(np.max(nearest_distances)):.3f}"
+            )
