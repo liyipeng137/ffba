@@ -152,19 +152,30 @@ class TrackEstablishment:
             i: [] for i in range(N)
         }  # (image_id, [is_negative, ...])
 
-        N_indexes = {
-            idx: predictions_dict["tracks"][idx].shape[-3] for idx in indexes
-        }
-        pts2d_idx_all = {
-            idx: np.ones(
-                [N_indexes[idx], predictions_dict["tracks"][idx].shape[-2]],
-                dtype=int,
-            )
-            * -1
-            for idx in indexes
-        }  # N x K
+        if add_tracks:
+            N_indexes = {
+                idx: predictions_dict["tracks"][idx].shape[-3]
+                for idx in indexes
+            }
+            pts2d_idx_all = {
+                idx: np.ones(
+                    [
+                        N_indexes[idx],
+                        predictions_dict["tracks"][idx].shape[-2],
+                    ],
+                    dtype=int,
+                )
+                * -1
+                for idx in indexes
+            }  # N x K
+        else:
+            N_indexes = {
+                idx: predictions_dict["tracks_virtual"][idx].shape[-3]
+                for idx in indexes
+            }
+            pts2d_idx_all = None
 
-        if add_virtual_points or not add_tracks:
+        if add_virtual_points:
             pts2d_idx_virtual_all = {
                 idx: np.zeros(
                     [
@@ -181,7 +192,7 @@ class TrackEstablishment:
         # Initialize inverse maps: image_id -> list of (idx, i, j) tuples
         pts2d_idx_inv = {i: [] for i in range(N)}  # inverse map for real tracks
 
-        if add_virtual_points or not add_tracks:
+        if add_virtual_points:
             pts2d_idx_virtual_inv = {
                 i: [] for i in range(N)
             }  # inverse map for virtual
@@ -191,8 +202,8 @@ class TrackEstablishment:
         # Add the points
         logger.info("Adding points to dictionary...")
         for idx in tqdm(indexes):
-            scores = predictions_dict["scores"][idx]
             if add_tracks:
+                scores = predictions_dict["scores"][idx]
                 for i in range(predictions_dict["tracks"][idx].shape[1]):
                     valid = scores[0, i, :] > 0.0
 
@@ -216,7 +227,7 @@ class TrackEstablishment:
                     for j in valid_idx:
                         pts2d_idx_inv[idx_inner].append((idx, i, j))
 
-            if not add_virtual_points and add_tracks:
+            if not add_virtual_points:
                 continue
 
             for i in range(predictions_dict["tracks_virtual"][idx].shape[1]):
@@ -298,19 +309,22 @@ class TrackEstablishment:
             # Store keypoints for this image
             keypoints_per_image[idx] = images_points2d_tensor.cpu().numpy()
 
-            # Update the indexes in pts2d_idx_all and pts2d_idx_virtual_all
-            for idx_inner in indexes:
-                for i in range(predictions_dict["tracks"][idx_inner].shape[1]):
-                    if predictions_dict["indexes"][idx_inner][i] != idx:
-                        continue
-                    for j in range(
-                        predictions_dict["tracks"][idx_inner].shape[2]
+            # Update the indexes in pts2d_idx_all.
+            if add_tracks:
+                for idx_inner in indexes:
+                    for i in range(
+                        predictions_dict["tracks"][idx_inner].shape[1]
                     ):
-                        if pts2d_idx_all[idx_inner][i, j] == -1:
+                        if predictions_dict["indexes"][idx_inner][i] != idx:
                             continue
-                        pts2d_idx_all[idx_inner][i, j] = uf_pts2d.find(
-                            pts2d_idx_all[idx_inner][i, j]
-                        )
+                        for j in range(
+                            predictions_dict["tracks"][idx_inner].shape[2]
+                        ):
+                            if pts2d_idx_all[idx_inner][i, j] == -1:
+                                continue
+                            pts2d_idx_all[idx_inner][i, j] = uf_pts2d.find(
+                                pts2d_idx_all[idx_inner][i, j]
+                            )
 
             uf_pts2d.clear()
 

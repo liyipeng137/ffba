@@ -51,9 +51,20 @@ def parse_args():
     )
     parser.add_argument("--alignment_type", type=str, default="weighted_iterative")
     parser.add_argument("--pair_k_similarity", type=int, default=0)
-    parser.add_argument("--pair_k_pose", type=int, default=5)
+    parser.add_argument("--pair_k_pose", type=int, default=25)
     parser.add_argument("--pair_temporal_window", type=int, default=0)
     parser.add_argument("--pair_pose_rotation_threshold", type=float, default=30.0)
+    parser.add_argument(
+        "--pair_pose_fill_unfiltered",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "When pose-neighbor candidates passing the rotation threshold are "
+            "fewer than pair_k_pose, fill the remaining slots by camera-center "
+            "distance. This keeps the exported graph dense enough for "
+            "Gluemap-style star groups."
+        ),
+    )
     parser.add_argument("--max_num_keypoints", type=int, default=4096)
     parser.add_argument("--artifact_dir", type=str, default=None)
     parser.add_argument(
@@ -98,6 +109,20 @@ def _normalize_extrinsic(extrinsic):
     return extrinsic[:, :3, :4]
 
 
+def _normalize_depth_like(array, num_images, name):
+    array = np.asarray(array, dtype=np.float32)
+    if array.ndim == 5 and array.shape[0] == 1:
+        array = array[0]
+    if array.ndim == 3:
+        array = array[..., None]
+    if array.ndim != 4 or array.shape[0] != num_images or array.shape[-1] != 1:
+        raise ValueError(
+            f"Expected {name} shape (N,H,W), (N,H,W,1), or (1,N,H,W,1), "
+            f"got {array.shape}"
+        )
+    return array
+
+
 def _add_pair(pairs, i, j, n):
     if i == j or i < 0 or j < 0 or i >= n or j >= n:
         return
@@ -112,6 +137,7 @@ def build_mixed_pairs(
     k_pose,
     temporal_window,
     pose_rotation_threshold,
+    pose_fill_unfiltered,
 ):
     n = int(images.shape[0])
     pairs = set()
@@ -138,11 +164,48 @@ def build_mixed_pairs(
         invalid = angle_diffs >= pose_rotation_threshold
         np.fill_diagonal(invalid, True)
         for i in range(n):
-            valid_ordered = [j for j in np.argsort(dists[i]) if not invalid[i, j]]
-            for j in valid_ordered[: min(k_pose, n - 1)]:
+            ordered = [int(j) for j in np.argsort(dists[i]) if j != i]
+            valid_ordered = [j for j in ordered if not invalid[i, j]]
+            selected = valid_ordered[: min(k_pose, n - 1)]
+            if pose_fill_unfiltered and len(selected) < min(k_pose, n - 1):
+                selected_set = set(selected)
+                for j in ordered:
+                    if j in selected_set:
+                        continue
+                    selected.append(j)
+                    selected_set.add(j)
+                    if len(selected) >= min(k_pose, n - 1):
+                        break
+            for j in selected:
                 _add_pair(pairs, i, int(j), n)
 
     return np.asarray(sorted(pairs), dtype=np.int64)
+
+
+def summarize_pair_graph(pairs, num_images):
+    degrees = np.zeros(num_images, dtype=np.int64)
+    for i, j in pairs.tolist():
+        degrees[int(i)] += 1
+        degrees[int(j)] += 1
+    if num_images == 0:
+        return {
+            "num_pairs": int(pairs.shape[0]),
+            "degree_min": 0,
+            "degree_median": 0.0,
+            "degree_mean": 0.0,
+            "degree_p90": 0.0,
+            "degree_max": 0,
+            "zero_degree_images": 0,
+        }
+    return {
+        "num_pairs": int(pairs.shape[0]),
+        "degree_min": int(degrees.min()),
+        "degree_median": float(np.median(degrees)),
+        "degree_mean": float(degrees.mean()),
+        "degree_p90": float(np.percentile(degrees, 90)),
+        "degree_max": int(degrees.max()),
+        "zero_degree_images": int(np.sum(degrees == 0)),
+    }
 
 
 def save_images(images, out_dir):
@@ -278,7 +341,9 @@ def main():
         args.pair_k_pose,
         args.pair_temporal_window,
         args.pair_pose_rotation_threshold,
+        args.pair_pose_fill_unfiltered,
     )
+    pair_graph_stats = summarize_pair_graph(pairs, extrinsic.shape[0])
     np.save(artifact_dir / "pairs.npy", pairs)
     np.savez_compressed(
         artifact_dir / "coarse_poses.npz",
@@ -286,6 +351,20 @@ def main():
         intrinsic=intrinsic,
         image_ids=image_ids,
     )
+    raw_depth = _normalize_depth_like(
+        final_predictions["depth"], extrinsic.shape[0], "depth"
+    )
+    raw_depth_conf = None
+    if "depth_conf" in final_predictions:
+        raw_depth_conf = _normalize_depth_like(
+            final_predictions["depth_conf"],
+            extrinsic.shape[0],
+            "depth_conf",
+        )
+    raw_geometry_payload = {"depth": raw_depth}
+    if raw_depth_conf is not None:
+        raw_geometry_payload["depth_conf"] = raw_depth_conf
+    np.savez_compressed(artifact_dir / "raw_geometry.npz", **raw_geometry_payload)
 
     artifact_image_names = save_images(images, artifact_dir / "images")
     depth_stats = None
@@ -318,12 +397,19 @@ def main():
             "pair_k_pose": args.pair_k_pose,
             "pair_temporal_window": args.pair_temporal_window,
             "pair_pose_rotation_threshold": args.pair_pose_rotation_threshold,
+            "pair_pose_fill_unfiltered": args.pair_pose_fill_unfiltered,
             "num_pairs": int(pairs.shape[0]),
+            "pair_graph": pair_graph_stats,
         },
         "lightglue": {
             "features": "superpoint",
             "max_num_keypoints": args.max_num_keypoints,
             "match_counts": match_counts,
+        },
+        "raw_geometry": {
+            "path": "raw_geometry.npz",
+            "depth_shape": list(raw_depth.shape),
+            "has_depth_conf": raw_depth_conf is not None,
         },
         "depth_export": depth_stats,
         "timing": {"total_export_seconds": time.time() - t_start},
@@ -334,6 +420,15 @@ def main():
 
     print(f"[EXPORT] Wrote artifacts to {artifact_dir}")
     print(f"[EXPORT] images={extrinsic.shape[0]}, pairs={pairs.shape[0]}")
+    print(
+        "[EXPORT] pair degree: "
+        f"min={pair_graph_stats['degree_min']}, "
+        f"median={pair_graph_stats['degree_median']:.1f}, "
+        f"mean={pair_graph_stats['degree_mean']:.1f}, "
+        f"p90={pair_graph_stats['degree_p90']:.1f}, "
+        f"max={pair_graph_stats['degree_max']}, "
+        f"zero={pair_graph_stats['zero_degree_images']}"
+    )
 
 
 if __name__ == "__main__":

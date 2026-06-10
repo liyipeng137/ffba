@@ -3,6 +3,7 @@ import logging
 import os
 import shutil
 import time
+from collections import defaultdict
 from copy import deepcopy
 
 import numpy as np
@@ -88,6 +89,267 @@ def _apply_deletions(
         reconstruction.delete_point3D(int(p3d_id))
 
 
+def _summarize_values(values: list[int] | list[float]) -> dict[str, float]:
+    """Small numeric summary used by refinement debug logging."""
+    if len(values) == 0:
+        return {
+            "count": 0,
+            "min": 0.0,
+            "median": 0.0,
+            "mean": 0.0,
+            "p90": 0.0,
+            "max": 0.0,
+        }
+
+    arr = np.asarray(values, dtype=np.float64)
+    return {
+        "count": float(arr.size),
+        "min": float(np.min(arr)),
+        "median": float(np.median(arr)),
+        "mean": float(np.mean(arr)),
+        "p90": float(np.percentile(arr, 90)),
+        "max": float(np.max(arr)),
+    }
+
+
+def _format_summary(summary: dict[str, float]) -> str:
+    return (
+        f"min={summary['min']:.1f}, median={summary['median']:.1f}, "
+        f"mean={summary['mean']:.1f}, p90={summary['p90']:.1f}, "
+        f"max={summary['max']:.1f}"
+    )
+
+
+def _summarize_point_tracks(
+    points3D: dict[int, pycolmap.Point3D],
+    num_images: int | None = None,
+    image_ids: list[int] | None = None,
+) -> dict:
+    track_lengths = []
+    image_observations = defaultdict(int)
+
+    for point3D in points3D.values():
+        elements = list(point3D.track.elements)
+        track_lengths.append(len(elements))
+        for elem in elements:
+            image_observations[int(elem.image_id)] += 1
+
+    if image_ids is not None:
+        per_image_counts = [
+            int(image_observations.get(image_id, 0)) for image_id in image_ids
+        ]
+        zero_images = sum(1 for count in per_image_counts if count == 0)
+    elif num_images is None:
+        per_image_counts = list(image_observations.values())
+        zero_images = 0
+    else:
+        per_image_counts = [
+            int(image_observations.get(image_id, 0))
+            for image_id in range(num_images)
+        ]
+        zero_images = sum(1 for count in per_image_counts if count == 0)
+
+    return {
+        "points": int(len(points3D)),
+        "observations": int(sum(track_lengths)),
+        "track_length": _summarize_values(track_lengths),
+        "image_observations": _summarize_values(per_image_counts),
+        "images_with_observations": int(len(image_observations)),
+        "zero_observation_images": int(zero_images),
+    }
+
+
+def _log_point_tracks_debug(
+    label: str,
+    points3D: dict[int, pycolmap.Point3D],
+    num_images: int | None = None,
+) -> None:
+    stats = _summarize_point_tracks(points3D, num_images)
+    logger.info(
+        "[RefineDebug] %s: points=%d, observations=%d, "
+        "track_len=(%s), obs/image=(%s), images_with_obs=%d, "
+        "zero_obs_images=%d",
+        label,
+        stats["points"],
+        stats["observations"],
+        _format_summary(stats["track_length"]),
+        _format_summary(stats["image_observations"]),
+        stats["images_with_observations"],
+        stats["zero_observation_images"],
+    )
+
+
+def _log_reconstruction_debug(
+    label: str,
+    reconstruction: pycolmap.Reconstruction | None,
+) -> None:
+    if reconstruction is None:
+        logger.info("[RefineDebug] %s: reconstruction=None", label)
+        return
+
+    stats = _summarize_point_tracks(
+        reconstruction.points3D,
+        image_ids=[int(image_id) for image_id in reconstruction.images],
+    )
+    logger.info(
+        "[RefineDebug] %s: images=%d, cameras=%d, points=%d, "
+        "observations=%d, track_len=(%s), obs/image=(%s), "
+        "images_with_obs=%d, zero_obs_images=%d",
+        label,
+        len(reconstruction.images),
+        len(reconstruction.cameras),
+        stats["points"],
+        stats["observations"],
+        _format_summary(stats["track_length"]),
+        _format_summary(stats["image_observations"]),
+        stats["images_with_observations"],
+        stats["zero_observation_images"],
+    )
+
+
+def _log_keypoint_debug(
+    label: str,
+    keypoints_per_image: dict[int, np.ndarray],
+    num_images: int,
+) -> None:
+    counts = [
+        len(keypoints_per_image[image_id])
+        if image_id in keypoints_per_image
+        else 0
+        for image_id in range(num_images)
+    ]
+    logger.info(
+        "[RefineDebug] %s: total_keypoints=%d, images_with_keypoints=%d, "
+        "zero_keypoint_images=%d, keypoints/image=(%s)",
+        label,
+        int(sum(counts)),
+        int(sum(1 for count in counts if count > 0)),
+        int(sum(1 for count in counts if count == 0)),
+        _format_summary(_summarize_values(counts)),
+    )
+
+
+def _log_negative_depth_debug(
+    label: str,
+    negative_depth_observations: dict[int, set] | dict[int, list],
+) -> None:
+    counts = [len(v) for v in negative_depth_observations.values()]
+    logger.info(
+        "[RefineDebug] %s: images=%d, observations=%d, obs/image=(%s)",
+        label,
+        len(negative_depth_observations),
+        int(sum(counts)),
+        _format_summary(_summarize_values(counts)),
+    )
+
+
+def _log_database_debug(label: str, db_path: str) -> None:
+    if not os.path.exists(db_path):
+        logger.info("[RefineDebug] %s: database missing at %s", label, db_path)
+        return
+
+    try:
+        database = pycolmap.Database.open(db_path)
+        images = database.read_all_images()
+        keypoint_counts = []
+        for image in images:
+            keypoints = database.read_keypoints(image.image_id)
+            keypoint_counts.append(0 if keypoints is None else len(keypoints))
+
+        pair_ids, matches_list = database.read_all_matches()
+        match_counts = [len(matches) for matches in matches_list]
+        logger.info(
+            "[RefineDebug] %s: images=%d, total_keypoints=%d, "
+            "zero_keypoint_images=%d, keypoints/image=(%s), "
+            "match_pairs=%d, total_matches=%d, matches/pair=(%s)",
+            label,
+            len(images),
+            int(sum(keypoint_counts)),
+            int(sum(1 for count in keypoint_counts if count == 0)),
+            _format_summary(_summarize_values(keypoint_counts)),
+            len(pair_ids),
+            int(sum(match_counts)),
+            _format_summary(_summarize_values(match_counts)),
+        )
+    except Exception as exc:
+        logger.warning(
+            "[RefineDebug] %s: failed to inspect database %s: %s",
+            label,
+            db_path,
+            exc,
+        )
+
+
+def _log_predictions_debug(
+    label: str,
+    predictions_dict: dict,
+) -> None:
+    num_groups = len(predictions_dict.get("indexes", []))
+    group_sizes = [
+        len(indexes) for indexes in predictions_dict.get("indexes", [])
+    ]
+    logger.info(
+        "[RefineDebug] %s: groups=%d, group_size=(%s)",
+        label,
+        num_groups,
+        _format_summary(_summarize_values(group_sizes)),
+    )
+
+    if "tracks" in predictions_dict and "scores" in predictions_dict:
+        real_points = []
+        real_observations = []
+        for idx in range(num_groups):
+            tracks = predictions_dict["tracks"][idx]
+            scores = predictions_dict["scores"][idx]
+            real_points.append(int(tracks.shape[-2]))
+            real_observations.append(int((scores > 0).sum().item()))
+        logger.info(
+            "[RefineDebug] %s real predictions: points/group=(%s), "
+            "valid_obs/group=(%s), total_valid_obs=%d",
+            label,
+            _format_summary(_summarize_values(real_points)),
+            _format_summary(_summarize_values(real_observations)),
+            int(sum(real_observations)),
+        )
+
+    if (
+        "tracks_virtual" in predictions_dict
+        and "valid_virtual" in predictions_dict
+    ):
+        virtual_points = []
+        virtual_observations = []
+        for idx in range(num_groups):
+            tracks_virtual = predictions_dict["tracks_virtual"][idx]
+            valid_virtual = predictions_dict["valid_virtual"][idx]
+            virtual_points.append(int(tracks_virtual.shape[-2]))
+            virtual_observations.append(int(valid_virtual.sum().item()))
+        logger.info(
+            "[RefineDebug] %s virtual predictions: points/group=(%s), "
+            "valid_obs/group=(%s), total_valid_obs=%d",
+            label,
+            _format_summary(_summarize_values(virtual_points)),
+            _format_summary(_summarize_values(virtual_observations)),
+            int(sum(virtual_observations)),
+        )
+
+    if "pose_inconsistent" in predictions_dict:
+        pose_inconsistent = predictions_dict["pose_inconsistent"]
+        masks = (
+            pose_inconsistent.values()
+            if hasattr(pose_inconsistent, "values")
+            else pose_inconsistent
+        )
+        inconsistent_counts = [
+            int(mask.sum().item()) for mask in masks
+        ]
+        logger.info(
+            "[RefineDebug] %s pose_inconsistent: total=%d, per_group=(%s)",
+            label,
+            int(sum(inconsistent_counts)),
+            _format_summary(_summarize_values(inconsistent_counts)),
+        )
+
+
 def select_tracks_from_merged(
     reconstruction: pycolmap.Reconstruction,
     sift_count: dict[int, int],
@@ -102,6 +364,8 @@ def select_tracks_from_merged(
         _extract_track_csr(reconstruction)
     )
     sc = {int(k): int(v) for k, v in sift_count.items()}
+    points_before = len(reconstruction.points3D)
+    observations_before = int(track_lengths.sum()) if len(track_lengths) else 0
 
     ids_to_delete, pair_count = pygluemap.compute_tracks_to_delete(
         point3d_ids,
@@ -112,6 +376,22 @@ def select_tracks_from_merged(
         min_num_support_abs,
     )
     _apply_deletions(reconstruction, ids_to_delete)
+    observations_after = sum(
+        len(list(point.track.elements))
+        for point in reconstruction.points3D.values()
+    )
+    logger.info(
+        "[RefineDebug] SelectTrack: points=%d -> %d, removed=%d, "
+        "observations=%d -> %d, pair_count_entries=%d, "
+        "pair_count=(%s)",
+        points_before,
+        len(reconstruction.points3D),
+        len(ids_to_delete),
+        observations_before,
+        observations_after,
+        len(pair_count),
+        _format_summary(_summarize_values(list(pair_count.values()))),
+    )
     return pair_count
 
 
@@ -131,6 +411,8 @@ def select_virtual_tracks_from_merged(
     point3d_ids, track_img_ids, track_pt2d_idxs, track_lengths = (
         _extract_track_csr(virtual_reconstruction)
     )
+    points_before = len(virtual_reconstruction.points3D)
+    observations_before = int(track_lengths.sum()) if len(track_lengths) else 0
 
     ids_to_delete, updated_pair_count = (
         pygluemap.compute_virtual_tracks_to_delete(
@@ -143,6 +425,22 @@ def select_virtual_tracks_from_merged(
         )
     )
     _apply_deletions(virtual_reconstruction, ids_to_delete)
+    observations_after = sum(
+        len(list(point.track.elements))
+        for point in virtual_reconstruction.points3D.values()
+    )
+    logger.info(
+        "[RefineDebug] SelectVirtualTrack: points=%d -> %d, removed=%d, "
+        "observations=%d -> %d, pair_count_entries=%d, "
+        "pair_count=(%s)",
+        points_before,
+        len(virtual_reconstruction.points3D),
+        len(ids_to_delete),
+        observations_before,
+        observations_after,
+        len(updated_pair_count),
+        _format_summary(_summarize_values(list(updated_pair_count.values()))),
+    )
     return updated_pair_count
 
 
@@ -234,6 +532,7 @@ def run_refinement_pipeline(
         f"Track mode: {track_mode} (SIFT={use_sift}, "
         f"Prior={use_prior}, Virtual={use_virtual})"
     )
+    _log_predictions_debug("refinement input predictions", predictions_dict)
 
     # Step 1: Triangulate 3D points
     logger.info("Triangulating points with pycolmap...")
@@ -243,6 +542,9 @@ def run_refinement_pipeline(
     coarse_reconstruction = pycolmap.Reconstruction()
     coarse_reconstruction.read(args.curr_path + "/" + coarse_dir)
     refinement_timing["load_coarse"] = time.perf_counter() - t0
+    _log_reconstruction_debug(
+        "loaded coarse reconstruction", coarse_reconstruction
+    )
 
     # Step 1b: Determine parameters based on track mode
     if use_prior:
@@ -270,6 +572,10 @@ def run_refinement_pipeline(
         database_name=database_name,
     )
     refinement_timing["prepare_prior"] = time.perf_counter() - t0
+    _log_database_debug(
+        f"prepared prior database ({database_name})",
+        args.curr_path + "/" + database_name,
+    )
 
     # Step 1c.5: Read SIFT DB keypoint counts (= sift_count per image)
     t0 = time.perf_counter()
@@ -284,6 +590,20 @@ def run_refinement_pipeline(
     else:
         sift_count_by_name = {}
     refinement_timing["read_sift"] = time.perf_counter() - t0
+    if use_sift:
+        sift_counts = list(sift_count_by_name.values())
+        logger.info(
+            "[RefineDebug] SIFT database keypoints: images=%d, "
+            "total_keypoints=%d, zero_keypoint_images=%d, "
+            "keypoints/image=(%s)",
+            len(sift_counts),
+            int(sum(sift_counts)),
+            int(sum(1 for count in sift_counts if count == 0)),
+            _format_summary(_summarize_values(sift_counts)),
+        )
+        _log_database_debug(
+            "SIFT database", args.curr_path + "/database_sift.db"
+        )
 
     # Step 1d: Merge SIFT database with the created database (or copy if
     # no SIFT)
@@ -302,6 +622,7 @@ def run_refinement_pipeline(
         logger.info("Copying tracks database (no SIFT merge)...")
         shutil.copy2(args.curr_path + "/" + database_name, merged_db_path)
     refinement_timing["merge_databases"] = time.perf_counter() - t0
+    _log_database_debug("merged database", merged_db_path)
 
     # Step 2: Establish tracks from predictions
     t0 = time.perf_counter()
@@ -335,6 +656,12 @@ def run_refinement_pipeline(
     )
     torch.cuda.empty_cache()
     refinement_timing["establish_tracks"] = time.perf_counter() - t0
+    _log_keypoint_debug(
+        "TrackEstablishment keypoints", keypoints_per_image, num_images
+    )
+    _log_point_tracks_debug(
+        "TrackEstablishment points before initialization", points3D, num_images
+    )
 
     # Step 3: Initialize 3D world points
     t0 = time.perf_counter()
@@ -348,6 +675,10 @@ def run_refinement_pipeline(
     ]
     negative_depth_observations = build_negative_depth_observations(
         pts2d_idx_inv, images_points2d_virtual_isnegative
+    )
+    _log_negative_depth_debug(
+        "negative-depth virtual observations before reconstruction build",
+        negative_depth_observations,
     )
     points3D = initialize_world_points(
         predictions_dict,
@@ -363,6 +694,9 @@ def run_refinement_pipeline(
         negative_depth_observations=negative_depth_observations,
     )
     refinement_timing["initialize_points"] = time.perf_counter() - t0
+    _log_point_tracks_debug(
+        "TrackEstablishment points after initialization", points3D, num_images
+    )
 
     # Step 4: Configure bundle adjustment
     ba_options = IterativeBAOptions(
@@ -387,6 +721,9 @@ def run_refinement_pipeline(
         camera_model=dataset_pair.camera_model,
     )
     refinement_timing["build_reconstruction"] = time.perf_counter() - t0
+    _log_reconstruction_debug(
+        "virtual reconstruction after build", virtual_reconstruction
+    )
 
     # build_reconstruction_for_ba emits 1-indexed image_ids, so consumers that
     # join against the reconstruction (BA, reprojection-error filter) need a
@@ -407,6 +744,10 @@ def run_refinement_pipeline(
         )
         logger.info(f"{'=' * 60}")
         t_iter_start = time.perf_counter()
+        _log_reconstruction_debug(
+            f"iter {outer_iter + 1} virtual seed before triangulation",
+            virtual_reconstruction,
+        )
 
         # Step 1e: Triangulate on merged database
         t_tri_start = time.perf_counter()
@@ -427,6 +768,10 @@ def run_refinement_pipeline(
             options=opt_triang,
         )
         t_tri_end = time.perf_counter()
+        _log_reconstruction_debug(
+            f"iter {outer_iter + 1} real after triangulation",
+            reconstruction,
+        )
 
         # Step 7a: Selectively prune prior/virtual tracks (SelectTrack logic)
         sift_count = {}
@@ -438,6 +783,10 @@ def run_refinement_pipeline(
             sift_count=sift_count,
             min_num_support_abs=512,
         )
+        _log_reconstruction_debug(
+            f"iter {outer_iter + 1} real after SelectTrack",
+            reconstruction,
+        )
 
         # Step 7a.2: Prune virtual tracks using pair coverage from real
         # selection
@@ -447,10 +796,22 @@ def run_refinement_pipeline(
                 pair_count=pair_count,
                 min_num_support_abs=512,
             )
+            _log_reconstruction_debug(
+                f"iter {outer_iter + 1} virtual after SelectVirtualTrack",
+                virtual_reconstruction,
+            )
 
         # Step 7.5: Filter tracks before bundle adjustment
         t_filter_start = time.perf_counter()
         if angular_error_threshold_deg > 0:
+            _log_reconstruction_debug(
+                f"iter {outer_iter + 1} real before angular filter",
+                reconstruction,
+            )
+            _log_reconstruction_debug(
+                f"iter {outer_iter + 1} virtual before angular filter",
+                virtual_reconstruction,
+            )
             for recon, neg_depth, label in (
                 (reconstruction, None, "real: "),
                 (
@@ -468,6 +829,14 @@ def run_refinement_pipeline(
                     negative_depth_observations=neg_depth,
                     log_prefix=label,
                 )
+            _log_reconstruction_debug(
+                f"iter {outer_iter + 1} real after angular filter",
+                reconstruction,
+            )
+            _log_reconstruction_debug(
+                f"iter {outer_iter + 1} virtual after angular filter",
+                virtual_reconstruction,
+            )
 
         t_filter_end = time.perf_counter()
 
@@ -491,9 +860,21 @@ def run_refinement_pipeline(
                 f"  Track limit: kept {max_num_tracks}, "
                 f"removed {len(ids_to_remove)} tracks"
             )
+            _log_reconstruction_debug(
+                f"iter {outer_iter + 1} real after max_num_tracks",
+                reconstruction,
+            )
 
         # Step 8: Run iterative bundle adjustment
         t_ba_start = time.perf_counter()
+        _log_reconstruction_debug(
+            f"iter {outer_iter + 1} real before augmented BA",
+            reconstruction,
+        )
+        _log_reconstruction_debug(
+            f"iter {outer_iter + 1} virtual before augmented BA",
+            virtual_reconstruction,
+        )
         reconstruction, virtual_reconstruction = iterative_bundle_adjustment(
             reconstruction,
             virtual_reconstruction,
@@ -501,6 +882,14 @@ def run_refinement_pipeline(
             options=ba_options,
         )
         t_ba_end = time.perf_counter()
+        _log_reconstruction_debug(
+            f"iter {outer_iter + 1} real after augmented BA",
+            reconstruction,
+        )
+        _log_reconstruction_debug(
+            f"iter {outer_iter + 1} virtual after augmented BA",
+            virtual_reconstruction,
+        )
 
         iter_timing = {
             "triangulation": t_tri_end - t_tri_start,
@@ -529,6 +918,12 @@ def run_refinement_pipeline(
         args.curr_path + "/" + file_dir,
     )
     os.makedirs(args.curr_path + "/" + file_dir, exist_ok=True)
+    _log_reconstruction_debug(
+        "final real reconstruction before write", reconstruction
+    )
+    _log_reconstruction_debug(
+        "final virtual reconstruction before write", virtual_reconstruction
+    )
     reconstruction.write(args.curr_path + "/" + file_dir)
     refinement_timing["write_output"] = time.perf_counter() - t0
 

@@ -6,9 +6,7 @@ import shutil
 import sys
 import time
 from collections import defaultdict
-from copy import deepcopy
 from pathlib import Path
-from types import SimpleNamespace
 
 import numpy as np
 import torch
@@ -46,49 +44,16 @@ def parse_args():
         default="/root/.cache/torch/hub/checkpoints/vggsfm_v2_tracker.pt",
     )
     parser.add_argument(
-        "--track_mode",
-        type=str,
-        default="SP",
-        choices=["SP", "SPV"],
+        "--track_mode", type=str, default="SP", choices=["S", "P", "SP"]
     )
-    parser.add_argument("--neighbors_per_center", type=int, default=25)
-    parser.add_argument(
-        "--group_strategy",
-        type=str,
-        default="star",
-        choices=["star", "pose"],
-        help=(
-            "How to build per-center tracking groups from pairs. "
-            "'star' uses GlueMap BaseStarDataset star pruning; 'pose' uses "
-            "nearest camera-center neighbors."
-        ),
-    )
-    parser.add_argument(
-        "--skip_doppelgangers",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help=(
-            "Match GlueMap skip_doppelgangers: do not run two-view DG, "
-            "treat all exported pairs as valid with score 1.0."
-        ),
-    )
-    parser.add_argument("--valid_dg_threshold", type=float, default=0.8)
-    parser.add_argument(
-        "--star_sequential_window",
-        type=int,
-        default=0,
-        help=(
-            "Optional sequential edge window passed into GlueMap star "
-            "construction. 0 means no explicit sequential edges."
-        ),
-    )
+    parser.add_argument("--neighbors_per_center", type=int, default=8)
     parser.add_argument(
         "--build_virtual_tracks",
         action=argparse.BooleanOptionalAction,
         default=True,
         help=(
-            "Build GlueMap-style virtual tracks and diagnostics before BA. "
-            "When track_mode=SPV, these tracks are also used by augmented BA."
+            "Build GlueMap-style virtual tracks and diagnostics before BA, "
+            "without adding them to BA."
         ),
     )
     parser.add_argument(
@@ -106,16 +71,6 @@ def parse_args():
         type=str,
         default="aliked",
         choices=["superpoint", "aliked"],
-    )
-    parser.add_argument(
-        "--vggsfm_tracker_input",
-        type=str,
-        default="1024",
-        choices=["1024", "native"],
-        help=(
-            "Run VGGSfM tracker on GlueMap-style 1024 padded images "
-            "or directly on the exported artifact image size."
-        ),
     )
     parser.add_argument(
         "--aliked_detection_threshold", type=float, default=0.005
@@ -146,21 +101,10 @@ def parse_args():
     )
     parser.add_argument("--min_frame_observations", type=int, default=10)
     parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument(
-        "--camera_model", type=str, default="SIMPLE_PINHOLE"
-    )
+    parser.add_argument("--camera_model", type=str, default=None)
     parser.add_argument("--ba_max_num_iterations", type=int, default=100)
-    parser.add_argument("--num_refinement_iterations", type=int, default=2)
-    parser.add_argument(
-        "--augmented_ba_max_filter_iterations", type=int, default=3
-    )
-    parser.add_argument(
-        "--augmented_ba_normalized_reproj_threshold",
-        type=float,
-        default=1e-2,
-    )
     parser.add_argument("--tri_min_angle", type=float, default=1.0)
-    parser.add_argument("--tri_create_max_angle_error", type=float, default=0.5)
+    parser.add_argument("--tri_create_max_angle_error", type=float, default=2.0)
     parser.add_argument(
         "--enable_select_tracks",
         action=argparse.BooleanOptionalAction,
@@ -180,11 +124,6 @@ def parse_args():
     )
     parser.add_argument(
         "--filter_reproj_error_threshold", type=float, default=0.5
-    )
-    parser.add_argument(
-        "--virtual_init_angular_error_threshold",
-        type=float,
-        default=None,
     )
     parser.add_argument(
         "--debug_print",
@@ -572,12 +511,10 @@ def build_virtual_track_diagnostics(
         )
 
     centers = camera_centers_from_w2c(extrinsic)
-    groups, group_stats = build_vggsfm_groups(
-        args,
+    groups = build_vggsfm_groups(
         pairs,
         num_images,
-        image_names,
-        image_size_hw,
+        args.neighbors_per_center,
         centers=centers,
     )
     center_set = {group[0] for group in groups}
@@ -670,8 +607,6 @@ def build_virtual_track_diagnostics(
         "num_images": int(num_images),
         "num_groups": int(len(groups)),
         "neighbors_per_center": int(args.neighbors_per_center),
-        "group_strategy": args.group_strategy,
-        "group_stats": group_stats,
         "skipped_centers": skipped_centers,
         "depth": {
             "shape": list(depth.shape),
@@ -756,7 +691,7 @@ def build_virtual_track_diagnostics(
             },
             output_dir / "virtual_tracks_debug.pt",
         )
-    return predictions_dict, stats
+    return stats
 
 
 def load_lightglue_features(features_dir, num_images):
@@ -800,113 +735,7 @@ def count_lightglue_observations(matches, num_images):
     return counts
 
 
-def summarize_groups(groups, num_images):
-    group_sizes = [len(group) for group in groups]
-    neighbor_counts = [max(len(group) - 1, 0) for group in groups]
-    centers = [int(group[0]) for group in groups]
-    missing_centers = sorted(set(range(num_images)) - set(centers))
-    return {
-        "num_groups": int(len(groups)),
-        "group_size": summarize_numeric(group_sizes),
-        "neighbors": summarize_numeric(neighbor_counts),
-        "missing_centers": missing_centers,
-    }
-
-
-def build_sequential_edges(num_images, pairs, window):
-    if window <= 0:
-        return []
-    pair_set = {tuple(sorted((int(i), int(j)))) for i, j in pairs.tolist()}
-    sequential_edges = []
-    for i in range(num_images):
-        for step in range(1, window + 1):
-            j = i + step
-            if j >= num_images:
-                break
-            edge = (i, j)
-            if edge in pair_set:
-                sequential_edges.append(edge)
-    return sequential_edges
-
-
-def build_skip_doppelgangers_scores(pairs):
-    return np.ones(int(pairs.shape[0]), dtype=np.float32)
-
-
-def build_pose_edge_scores(pairs, centers):
-    if centers is None or len(pairs) == 0:
-        return build_skip_doppelgangers_scores(pairs)
-    distances = np.asarray(
-        [
-            float(np.linalg.norm(centers[int(i)] - centers[int(j)]))
-            for i, j in pairs.tolist()
-        ],
-        dtype=np.float32,
-    )
-    if distances.size == 0 or float(distances.max()) <= 0:
-        return build_skip_doppelgangers_scores(pairs)
-    scores = 1.0 - distances / max(float(distances.max()), 1e-6)
-    return scores.astype(np.float32)
-
-
-def build_gluemap_star_groups(
-    args,
-    pairs,
-    num_images,
-    image_names,
-    image_size_hw,
-    centers=None,
-):
-    _ensure_gluemap_imports()
-    from gluemap.datasets.star import BaseStarDataset  # noqa: PLC0415
-
-    pairs = np.asarray(pairs, dtype=np.int64).reshape(-1, 2)
-    if args.skip_doppelgangers:
-        scores = build_skip_doppelgangers_scores(pairs)
-        valid_edges = pairs
-        score_source = "skip_doppelgangers"
-    else:
-        scores = build_pose_edge_scores(pairs, centers)
-        valid_edges = pairs[scores > args.valid_dg_threshold]
-        if len(valid_edges) == 0:
-            valid_edges = pairs
-        score_source = "pose_distance"
-
-    dataset_args = SimpleNamespace(num_track_per_img=args.vggsfm_query_points)
-    dataset = BaseStarDataset(dataset_args)
-    dataset.max_neighbors = int(args.neighbors_per_center)
-    dataset.valid_edges = valid_edges
-    dataset.edge_scores = {
-        tuple(sorted((int(i), int(j)))): float(score)
-        for (i, j), score in zip(pairs.tolist(), scores.tolist(), strict=False)
-    }
-    dataset.N = int(num_images)
-    dataset.images_list = list(image_names)
-    dataset.images_path = ""
-    dataset.images_shape_ori = [tuple(image_size_hw) for _ in range(num_images)]
-    dataset.force_square = False
-    dataset.sequential_edges = build_sequential_edges(
-        num_images, pairs, args.star_sequential_window
-    )
-    dataset.__post_init__()
-
-    groups = [[int(x) for x in star.tolist()] for star in dataset.stars]
-    stats = {
-        "strategy": "star",
-        "score_source": score_source,
-        "skip_doppelgangers": bool(args.skip_doppelgangers),
-        "valid_dg_threshold": float(args.valid_dg_threshold),
-        "input_pairs": int(pairs.shape[0]),
-        "valid_edges": int(np.asarray(valid_edges).reshape(-1, 2).shape[0]),
-        "output_pairs": int(np.asarray(dataset.pairs).reshape(-1, 2).shape[0]),
-        "max_neighbors": int(args.neighbors_per_center),
-        "sequential_edges": int(len(dataset.sequential_edges or [])),
-        **summarize_groups(groups, num_images),
-    }
-    return groups, stats
-
-
-def build_pose_groups(pairs, num_images, neighbors_per_center, centers=None):
+def build_vggsfm_groups(pairs, num_images, neighbors_per_center, centers=None):
     adjacency = defaultdict(list)
     for i, j in pairs.tolist():
         adjacency[int(i)].append(int(j))
@@ -934,39 +763,6 @@ def build_pose_groups(pairs, num_images, neighbors_per_center, centers=None):
     return groups
 
 
-def build_vggsfm_groups(
-    args,
-    pairs,
-    num_images,
-    image_names,
-    image_size_hw,
-    centers=None,
-):
-    if args.group_strategy == "star":
-        return build_gluemap_star_groups(
-            args,
-            pairs,
-            num_images,
-            image_names,
-            image_size_hw,
-            centers=centers,
-        )
-
-    groups = build_pose_groups(
-        pairs,
-        num_images,
-        args.neighbors_per_center,
-        centers=centers,
-    )
-    stats = {
-        "strategy": "pose",
-        "input_pairs": int(np.asarray(pairs).reshape(-1, 2).shape[0]),
-        "max_neighbors": int(args.neighbors_per_center),
-        **summarize_groups(groups, num_images),
-    }
-    return groups, stats
-
-
 def sample_query_points(keypoints, max_points):
     if keypoints.shape[0] <= max_points:
         return keypoints
@@ -974,62 +770,13 @@ def sample_query_points(keypoints, max_points):
     return keypoints[indices]
 
 
-def apply_image_change(points, image_change):
-    points = np.asarray(points, dtype=np.float32).copy()
-    points[..., 0] = points[..., 0] * image_change[0] + image_change[2]
-    points[..., 1] = points[..., 1] * image_change[1] + image_change[3]
-    return points
-
-
-def invert_image_change(points, image_change):
-    points = np.asarray(points, dtype=np.float32).copy()
-    points[..., 0] = (points[..., 0] - image_change[2]) / image_change[0]
-    points[..., 1] = (points[..., 1] - image_change[3]) / image_change[1]
-    return points
-
-
-def prepare_vggsfm_tracker_images(args, images):
-    if args.vggsfm_tracker_input == "native":
-        return images, None, {
-            "tracker_input": "native",
-            "tracker_image_size_hw": [
-                int(images.shape[-2]),
-                int(images.shape[-1]),
-            ],
-        }
-
-    _ensure_gluemap_imports()
-    from gluemap.utils.load_fn import (  # noqa: PLC0415
-        load_and_preprocess_images_1024,
-    )
-
-    images_cpu = [images[idx].detach().cpu() for idx in range(images.shape[0])]
-    images_1024, image_changes_1024 = load_and_preprocess_images_1024(
-        images_cpu
-    )
-    image_changes_1024 = np.asarray(image_changes_1024, dtype=np.float32)
-    return images_1024, image_changes_1024, {
-        "tracker_input": "1024",
-        "tracker_image_size_hw": [
-            int(images_1024.shape[-2]),
-            int(images_1024.shape[-1]),
-        ],
-    }
-
-
 @torch.no_grad()
-def build_vggsfm_query_points(
-    args, tracker_images, features, tracker_image_changes=None
-):
+def build_vggsfm_query_points(args, images, features):
     if args.vggsfm_query_source == "superpoint":
-        query_points = []
-        for idx, feats in enumerate(features):
-            keypoints = np.asarray(feats["keypoints"], dtype=np.float32)
-            if tracker_image_changes is not None:
-                keypoints = apply_image_change(
-                    keypoints, tracker_image_changes[idx]
-                )
-            query_points.append(keypoints)
+        query_points = [
+            np.asarray(feats["keypoints"], dtype=np.float32)
+            for feats in features
+        ]
         return query_points, {
             "query_source": "superpoint",
             "query_counts": [int(points.shape[0]) for points in query_points],
@@ -1049,9 +796,8 @@ def build_vggsfm_query_points(
         .to(args.device)
     )
     query_points = []
-    for idx in range(tracker_images.shape[0]):
-        image = tracker_images[idx : idx + 1].to(args.device)
-        feats = extractor.extract(image)
+    for idx in range(images.shape[0]):
+        feats = extractor.extract(images[idx : idx + 1])
         keypoints = (
             feats["keypoints"][0].detach().cpu().numpy().astype(np.float32)
         )
@@ -1066,11 +812,13 @@ def build_vggsfm_query_points(
 
 
 @torch.no_grad()
-def run_vggsfm_prior_tracks(
-    args, images, features, pairs, metadata, extrinsic, image_names
-):
+def run_vggsfm_prior_tracks(args, images, features, pairs, metadata, extrinsic):
+    if "P" not in args.track_mode:
+        return [], {"num_groups": 0, "num_tracks": 0, "num_observations": 0}
     if not args.path_tracker:
-        raise ValueError("--path_tracker is required")
+        raise ValueError(
+            "--path_tracker is required when --track_mode includes P"
+        )
 
     _ensure_gluemap_imports()
     from vggsfm.vggsfm_tracker import TrackerPredictor  # noqa: PLC0415
@@ -1081,24 +829,16 @@ def run_vggsfm_prior_tracks(
     )
 
     centers = camera_centers_from_w2c(extrinsic)
-    groups, group_stats = build_vggsfm_groups(
-        args,
+    groups = build_vggsfm_groups(
         pairs,
         images.shape[0],
-        image_names,
-        metadata["image_size_hw"],
+        args.neighbors_per_center,
         centers=centers,
     )
     tracks = []
     observations = 0
-    tracker_images, tracker_image_changes, tracker_stats = (
-        prepare_vggsfm_tracker_images(args, images)
-    )
     query_points_per_image, query_stats = build_vggsfm_query_points(
-        args,
-        tracker_images,
-        features,
-        tracker_image_changes=tracker_image_changes,
+        args, images, features
     )
 
     for group in groups:
@@ -1108,7 +848,7 @@ def run_vggsfm_prior_tracks(
         )
         if query_np.shape[0] == 0:
             continue
-        group_tensor = tracker_images[group].unsqueeze(0).to(args.device)
+        group_tensor = images[group].unsqueeze(0)
         query = (
             torch.from_numpy(query_np)
             .to(args.device, dtype=torch.float32)
@@ -1124,15 +864,7 @@ def run_vggsfm_prior_tracks(
         pred_score = pred_score[0].detach().cpu().numpy()
 
         for point_idx in range(query_np.shape[0]):
-            h, w = metadata["image_size_hw"]
-            center_xy = query_np[point_idx].astype(np.float32)
-            if tracker_image_changes is not None:
-                center_xy = invert_image_change(
-                    center_xy, tracker_image_changes[center]
-                )
-            if not (0 <= center_xy[0] < w and 0 <= center_xy[1] < h):
-                continue
-            obs = [(center, center_xy.astype(np.float32))]
+            obs = [(center, query_np[point_idx].astype(np.float32))]
             for local_idx, image_idx in enumerate(group[1:], start=1):
                 if pred_vis[local_idx, point_idx] < args.vggsfm_vis_threshold:
                     continue
@@ -1142,10 +874,7 @@ def run_vggsfm_prior_tracks(
                 ):
                     continue
                 xy = pred_track[local_idx, point_idx].astype(np.float32)
-                if tracker_image_changes is not None:
-                    xy = invert_image_change(
-                        xy, tracker_image_changes[int(image_idx)]
-                    )
+                h, w = metadata["image_size_hw"]
                 if not (0 <= xy[0] < w and 0 <= xy[1] < h):
                     continue
                 obs.append((int(image_idx), xy))
@@ -1158,10 +887,7 @@ def run_vggsfm_prior_tracks(
         "num_tracks": len(tracks),
         "num_observations": observations,
         "neighbors_per_center": args.neighbors_per_center,
-        "group_strategy": args.group_strategy,
-        "group_stats": group_stats,
         "query_points": args.vggsfm_query_points,
-        **tracker_stats,
         **query_stats,
     }
 
@@ -1760,180 +1486,35 @@ def run_bundle_adjustment(pycolmap, reconstruction, max_num_iterations):
     return summary
 
 
-def classify_point3d_track_source(point3d, s_keypoint_count):
-    has_s_observation = False
-    has_p_observation = False
-    for elem in point3d.track.elements:
-        if int(elem.point2D_idx) < s_keypoint_count.get(elem.image_id, 0):
-            has_s_observation = True
-        else:
-            has_p_observation = True
-
-    if has_s_observation and has_p_observation:
-        return "mixed"
-    if has_s_observation:
-        return "s_only"
-    if has_p_observation:
-        return "p_only"
-    return "empty"
-
-
-def build_s_keypoint_count(reconstruction, features):
-    return {
-        image_id: int(features[image_id - 1]["keypoints"].shape[0])
-        for image_id in reconstruction.images
-    }
-
-
 def classify_tracks_by_s_keypoints(reconstruction, s_keypoint_count):
     counts = {"total": 0, "s": 0, "non_s": 0, "mixed": 0}
     for point3d in reconstruction.points3D.values():
-        source = classify_point3d_track_source(point3d, s_keypoint_count)
-        if source == "empty":
+        flags = []
+        for elem in point3d.track.elements:
+            flags.append(
+                int(elem.point2D_idx) < s_keypoint_count.get(elem.image_id, 0)
+            )
+        if not flags:
             continue
         counts["total"] += 1
-        if source == "s_only":
+        if all(flags):
             counts["s"] += 1
-        elif source == "mixed":
+        elif any(flags):
             counts["mixed"] += 1
         else:
             counts["non_s"] += 1
     return counts
 
 
-def summarize_angular_errors_by_track_source(
-    reconstruction,
-    features,
-    error_threshold,
-):
-    if reconstruction is None:
-        return {"enabled": False, "reason": "missing reconstruction"}
-
-    from gluemap.math.reprojection_error import (  # noqa: PLC0415
-        ReprojectionErrorType,
-        compute_all_errors_from_reconstruction,
-    )
-
-    s_keypoint_count = build_s_keypoint_count(reconstruction, features)
-    errors_per_track = compute_all_errors_from_reconstruction(
-        reconstruction,
-        ReprojectionErrorType.ANGULAR,
-        negative_depth_observations={},
-    )
-    bucket_order = ("s_only", "p_only", "mixed")
-    buckets = {
-        source: {
-            "track_count": 0,
-            "track_observation_count": 0,
-            "error_observation_count": 0,
-            "finite_error_count": 0,
-            "nonfinite_error_count": 0,
-            "min": 0.0,
-            "median": 0.0,
-            "mean": 0.0,
-            "max": 0.0,
-            "lt_threshold_count": 0,
-            "lt_threshold_ratio": 0.0,
-        }
-        for source in bucket_order
-    }
-    finite_errors_by_bucket = {source: [] for source in bucket_order}
-
-    for point3D_id, point3d in reconstruction.points3D.items():
-        source = classify_point3d_track_source(point3d, s_keypoint_count)
-        if source == "empty":
-            continue
-
-        bucket = buckets[source]
-        bucket["track_count"] += 1
-        bucket["track_observation_count"] += len(list(point3d.track.elements))
-
-        track_errors = errors_per_track.get(point3D_id, [])
-        bucket["error_observation_count"] += len(track_errors)
-        for _, _, error in track_errors:
-            if np.isfinite(error):
-                finite_errors_by_bucket[source].append(float(error))
-            else:
-                bucket["nonfinite_error_count"] += 1
-
-    for source, finite_errors in finite_errors_by_bucket.items():
-        bucket = buckets[source]
-        values = np.asarray(finite_errors, dtype=np.float64)
-        bucket["finite_error_count"] = int(values.size)
-        if values.size == 0:
-            continue
-        bucket["min"] = float(values.min())
-        bucket["median"] = float(np.median(values))
-        bucket["mean"] = float(values.mean())
-        bucket["max"] = float(values.max())
-        bucket["lt_threshold_count"] = int(np.sum(values < error_threshold))
-        bucket["lt_threshold_ratio"] = float(
-            bucket["lt_threshold_count"] / values.size
-        )
-
-    return {
-        "enabled": True,
-        "error_type": "angular",
-        "error_threshold": float(error_threshold),
-        "buckets": buckets,
-    }
-
-
-def log_angular_errors_by_track_source(args, iteration, stats):
-    if not stats.get("enabled"):
-        debug(
-            args,
-            "Angular errors by track source skipped: "
-            f"{stats.get('reason', 'unknown reason')}",
-        )
-        return
-
-    threshold = stats["error_threshold"]
-    labels = {
-        "s_only": "S-only",
-        "p_only": "P-only",
-        "mixed": "mixed",
-    }
-    for source in ("s_only", "p_only", "mixed"):
-        bucket = stats["buckets"][source]
-        if bucket["finite_error_count"] > 0:
-            error_summary = (
-                f"mean={bucket['mean']:.4f}, "
-                f"median={bucket['median']:.4f}, "
-                f"max={bucket['max']:.4f}, "
-                f"<{threshold:g}deg="
-                f"{bucket['lt_threshold_ratio'] * 100:.1f}%"
-            )
-        else:
-            error_summary = (
-                "mean=n/a, median=n/a, max=n/a, "
-                f"<{threshold:g}deg=n/a"
-            )
-
-        debug(
-            args,
-            "Angular errors by track source "
-            f"iter={iteration}, bucket={labels[source]}: "
-            f"tracks={bucket['track_count']}, "
-            f"track_obs={bucket['track_observation_count']}, "
-            f"error_obs={bucket['error_observation_count']}, "
-            f"finite={bucket['finite_error_count']}, "
-            f"nonfinite={bucket['nonfinite_error_count']}, "
-            f"{error_summary}",
-        )
-
-
-def run_select_tracks(
-    reconstruction,
-    features,
-    min_num_support_abs,
-    return_pair_count=False,
-):
+def run_select_tracks(reconstruction, features, min_num_support_abs):
     from gluemap.controllers.global_refinement import (  # noqa: PLC0415
         select_tracks_from_merged,
     )
 
-    s_keypoint_count = build_s_keypoint_count(reconstruction, features)
+    s_keypoint_count = {
+        image_id: int(features[image_id - 1]["keypoints"].shape[0])
+        for image_id in reconstruction.images
+    }
     before = classify_tracks_by_s_keypoints(reconstruction, s_keypoint_count)
     pair_count = select_tracks_from_merged(
         reconstruction=reconstruction,
@@ -1941,7 +1522,7 @@ def run_select_tracks(
         min_num_support_abs=min_num_support_abs,
     )
     after = classify_tracks_by_s_keypoints(reconstruction, s_keypoint_count)
-    stats = {
+    return {
         "enabled": True,
         "min_num_support_abs": int(min_num_support_abs),
         "before": before,
@@ -1949,9 +1530,6 @@ def run_select_tracks(
         "removed_points3D": int(before["total"] - after["total"]),
         "pair_count_entries": int(len(pair_count)),
     }
-    if return_pair_count:
-        return stats, pair_count
-    return stats
 
 
 def run_reprojection_filter(reconstruction, error_type, error_threshold):
@@ -1985,376 +1563,6 @@ def run_reprojection_filter(reconstruction, error_type, error_threshold):
     }
 
 
-def count_reconstruction_observations(reconstruction):
-    if reconstruction is None:
-        return 0
-    return int(
-        sum(
-            len(list(point3d.track.elements))
-            for point3d in reconstruction.points3D.values()
-        )
-    )
-
-
-def summarize_reconstruction(reconstruction):
-    if reconstruction is None:
-        return {"points3D": 0, "observations": 0}
-    return {
-        "points3D": int(len(reconstruction.points3D)),
-        "observations": count_reconstruction_observations(reconstruction),
-    }
-
-
-def run_reprojection_filter_with_stats(
-    reconstruction,
-    error_type,
-    error_threshold,
-    negative_depth_observations=None,
-    log_prefix="",
-):
-    if reconstruction is None:
-        return {"enabled": False, "reason": "missing reconstruction"}
-
-    from gluemap.math.reprojection_error import (  # noqa: PLC0415
-        ReprojectionErrorType,
-        filter_reconstruction_by_reprojection_error,
-    )
-
-    error_type_map = {
-        "angular": ReprojectionErrorType.ANGULAR,
-        "pixel": ReprojectionErrorType.PIXEL,
-        "normalized": ReprojectionErrorType.NORMALIZED,
-    }
-    before = summarize_reconstruction(reconstruction)
-    observations_removed, tracks_removed = (
-        filter_reconstruction_by_reprojection_error(
-            reconstruction,
-            error_type_map[error_type],
-            error_threshold,
-            negative_depth_observations=negative_depth_observations,
-            log_prefix=log_prefix,
-        )
-    )
-    after = summarize_reconstruction(reconstruction)
-    return {
-        "enabled": True,
-        "error_type": error_type,
-        "error_threshold": float(error_threshold),
-        "before": before,
-        "after": after,
-        "observations_removed": int(observations_removed),
-        "tracks_removed": int(tracks_removed),
-    }
-
-
-def triangulate_from_seed_reconstruction(
-    pycolmap,
-    seed_reconstruction,
-    database_path,
-    output_dir,
-    args,
-):
-    options = pycolmap.IncrementalPipelineOptions()
-    options.triangulation.min_angle = args.tri_min_angle
-    options.triangulation.merge_max_reproj_error = 15.0
-    options.triangulation.complete_max_reproj_error = 15.0
-    options.triangulation.ignore_two_view_tracks = False
-    options.triangulation.create_max_angle_error = (
-        args.tri_create_max_angle_error
-    )
-    options.ba_global_max_refinements = 0
-    if output_dir.exists():
-        shutil.rmtree(output_dir)
-    with suppress_native_stdio():
-        reconstruction = pycolmap.triangulate_points(
-            deepcopy(seed_reconstruction),
-            str(database_path),
-            ".",
-            str(output_dir),
-            clear_points=True,
-            refine_intrinsics=False,
-            options=options,
-        )
-    return reconstruction
-
-
-def run_merg3r_augmented_refinement_loop(
-    args,
-    pycolmap,
-    output_dir,
-    image_names,
-    image_size_hw,
-    camera_model,
-    extrinsic,
-    global_intrinsics,
-    intrinsics_mapping,
-    virtual_predictions_dict,
-    features,
-    database_path,
-):
-    from gluemap.controllers.augmented_bundle_adjustment import (  # noqa: PLC0415
-        IterativeBAOptions,
-        build_negative_depth_observations,
-        build_reconstruction_for_ba,
-        initialize_world_points,
-        iterative_bundle_adjustment,
-    )
-    from gluemap.controllers.global_refinement import (  # noqa: PLC0415
-        select_virtual_tracks_from_merged,
-    )
-    from gluemap.estimators.track_establishment import (  # noqa: PLC0415
-        TrackEstablishmentOptions,
-        establish_tracks_from_predictions_dict,
-    )
-    from gluemap.utils.colmap import (  # noqa: PLC0415
-        camera_from_intrinsics_matrix,
-    )
-
-    if virtual_predictions_dict is None:
-        raise ValueError(
-            "track_mode=SPV requires virtual predictions, but they were not "
-            "built"
-        )
-
-    num_images = len(image_names)
-    image_shapes = [tuple(image_size_hw) for _ in range(num_images)]
-    rotations, centers = global_pose_dicts_from_w2c(extrinsic)
-    stats = {
-        "enabled": True,
-        "num_refinement_iterations": int(args.num_refinement_iterations),
-        "setup": {},
-        "iterations": [],
-    }
-
-    t0 = time.time()
-    track_options = TrackEstablishmentOptions(track_min_num_views_per_track=2)
-    (
-        points3D,
-        keypoints_per_image,
-        pts2d_idx_inv,
-        pts2d_idx_virtual_inv,
-        images_points2d_virtual_isnegative,
-    ) = establish_tracks_from_predictions_dict(
-        predictions_dict=virtual_predictions_dict,
-        num_images=num_images,
-        options=track_options,
-        add_tracks=False,
-        add_virtual_points=True,
-        device=args.device,
-    )
-    torch.cuda.empty_cache()
-    stats["setup"]["establish_virtual_tracks_seconds"] = time.time() - t0
-    stats["setup"]["established_virtual_tracks"] = int(len(points3D))
-
-    height, width = image_size_hw
-    cameras = [
-        (
-            camera_from_intrinsics_matrix(
-                intr[0],
-                camera_model,
-                width=width,
-                height=height,
-                camera_id=camera_id + 1,
-            )
-            if intr is not None
-            else None
-        )
-        for camera_id, intr in enumerate(global_intrinsics)
-    ]
-    negative_depth_observations = build_negative_depth_observations(
-        pts2d_idx_inv, images_points2d_virtual_isnegative
-    )
-    virtual_init_threshold = args.virtual_init_angular_error_threshold
-    if virtual_init_threshold is None:
-        virtual_init_threshold = (
-            args.filter_reproj_error_threshold
-            if args.filter_reproj_error_type == "angular"
-            else 0.5
-        )
-    stats["setup"]["virtual_init_angular_error_threshold"] = float(
-        virtual_init_threshold
-    )
-
-    t0 = time.time()
-    points3D = initialize_world_points(
-        virtual_predictions_dict,
-        rotations,
-        centers,
-        points3D,
-        pts2d_idx_inv,
-        pts2d_idx_virtual_inv,
-        keypoints_per_image=keypoints_per_image,
-        cameras=cameras,
-        intrinsics_mapping=intrinsics_mapping,
-        angular_error_threshold_deg=virtual_init_threshold,
-        negative_depth_observations=negative_depth_observations,
-    )
-    stats["setup"]["initialize_virtual_points_seconds"] = time.time() - t0
-    stats["setup"]["initialized_virtual_tracks"] = int(len(points3D))
-
-    t0 = time.time()
-    virtual_reconstruction = build_reconstruction_for_ba(
-        rotations,
-        centers,
-        global_intrinsics,
-        intrinsics_mapping,
-        points3D,
-        keypoints_per_image,
-        image_sizes=image_shapes,
-        images_list=image_names,
-        camera_model=camera_model,
-    )
-    stats["setup"]["build_virtual_reconstruction_seconds"] = time.time() - t0
-    stats["setup"]["virtual_reconstruction"] = summarize_reconstruction(
-        virtual_reconstruction
-    )
-
-    negative_depth_observations_1indexed = {
-        image_id + 1: point2d_indices
-        for image_id, point2d_indices in negative_depth_observations.items()
-    }
-
-    ba_options = IterativeBAOptions(
-        max_ba_iterations=args.ba_max_num_iterations,
-        max_filter_iterations=args.augmented_ba_max_filter_iterations,
-        normalized_reproj_threshold=(
-            args.augmented_ba_normalized_reproj_threshold
-        ),
-        min_track_length=2,
-        fix_rotations_first_pass=False,
-    )
-
-    reconstruction = None
-    for outer_iter in range(args.num_refinement_iterations):
-        iter_stats = {"iteration": int(outer_iter + 1)}
-        t_iter = time.time()
-
-        t0 = time.time()
-        reconstruction = triangulate_from_seed_reconstruction(
-            pycolmap,
-            virtual_reconstruction,
-            database_path,
-            output_dir / f"triangulated_aug_iter_{outer_iter + 1}",
-            args,
-        )
-        iter_stats["triangulation"] = {
-            "seconds": time.time() - t0,
-            **summarize_reconstruction(reconstruction),
-        }
-
-        pair_count = {}
-        if args.enable_select_tracks:
-            t0 = time.time()
-            select_stats, pair_count = run_select_tracks(
-                reconstruction,
-                features,
-                args.select_track_min_support,
-                return_pair_count=True,
-            )
-            select_stats["seconds"] = time.time() - t0
-            iter_stats["select_tracks"] = select_stats
-        else:
-            iter_stats["select_tracks"] = {
-                "enabled": False,
-                "reason": "disabled",
-            }
-
-        t0 = time.time()
-        before_virtual_select = summarize_reconstruction(virtual_reconstruction)
-        if virtual_reconstruction is not None:
-            pair_count = select_virtual_tracks_from_merged(
-                virtual_reconstruction=virtual_reconstruction,
-                pair_count=pair_count,
-                min_num_support_abs=args.select_track_min_support,
-            )
-        after_virtual_select = summarize_reconstruction(virtual_reconstruction)
-        iter_stats["select_virtual_tracks"] = {
-            "enabled": virtual_reconstruction is not None,
-            "seconds": time.time() - t0,
-            "before": before_virtual_select,
-            "after": after_virtual_select,
-            "removed_points3D": int(
-                before_virtual_select["points3D"]
-                - after_virtual_select["points3D"]
-            ),
-            "pair_count_entries": int(len(pair_count)),
-        }
-
-        if args.filter_reproj_error_type == "angular":
-            t0 = time.time()
-            angular_bucket_stats = summarize_angular_errors_by_track_source(
-                reconstruction,
-                features,
-                args.filter_reproj_error_threshold,
-            )
-            angular_bucket_stats["seconds"] = time.time() - t0
-            iter_stats["angular_errors_by_track_source"] = angular_bucket_stats
-            log_angular_errors_by_track_source(
-                args,
-                outer_iter + 1,
-                angular_bucket_stats,
-            )
-        else:
-            iter_stats["angular_errors_by_track_source"] = {
-                "enabled": False,
-                "reason": (
-                    "only computed when filter_reproj_error_type=angular"
-                ),
-            }
-
-        if args.enable_reprojection_filter:
-            t0 = time.time()
-            real_filter_stats = run_reprojection_filter_with_stats(
-                reconstruction,
-                args.filter_reproj_error_type,
-                args.filter_reproj_error_threshold,
-                log_prefix="real: ",
-            )
-            virtual_filter_stats = run_reprojection_filter_with_stats(
-                virtual_reconstruction,
-                args.filter_reproj_error_type,
-                args.filter_reproj_error_threshold,
-                negative_depth_observations=negative_depth_observations_1indexed,
-                log_prefix="virtual: ",
-            )
-            iter_stats["reprojection_filter"] = {
-                "enabled": True,
-                "seconds": time.time() - t0,
-                "real": real_filter_stats,
-                "virtual": virtual_filter_stats,
-            }
-        else:
-            iter_stats["reprojection_filter"] = {"enabled": False}
-
-        t0 = time.time()
-        before_ba = {
-            "real": summarize_reconstruction(reconstruction),
-            "virtual": summarize_reconstruction(virtual_reconstruction),
-        }
-        reconstruction, virtual_reconstruction = iterative_bundle_adjustment(
-            reconstruction,
-            virtual_reconstruction,
-            negative_depth_observations_1indexed,
-            options=ba_options,
-        )
-        iter_stats["bundle_adjustment"] = {
-            "seconds": time.time() - t0,
-            "before": before_ba,
-            "after": {
-                "real": summarize_reconstruction(reconstruction),
-                "virtual": summarize_reconstruction(virtual_reconstruction),
-            },
-        }
-        iter_stats["seconds"] = time.time() - t_iter
-        stats["iterations"].append(iter_stats)
-
-    stats["final"] = {
-        "real": summarize_reconstruction(reconstruction),
-        "virtual": summarize_reconstruction(virtual_reconstruction),
-    }
-    return reconstruction, virtual_reconstruction, stats
-
-
 def main():
     args = parse_args()
     if args.device.startswith("cuda") and not torch.cuda.is_available():
@@ -2381,12 +1589,7 @@ def main():
     pairs = np.load(artifact_dir / "pairs.npy")
     image_names = metadata["artifact_image_names"]
     image_size_hw = tuple(metadata["image_size_hw"])
-    camera_model = args.camera_model or "SIMPLE_PINHOLE"
-    use_virtual_ba = args.track_mode == "SPV"
-    if use_virtual_ba and not args.build_virtual_tracks:
-        raise ValueError(
-            "track_mode=SPV requires --build_virtual_tracks to remain enabled."
-        )
+    camera_model = args.camera_model or metadata.get("camera_model", "PINHOLE")
     if args.build_virtual_tracks and not (
         artifact_dir / "raw_geometry.npz"
     ).exists():
@@ -2394,7 +1597,7 @@ def main():
             f"{artifact_dir / 'raw_geometry.npz'} is required for "
             "virtual-track diagnostics. Re-run "
             "MERG3R/export_merg3r_refine_inputs.py, or pass "
-            "--no-build_virtual_tracks when track_mode=SP."
+            "--no-build_virtual_tracks."
         )
 
     debug(
@@ -2415,42 +1618,44 @@ def main():
 
     stats = {"track_mode": args.track_mode, "timing": {}}
 
-    debug(
-        args,
-        "Running VGGSfM prior tracking: "
-        f"group_strategy={args.group_strategy}, "
-        f"skip_doppelgangers={args.skip_doppelgangers}, "
-        f"neighbors_per_center={args.neighbors_per_center}, "
-        f"query_points={args.vggsfm_query_points}, "
-        f"query_source={args.vggsfm_query_source}, "
-        f"tracker_input={args.vggsfm_tracker_input}, "
-        f"fine_tracking={args.vggsfm_fine_tracking}",
-    )
-    t0 = time.time()
-    prior_tracks, prior_stats = run_vggsfm_prior_tracks(
-        args, images, features, pairs, metadata, extrinsic, image_names
-    )
-    stats["timing"]["vggsfm_prior_tracks"] = time.time() - t0
-    stats["vggsfm"] = prior_stats
-    debug(
-        args,
-        "VGGSfM prior done: "
-        f"groups={prior_stats['num_groups']}, "
-        f"group_strategy={prior_stats['group_strategy']}, "
-        f"group_neighbors_median="
-        f"{prior_stats['group_stats']['neighbors']['median']:.1f}, "
-        f"tracks={prior_stats['num_tracks']}, "
-        f"observations={prior_stats['num_observations']}, "
-        f"query_source={prior_stats['query_source']}, "
-        f"tracker_input={prior_stats['tracker_input']}, "
-        f"tracker_image_size_hw={prior_stats['tracker_image_size_hw']}, "
-        f"query_extract_time="
-        f"{prior_stats['query_extraction_time']:.2f}s, "
-        f"time={stats['timing']['vggsfm_prior_tracks']:.2f}s",
-    )
+    prior_tracks = []
+    if "P" in args.track_mode:
+        debug(
+            args,
+            "Running VGGSfM prior tracking: "
+            f"neighbors_per_center={args.neighbors_per_center}, "
+            f"query_points={args.vggsfm_query_points}, "
+            f"query_source={args.vggsfm_query_source}, "
+            f"fine_tracking={args.vggsfm_fine_tracking}",
+        )
+        t0 = time.time()
+        prior_tracks, prior_stats = run_vggsfm_prior_tracks(
+            args, images, features, pairs, metadata, extrinsic
+        )
+        stats["timing"]["vggsfm_prior_tracks"] = time.time() - t0
+        stats["vggsfm"] = prior_stats
+        debug(
+            args,
+            "VGGSfM prior done: "
+            f"groups={prior_stats['num_groups']}, "
+            f"tracks={prior_stats['num_tracks']}, "
+            f"observations={prior_stats['num_observations']}, "
+            f"query_source={prior_stats['query_source']}, "
+            f"query_extract_time="
+            f"{prior_stats['query_extraction_time']:.2f}s, "
+            f"time={stats['timing']['vggsfm_prior_tracks']:.2f}s",
+        )
 
-    s_counts = count_lightglue_observations(lightglue_matches, len(image_names))
-    p_counts = count_track_observations(prior_tracks, len(image_names))
+    s_counts = (
+        count_lightglue_observations(lightglue_matches, len(image_names))
+        if "S" in args.track_mode
+        else np.zeros(len(image_names), dtype=np.int64)
+    )
+    p_counts = (
+        count_track_observations(prior_tracks, len(image_names))
+        if "P" in args.track_mode
+        else np.zeros(len(image_names), dtype=np.int64)
+    )
     debug(args, format_count_summary("S observations/frame", s_counts))
     debug(args, format_count_summary("P observations/frame", p_counts))
     debug(
@@ -2534,7 +1739,6 @@ def main():
         f"time={stats['timing']['intrinsics_averaging']:.2f}s",
     )
 
-    virtual_predictions_dict = None
     if args.build_virtual_tracks:
         debug(args, "Building virtual-track diagnostics")
         t0 = time.time()
@@ -2547,10 +1751,7 @@ def main():
             if raw_depth_conf_all is not None
             else None
         )
-        (
-            virtual_predictions_dict,
-            stats["virtual_tracks"],
-        ) = build_virtual_track_diagnostics(
+        stats["virtual_tracks"] = build_virtual_track_diagnostics(
             args,
             output_dir,
             depth,
@@ -2567,13 +1768,10 @@ def main():
         vt = stats["virtual_tracks"]
         final_vt = vt["update_virtual_tracks_global"]["virtual"]
         debug(
-        args,
-        "Virtual-track diagnostics done: "
-        f"groups={vt['num_groups']}, "
-        f"group_strategy={vt['group_strategy']}, "
-        f"group_neighbors_median="
-        f"{vt['group_stats']['neighbors']['median']:.1f}, "
-        f"valid_obs={final_vt['valid_observations']}, "
+            args,
+            "Virtual-track diagnostics done: "
+            f"groups={vt['num_groups']}, "
+            f"valid_obs={final_vt['valid_observations']}, "
             f"points/group median="
             f"{final_vt['points_per_group']['median']:.1f}, "
             f"time={stats['timing']['virtual_tracks']:.2f}s",
@@ -2581,100 +1779,115 @@ def main():
     else:
         stats["virtual_tracks"] = {"enabled": False}
 
-    debug(args, "Writing LightGlue COLMAP database")
-    t0 = time.time()
-    lightglue_db_stats = write_lightglue_database(
-        str(output_dir / "database_lightglue.db"),
-        image_names,
-        image_size_hw,
-        intrinsic,
-        camera_model,
-        features,
-        lightglue_matches,
-    )
-    stats["timing"]["write_lightglue_db"] = time.time() - t0
-    stats["lightglue"] = {
-        "num_pairs": len(lightglue_matches),
-        "num_matches": int(
-            sum(m.shape[0] for m in lightglue_matches.values())
-        ),
-        "database": lightglue_db_stats,
-    }
-    debug(
-        args,
-        "LightGlue DB written: "
-        f"pairs={lightglue_db_stats['num_pairs']}, "
-        f"pairs_written={lightglue_db_stats['num_pairs_written']}, "
-        f"matches={lightglue_db_stats['num_matches']}, "
-        f"time={stats['timing']['write_lightglue_db']:.2f}s",
-    )
-
-    debug(args, "Writing VGGSfM prior COLMAP database")
-    t0 = time.time()
-    stats["prior_database"] = write_tracks_database(
-        str(output_dir / "database_vggsfm_prior.db"),
-        image_names,
-        image_size_hw,
-        intrinsic,
-        camera_model,
-        prior_tracks,
-        features=features,
-        snap_to_features=args.prior_snap_to_superpoint,
-        snap_threshold=args.prior_snap_threshold,
-        keep_unsnapped=args.prior_keep_unsnapped,
-        merge_threshold=args.prior_keypoint_merge_threshold,
-    )
-    stats["timing"]["write_prior_db"] = time.time() - t0
-    prior_db_stats = stats["prior_database"]
-    snap_stats = prior_db_stats["snap"]
-    if snap_stats["enabled"]:
-        center_snap_rate = (
-            snap_stats["center_snapped_observations"]
-            / snap_stats["center_observations"]
-            if snap_stats["center_observations"]
-            else 0.0
+    if "S" in args.track_mode:
+        debug(args, "Writing LightGlue COLMAP database")
+        t0 = time.time()
+        lightglue_db_stats = write_lightglue_database(
+            str(output_dir / "database_lightglue.db"),
+            image_names,
+            image_size_hw,
+            intrinsic,
+            camera_model,
+            features,
+            lightglue_matches,
         )
-        neighbor_snap_rate = (
-            snap_stats["neighbor_snapped_observations"]
-            / snap_stats["neighbor_observations"]
-            if snap_stats["neighbor_observations"]
-            else 0.0
-        )
+        stats["timing"]["write_lightglue_db"] = time.time() - t0
+        stats["lightglue"] = {
+            "num_pairs": len(lightglue_matches),
+            "num_matches": int(
+                sum(m.shape[0] for m in lightglue_matches.values())
+            ),
+            "database": lightglue_db_stats,
+        }
         debug(
             args,
-            "Prior snap to SuperPoint: "
-            f"threshold={snap_stats['snap_threshold']}, "
-            f"snapped={snap_stats['snapped_observations']}, "
-            f"unsnapped_kept="
-            f"{snap_stats['unsnapped_kept_observations']}, "
-            f"dropped={snap_stats['dropped_observations']}, "
-            f"mean_dist={snap_stats['snap_distance_mean']:.3f}, "
-            f"max_dist={snap_stats['snap_distance_max']:.3f}, "
-            f"center_snap={center_snap_rate:.1%}, "
-            f"neighbor_snap={neighbor_snap_rate:.1%}",
+            "LightGlue DB written: "
+            f"pairs={lightglue_db_stats['num_pairs']}, "
+            f"pairs_written={lightglue_db_stats['num_pairs_written']}, "
+            f"matches={lightglue_db_stats['num_matches']}, "
+            f"time={stats['timing']['write_lightglue_db']:.2f}s",
         )
-    debug(
-        args,
-        "Prior DB written: "
-        f"input_tracks={prior_db_stats['num_input_tracks']}, "
-        f"tracks={prior_db_stats['num_tracks']}, "
-        f"pairs={prior_db_stats['num_pairs']}, "
-        f"raw_kp={prior_db_stats['keypoint_merge']['raw_total']}, "
-        f"merged_kp={prior_db_stats['keypoint_merge']['merged_total']}, "
-        f"reduced={prior_db_stats['keypoint_merge']['merged_reduction']}, "
-        f"time={stats['timing']['write_prior_db']:.2f}s",
-    )
+
+    if "P" in args.track_mode:
+        debug(args, "Writing VGGSfM prior COLMAP database")
+        t0 = time.time()
+        stats["prior_database"] = write_tracks_database(
+            str(output_dir / "database_vggsfm_prior.db"),
+            image_names,
+            image_size_hw,
+            intrinsic,
+            camera_model,
+            prior_tracks,
+            features=features,
+            snap_to_features=args.prior_snap_to_superpoint,
+            snap_threshold=args.prior_snap_threshold,
+            keep_unsnapped=args.prior_keep_unsnapped,
+            merge_threshold=args.prior_keypoint_merge_threshold,
+        )
+        stats["timing"]["write_prior_db"] = time.time() - t0
+        prior_db_stats = stats["prior_database"]
+        snap_stats = prior_db_stats["snap"]
+        if snap_stats["enabled"]:
+            center_snap_rate = (
+                snap_stats["center_snapped_observations"]
+                / snap_stats["center_observations"]
+                if snap_stats["center_observations"]
+                else 0.0
+            )
+            neighbor_snap_rate = (
+                snap_stats["neighbor_snapped_observations"]
+                / snap_stats["neighbor_observations"]
+                if snap_stats["neighbor_observations"]
+                else 0.0
+            )
+            debug(
+                args,
+                "Prior snap to SuperPoint: "
+                f"threshold={snap_stats['snap_threshold']}, "
+                f"snapped={snap_stats['snapped_observations']}, "
+                f"unsnapped_kept="
+                f"{snap_stats['unsnapped_kept_observations']}, "
+                f"dropped={snap_stats['dropped_observations']}, "
+                f"mean_dist={snap_stats['snap_distance_mean']:.3f}, "
+                f"max_dist={snap_stats['snap_distance_max']:.3f}, "
+                f"center_snap={center_snap_rate:.1%}, "
+                f"neighbor_snap={neighbor_snap_rate:.1%}",
+            )
+        debug(
+            args,
+            "Prior DB written: "
+            f"input_tracks={prior_db_stats['num_input_tracks']}, "
+            f"tracks={prior_db_stats['num_tracks']}, "
+            f"pairs={prior_db_stats['num_pairs']}, "
+            f"raw_kp={prior_db_stats['keypoint_merge']['raw_total']}, "
+            f"merged_kp={prior_db_stats['keypoint_merge']['merged_total']}, "
+            f"reduced={prior_db_stats['keypoint_merge']['merged_reduction']}, "
+            f"time={stats['timing']['write_prior_db']:.2f}s",
+        )
 
     from gluemap.utils.colmap import merge_colmap_databases  # noqa: PLC0415
 
     t0 = time.time()
-    debug(args, "Merging LightGlue and VGGSfM prior databases")
-    merge_colmap_databases(
-        str(output_dir / "database_lightglue.db"),
-        str(output_dir / "database_vggsfm_prior.db"),
-        str(output_dir / "database_merged.db"),
-        primary_features_first=True,
-    )
+    if args.track_mode == "S":
+        debug(args, "Using LightGlue database as merged database")
+        shutil.copy2(
+            output_dir / "database_lightglue.db",
+            output_dir / "database_merged.db",
+        )
+    elif args.track_mode == "P":
+        debug(args, "Using VGGSfM prior database as merged database")
+        shutil.copy2(
+            output_dir / "database_vggsfm_prior.db",
+            output_dir / "database_merged.db",
+        )
+    else:
+        debug(args, "Merging LightGlue and VGGSfM prior databases")
+        merge_colmap_databases(
+            str(output_dir / "database_lightglue.db"),
+            str(output_dir / "database_vggsfm_prior.db"),
+            str(output_dir / "database_merged.db"),
+            primary_features_first=True,
+        )
     stats["timing"]["merge_databases"] = time.time() - t0
     debug(
         args,
@@ -2698,72 +1911,6 @@ def main():
         "Coarse reconstruction written in "
         + f"{stats['timing']['write_coarse']:.2f}s",
     )
-
-    if use_virtual_ba:
-        debug(
-            args,
-            "Running Merg3r-adapted GlueMap augmented refinement: "
-            f"iterations={args.num_refinement_iterations}, "
-            f"ba_max_iters={args.ba_max_num_iterations}",
-        )
-        t0 = time.time()
-        (
-            reconstruction,
-            virtual_reconstruction,
-            augmented_stats,
-        ) = run_merg3r_augmented_refinement_loop(
-            args,
-            pycolmap,
-            output_dir,
-            image_names,
-            image_size_hw,
-            camera_model,
-            extrinsic,
-            global_intrinsics,
-            intrinsics_mapping,
-            virtual_predictions_dict,
-            features,
-            output_dir / "database_merged.db",
-        )
-        stats["timing"]["augmented_refinement"] = time.time() - t0
-        stats["augmented_refinement"] = augmented_stats
-        debug(
-            args,
-            "Augmented refinement done: "
-            f"real_points={augmented_stats['final']['real']['points3D']}, "
-            f"virtual_points="
-            f"{augmented_stats['final']['virtual']['points3D']}, "
-            f"time={stats['timing']['augmented_refinement']:.2f}s",
-        )
-
-        refined_dir = output_dir / "refined_gluemap_aba"
-        refined_dir.mkdir(parents=True, exist_ok=True)
-        reconstruction.write(str(refined_dir))
-        virtual_dir = output_dir / "virtual_gluemap_aba"
-        if virtual_reconstruction is not None:
-            virtual_dir.mkdir(parents=True, exist_ok=True)
-            virtual_reconstruction.write(str(virtual_dir))
-        stats["timing"]["total"] = time.time() - t_start
-        stats["output"] = {
-            "coarse_dir": str(coarse_dir),
-            "database_merged": str(output_dir / "database_merged.db"),
-            "refined_dir": str(refined_dir),
-            "virtual_refined_dir": str(virtual_dir)
-            if virtual_reconstruction is not None
-            else None,
-        }
-        with open(output_dir / "refine_stats.json", "w") as f:
-            json.dump(stats, f, indent=2)
-
-        print(f"[REFINE] Wrote refined reconstruction to {refined_dir}")
-        print(
-            "[REFINE] "
-            + "augmented_real_points="
-            + f"{augmented_stats['final']['real']['points3D']}, "
-            + "augmented_virtual_points="
-            + f"{augmented_stats['final']['virtual']['points3D']}"
-        )
-        return
 
     debug(
         args,
@@ -2792,7 +1939,11 @@ def main():
         f"time={stats['timing']['triangulation']:.2f}s",
     )
 
-    if args.enable_select_tracks:
+    if (
+        args.enable_select_tracks
+        and "S" in args.track_mode
+        and "P" in args.track_mode
+    ):
         debug(
             args,
             "Running SelectTrack: "
@@ -2820,28 +1971,7 @@ def main():
     else:
         stats["select_tracks"] = {
             "enabled": False,
-            "reason": "disabled",
-        }
-
-    if args.filter_reproj_error_type == "angular":
-        t0 = time.time()
-        stats["angular_errors_by_track_source"] = (
-            summarize_angular_errors_by_track_source(
-                reconstruction,
-                features,
-                args.filter_reproj_error_threshold,
-            )
-        )
-        stats["angular_errors_by_track_source"]["seconds"] = time.time() - t0
-        log_angular_errors_by_track_source(
-            args,
-            1,
-            stats["angular_errors_by_track_source"],
-        )
-    else:
-        stats["angular_errors_by_track_source"] = {
-            "enabled": False,
-            "reason": "only computed when filter_reproj_error_type=angular",
+            "reason": "disabled or track_mode does not include both S and P",
         }
 
     if args.enable_reprojection_filter:
