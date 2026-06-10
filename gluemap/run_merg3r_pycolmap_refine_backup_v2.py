@@ -55,7 +55,7 @@ def parse_args():
     parser.add_argument(
         "--group_strategy",
         type=str,
-        default="pose",
+        default="star",
         choices=["star", "pose"],
         help=(
             "How to build per-center tracking groups from pairs. "
@@ -124,29 +124,9 @@ def parse_args():
     parser.add_argument("--vggsfm_score_threshold", type=float, default=0.0)
     parser.add_argument("--vggsfm_fine_tracking", action="store_true")
     parser.add_argument(
-        "--s_database_mode",
-        type=str,
-        default="lightglue",
-        choices=["lightglue", "sift"],
-        help=(
-            "S branch database source. 'lightglue' uses A-stage "
-            "SuperPoint/LightGlue artifacts; 'sift' runs GlueMap/COLMAP SIFT "
-            "feature extraction and matching in B."
-        ),
-    )
-    parser.add_argument(
         "--prior_snap_to_superpoint",
         action=argparse.BooleanOptionalAction,
         default=True,
-    )
-    parser.add_argument(
-        "--prior_snap_to_sift",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help=(
-            "When --s_database_mode=sift, snap VGGSfM prior observations to "
-            "nearest SIFT keypoints before writing the prior database."
-        ),
     )
     parser.add_argument("--prior_snap_threshold", type=float, default=1.0)
     parser.add_argument(
@@ -820,104 +800,6 @@ def count_lightglue_observations(matches, num_images):
     return counts
 
 
-def load_database_keypoint_features(database_path, image_names):
-    pycolmap = _lazy_import_pycolmap()
-    database = pycolmap.Database.open(str(database_path))
-    features = []
-    try:
-        for name in image_names:
-            image = database.read_image_with_name(str(Path(name)))
-            keypoints = database.read_keypoints(image.image_id)
-            if keypoints is None or len(keypoints) == 0:
-                keypoints_xy = np.empty((0, 2), dtype=np.float32)
-            else:
-                keypoints_xy = np.asarray(keypoints[:, :2], dtype=np.float32)
-            features.append(
-                {
-                    "keypoints": keypoints_xy,
-                    "descriptors": None,
-                    "scores": np.ones(
-                        keypoints_xy.shape[0], dtype=np.float32
-                    ),
-                }
-            )
-    finally:
-        database.close()
-    return features
-
-
-def summarize_database_matches(database_path, image_names):
-    pycolmap = _lazy_import_pycolmap()
-    database = pycolmap.Database.open(str(database_path))
-    counts = np.zeros(len(image_names), dtype=np.int64)
-    try:
-        image_id_to_name = {
-            image.image_id: image.name for image in database.read_all_images()
-        }
-        name_to_idx = {
-            str(Path(name)): idx for idx, name in enumerate(image_names)
-        }
-        pair_ids, matches_list = database.read_all_matches()
-        num_pairs = 0
-        num_matches = 0
-        for pair_id, matches in zip(
-            pair_ids, matches_list, strict=False
-        ):
-            if matches is None or len(matches) == 0:
-                continue
-            image_id1, image_id2 = pycolmap.pair_id_to_image_pair(pair_id)
-            name1 = image_id_to_name.get(image_id1)
-            name2 = image_id_to_name.get(image_id2)
-            if name1 not in name_to_idx or name2 not in name_to_idx:
-                continue
-            match_count = int(len(matches))
-            counts[name_to_idx[name1]] += match_count
-            counts[name_to_idx[name2]] += match_count
-            num_pairs += 1
-            num_matches += match_count
-    finally:
-        database.close()
-    return {
-        "num_pairs": int(num_pairs),
-        "num_matches": int(num_matches),
-        "observations_per_image": counts.tolist(),
-    }
-
-
-def prepare_sift_database_for_refine(
-    args,
-    output_dir,
-    artifact_dir,
-    image_names,
-    pairs,
-    camera_model,
-    intrinsics_mapping,
-):
-    from gluemap.utils.colmap import prepare_sift_database  # noqa: PLC0415
-
-    prepare_sift_database(
-        str(output_dir),
-        str(artifact_dir / "images"),
-        image_names,
-        intrinsics_mapping,
-        pairs,
-        device=args.device,
-        camera_model=camera_model,
-        skip_matching=False,
-        remove_existing=True,
-    )
-    database_path = output_dir / "database_sift.db"
-    features = load_database_keypoint_features(database_path, image_names)
-    match_stats = summarize_database_matches(database_path, image_names)
-    keypoint_counts = [int(feat["keypoints"].shape[0]) for feat in features]
-    return features, {
-        "database": str(database_path),
-        "num_keypoints": keypoint_counts,
-        "num_keypoints_total": int(sum(keypoint_counts)),
-        **match_stats,
-    }
-
-
 def summarize_groups(groups, num_images):
     group_sizes = [len(group) for group in groups]
     neighbor_counts = [max(len(group) - 1, 0) for group in groups]
@@ -1140,11 +1022,6 @@ def build_vggsfm_query_points(
     args, tracker_images, features, tracker_image_changes=None
 ):
     if args.vggsfm_query_source == "superpoint":
-        if features is None:
-            raise ValueError(
-                "vggsfm_query_source=superpoint requires loaded S features. "
-                "Use --vggsfm_query_source aliked with --s_database_mode sift."
-            )
         query_points = []
         for idx, feats in enumerate(features):
             keypoints = np.asarray(feats["keypoints"], dtype=np.float32)
@@ -1315,8 +1192,6 @@ def remap_pairs(pairs, old_to_new):
 
 
 def remap_lightglue_matches(matches, old_to_new):
-    if matches is None:
-        return None
     remapped = {}
     for (i, j), match_array in matches.items():
         if int(i) not in old_to_new or int(j) not in old_to_new:
@@ -1747,7 +1622,6 @@ def write_tracks_database(
     snap_threshold=1.0,
     keep_unsnapped=True,
     merge_threshold=1e-3,
-    snap_target="superpoint",
 ):
     pycolmap = _lazy_import_pycolmap()
     if os.path.exists(db_path):
@@ -1770,7 +1644,6 @@ def write_tracks_database(
             "input_tracks": int(len(tracks)),
             "output_tracks": int(len(tracks)),
         }
-    snap_stats["target"] = snap_target
     keypoints, matches, merge_stats = tracks_to_keypoints_and_matches(
         tracks_for_database,
         len(image_names),
@@ -2532,25 +2405,12 @@ def main():
         f"track_mode={args.track_mode}",
     )
 
-    if (
-        args.s_database_mode == "sift"
-        and args.vggsfm_query_source == "superpoint"
-    ):
-        raise ValueError(
-            "--s_database_mode sift does not load A-stage SuperPoint "
-            "features. Use --vggsfm_query_source aliked."
-        )
-
-    if args.s_database_mode == "lightglue":
-        features = load_lightglue_features(
-            artifact_dir / "features_lightglue", len(image_names)
-        )
-        lightglue_matches = load_lightglue_matches(
-            artifact_dir / "matches_lightglue.npz"
-        )
-    else:
-        features = None
-        lightglue_matches = None
+    features = load_lightglue_features(
+        artifact_dir / "features_lightglue", len(image_names)
+    )
+    lightglue_matches = load_lightglue_matches(
+        artifact_dir / "matches_lightglue.npz"
+    )
     images = load_images(artifact_dir / "images", image_names, args.device)
 
     stats = {"track_mode": args.track_mode, "timing": {}}
@@ -2589,49 +2449,7 @@ def main():
         f"time={stats['timing']['vggsfm_prior_tracks']:.2f}s",
     )
 
-    if args.s_database_mode == "lightglue":
-        s_counts = count_lightglue_observations(
-            lightglue_matches, len(image_names)
-        )
-        stats["s_database"] = {
-            "mode": "lightglue",
-            "prefilter_database_ready": False,
-        }
-    else:
-        debug(args, "Preparing prefilter SIFT database")
-        t0 = time.time()
-        prefilter_intrinsics_mapping = {
-            idx: 0 for idx in range(len(image_names))
-        }
-        features, sift_prefilter_stats = prepare_sift_database_for_refine(
-            args,
-            output_dir,
-            artifact_dir,
-            image_names,
-            pairs,
-            camera_model,
-            prefilter_intrinsics_mapping,
-        )
-        stats["timing"]["prepare_sift_database_prefilter"] = (
-            time.time() - t0
-        )
-        stats["s_database"] = {
-            "mode": "sift",
-            "prefilter": sift_prefilter_stats,
-            "prefilter_database_ready": True,
-        }
-        s_counts = np.asarray(
-            sift_prefilter_stats["observations_per_image"], dtype=np.int64
-        )
-        debug(
-            args,
-            "Prefilter SIFT DB ready: "
-            f"keypoints={sift_prefilter_stats['num_keypoints_total']}, "
-            f"pairs={sift_prefilter_stats['num_pairs']}, "
-            f"matches={sift_prefilter_stats['num_matches']}, "
-            f"time="
-            f"{stats['timing']['prepare_sift_database_prefilter']:.2f}s",
-        )
+    s_counts = count_lightglue_observations(lightglue_matches, len(image_names))
     p_counts = count_track_observations(prior_tracks, len(image_names))
     debug(args, format_count_summary("S observations/frame", s_counts))
     debug(args, format_count_summary("P observations/frame", p_counts))
@@ -2763,75 +2581,36 @@ def main():
     else:
         stats["virtual_tracks"] = {"enabled": False}
 
-    if args.s_database_mode == "lightglue":
-        debug(args, "Writing LightGlue COLMAP database")
-        t0 = time.time()
-        lightglue_db_stats = write_lightglue_database(
-            str(output_dir / "database_lightglue.db"),
-            image_names,
-            image_size_hw,
-            intrinsic,
-            camera_model,
-            features,
-            lightglue_matches,
-        )
-        stats["timing"]["write_lightglue_db"] = time.time() - t0
-        stats["lightglue"] = {
-            "num_pairs": len(lightglue_matches),
-            "num_matches": int(
-                sum(m.shape[0] for m in lightglue_matches.values())
-            ),
-            "database": lightglue_db_stats,
-        }
-        stats["s_database"]["final"] = lightglue_db_stats
-        debug(
-            args,
-            "LightGlue DB written: "
-            f"pairs={lightglue_db_stats['num_pairs']}, "
-            f"pairs_written={lightglue_db_stats['num_pairs_written']}, "
-            f"matches={lightglue_db_stats['num_matches']}, "
-            f"time={stats['timing']['write_lightglue_db']:.2f}s",
-        )
-    else:
-        if coverage_stats["dropped_indices"]:
-            debug(args, "Rebuilding SIFT COLMAP database after frame filtering")
-            t0 = time.time()
-            features, sift_final_stats = prepare_sift_database_for_refine(
-                args,
-                output_dir,
-                artifact_dir,
-                image_names,
-                pairs,
-                camera_model,
-                intrinsics_mapping,
-            )
-            stats["timing"]["prepare_sift_database_final"] = (
-                time.time() - t0
-            )
-        else:
-            sift_final_stats = stats["s_database"]["prefilter"]
-            stats["timing"]["prepare_sift_database_final"] = 0.0
-        stats["s_database"]["final"] = sift_final_stats
-        debug(
-            args,
-            "SIFT DB ready: "
-            f"keypoints={sift_final_stats['num_keypoints_total']}, "
-            f"pairs={sift_final_stats['num_pairs']}, "
-            f"matches={sift_final_stats['num_matches']}, "
-            f"time="
-            f"{stats['timing']['prepare_sift_database_final']:.2f}s",
-        )
+    debug(args, "Writing LightGlue COLMAP database")
+    t0 = time.time()
+    lightglue_db_stats = write_lightglue_database(
+        str(output_dir / "database_lightglue.db"),
+        image_names,
+        image_size_hw,
+        intrinsic,
+        camera_model,
+        features,
+        lightglue_matches,
+    )
+    stats["timing"]["write_lightglue_db"] = time.time() - t0
+    stats["lightglue"] = {
+        "num_pairs": len(lightglue_matches),
+        "num_matches": int(
+            sum(m.shape[0] for m in lightglue_matches.values())
+        ),
+        "database": lightglue_db_stats,
+    }
+    debug(
+        args,
+        "LightGlue DB written: "
+        f"pairs={lightglue_db_stats['num_pairs']}, "
+        f"pairs_written={lightglue_db_stats['num_pairs_written']}, "
+        f"matches={lightglue_db_stats['num_matches']}, "
+        f"time={stats['timing']['write_lightglue_db']:.2f}s",
+    )
 
     debug(args, "Writing VGGSfM prior COLMAP database")
     t0 = time.time()
-    prior_snap_to_s_features = (
-        args.prior_snap_to_sift
-        if args.s_database_mode == "sift"
-        else args.prior_snap_to_superpoint
-    )
-    prior_snap_target = (
-        "sift" if args.s_database_mode == "sift" else "superpoint"
-    )
     stats["prior_database"] = write_tracks_database(
         str(output_dir / "database_vggsfm_prior.db"),
         image_names,
@@ -2840,11 +2619,10 @@ def main():
         camera_model,
         prior_tracks,
         features=features,
-        snap_to_features=prior_snap_to_s_features,
+        snap_to_features=args.prior_snap_to_superpoint,
         snap_threshold=args.prior_snap_threshold,
         keep_unsnapped=args.prior_keep_unsnapped,
         merge_threshold=args.prior_keypoint_merge_threshold,
-        snap_target=prior_snap_target,
     )
     stats["timing"]["write_prior_db"] = time.time() - t0
     prior_db_stats = stats["prior_database"]
@@ -2864,7 +2642,7 @@ def main():
         )
         debug(
             args,
-            f"Prior snap to {snap_stats['target']}: "
+            "Prior snap to SuperPoint: "
             f"threshold={snap_stats['snap_threshold']}, "
             f"snapped={snap_stats['snapped_observations']}, "
             f"unsnapped_kept="
@@ -2890,22 +2668,13 @@ def main():
     from gluemap.utils.colmap import merge_colmap_databases  # noqa: PLC0415
 
     t0 = time.time()
-    if args.s_database_mode == "sift":
-        debug(args, "Merging VGGSfM prior and SIFT databases")
-        merge_colmap_databases(
-            str(output_dir / "database_vggsfm_prior.db"),
-            str(output_dir / "database_sift.db"),
-            str(output_dir / "database_merged.db"),
-            primary_features_first=False,
-        )
-    else:
-        debug(args, "Merging LightGlue and VGGSfM prior databases")
-        merge_colmap_databases(
-            str(output_dir / "database_lightglue.db"),
-            str(output_dir / "database_vggsfm_prior.db"),
-            str(output_dir / "database_merged.db"),
-            primary_features_first=True,
-        )
+    debug(args, "Merging LightGlue and VGGSfM prior databases")
+    merge_colmap_databases(
+        str(output_dir / "database_lightglue.db"),
+        str(output_dir / "database_vggsfm_prior.db"),
+        str(output_dir / "database_merged.db"),
+        primary_features_first=True,
+    )
     stats["timing"]["merge_databases"] = time.time() - t0
     debug(
         args,
