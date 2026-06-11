@@ -1,0 +1,499 @@
+import importlib.util
+import json
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from types import SimpleNamespace
+
+import numpy as np
+from PIL import Image
+
+CAMERA_MODEL = "SIMPLE_PINHOLE"
+S_DATABASE_MODE = "sift"
+QUERY_SOURCE = "aliked"
+GROUP_STRATEGY = "pose"
+TRACK_MODE = "SPV"
+TRACKER_INPUT = "1024"
+
+
+@dataclass
+class GluemapSpvRefineConfig:
+    path_tracker: str
+    device: str = "cuda"
+    neighbors_per_center: int = 25
+    vggsfm_query_points: int = 1024
+    aliked_detection_threshold: float = 0.005
+    vggsfm_vis_threshold: float = 0.5
+    vggsfm_score_threshold: float = 0.0
+    vggsfm_fine_tracking: bool = False
+    prior_snap_threshold: float = 1.0
+    prior_keypoint_merge_threshold: float = 1e-3
+    min_frame_observations: int = 10
+    ba_max_num_iterations: int = 100
+    num_refinement_iterations: int = 2
+    augmented_ba_max_filter_iterations: int = 3
+    augmented_ba_normalized_reproj_threshold: float = 1e-2
+    tri_min_angle: float = 1.0
+    tri_create_max_angle_error: float = 0.5
+    select_track_min_support: int = 512
+    filter_reproj_error_type: str = "angular"
+    filter_reproj_error_threshold: float = 0.5
+    virtual_init_angular_error_threshold: float | None = None
+    save_virtual_tracks_debug: bool = False
+    debug_print: bool = True
+
+
+@dataclass
+class GluemapSpvRefineResult:
+    image_names: list[str]
+    extrinsic: np.ndarray
+    pairs: np.ndarray
+    intrinsic: np.ndarray
+    intrinsics_mapping: dict[int, int]
+    stats: dict
+    refined_dir: Path
+    virtual_refined_dir: Path
+
+
+_REFINE_MODULE = None
+
+
+def _load_refine_module():
+    global _REFINE_MODULE
+    if _REFINE_MODULE is not None:
+        return _REFINE_MODULE
+
+    gluemap_root = Path(__file__).resolve().parents[1] / "gluemap"
+    module_path = gluemap_root / "run_merg3r_pycolmap_refine.py"
+    if str(gluemap_root) not in sys.path:
+        sys.path.insert(0, str(gluemap_root))
+
+    spec = importlib.util.spec_from_file_location(
+        "_merg3r_gluemap_refine_legacy", module_path
+    )
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot load GlueMap refine module from {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    module._ensure_gluemap_imports()
+    _REFINE_MODULE = module
+    return module
+
+
+def _make_refine_args(config: GluemapSpvRefineConfig):
+    return SimpleNamespace(
+        path_tracker=config.path_tracker,
+        track_mode=TRACK_MODE,
+        neighbors_per_center=config.neighbors_per_center,
+        group_strategy=GROUP_STRATEGY,
+        skip_doppelgangers=True,
+        valid_dg_threshold=0.8,
+        star_sequential_window=0,
+        build_virtual_tracks=True,
+        save_virtual_tracks_debug=config.save_virtual_tracks_debug,
+        vggsfm_query_points=config.vggsfm_query_points,
+        vggsfm_query_source=QUERY_SOURCE,
+        vggsfm_tracker_input=TRACKER_INPUT,
+        aliked_detection_threshold=config.aliked_detection_threshold,
+        vggsfm_vis_threshold=config.vggsfm_vis_threshold,
+        vggsfm_score_threshold=config.vggsfm_score_threshold,
+        vggsfm_fine_tracking=config.vggsfm_fine_tracking,
+        s_database_mode=S_DATABASE_MODE,
+        prior_snap_to_sift=True,
+        prior_snap_threshold=config.prior_snap_threshold,
+        prior_keep_unsnapped=True,
+        prior_keypoint_merge_threshold=config.prior_keypoint_merge_threshold,
+        drop_low_coverage_frames=True,
+        min_frame_observations=config.min_frame_observations,
+        device=config.device,
+        camera_model=CAMERA_MODEL,
+        ba_max_num_iterations=config.ba_max_num_iterations,
+        num_refinement_iterations=config.num_refinement_iterations,
+        augmented_ba_max_filter_iterations=(config.augmented_ba_max_filter_iterations),
+        augmented_ba_normalized_reproj_threshold=(
+            config.augmented_ba_normalized_reproj_threshold
+        ),
+        tri_min_angle=config.tri_min_angle,
+        tri_create_max_angle_error=config.tri_create_max_angle_error,
+        enable_select_tracks=True,
+        select_track_min_support=config.select_track_min_support,
+        enable_reprojection_filter=True,
+        filter_reproj_error_type=config.filter_reproj_error_type,
+        filter_reproj_error_threshold=config.filter_reproj_error_threshold,
+        virtual_init_angular_error_threshold=(
+            config.virtual_init_angular_error_threshold
+        ),
+        debug_print=config.debug_print,
+    )
+
+
+def _debug(args, message):
+    if args.debug_print:
+        print(f"[PIPELINE-REFINE] {message}", flush=True)
+
+
+def _save_work_images(images, output_dir):
+    images_dir = output_dir / "images"
+    images_dir.mkdir(parents=True, exist_ok=True)
+    image_names = []
+    images_cpu = images.detach().cpu().float().clamp(0, 1)
+    for idx, image in enumerate(images_cpu):
+        name = f"frame_{idx:06d}.png"
+        array = (image.permute(1, 2, 0).numpy() * 255.0).round().astype(np.uint8)
+        Image.fromarray(array).save(images_dir / name)
+        image_names.append(name)
+    return images_dir, image_names
+
+
+def _write_json(path, payload):
+    with open(path, "w") as f:
+        json.dump(payload, f, indent=2)
+
+
+def run_gluemap_spv_refinement(coarse_state, output_dir, config):
+    ref = _load_refine_module()
+    pycolmap = ref._lazy_import_pycolmap()
+    args = _make_refine_args(config)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    t_start = time.time()
+    images_dir, image_names = _save_work_images(coarse_state.images, output_dir)
+    image_size_hw = tuple(coarse_state.image_size_hw)
+    initial_intrinsics_all = np.asarray(coarse_state.intrinsic, dtype=np.float64)
+    extrinsic = np.asarray(coarse_state.extrinsic, dtype=np.float64)
+    pairs = np.asarray(coarse_state.pairs, dtype=np.int64)
+    metadata = {"image_size_hw": image_size_hw}
+
+    stats = {
+        "track_mode": TRACK_MODE,
+        "camera_model": CAMERA_MODEL,
+        "s_database_mode": S_DATABASE_MODE,
+        "vggsfm_query_source": QUERY_SOURCE,
+        "vggsfm_tracker_input": TRACKER_INPUT,
+        "group_strategy": GROUP_STRATEGY,
+        "timing": {},
+        "work_images": {
+            "images_dir": str(images_dir),
+            "image_names": image_names,
+            "source_image_names": list(coarse_state.image_names),
+        },
+    }
+
+    _debug(
+        args,
+        "Loaded coarse state: "
+        f"images={len(image_names)}, pairs={pairs.shape[0]}, "
+        f"image_size_hw={image_size_hw}, camera_model={CAMERA_MODEL}",
+    )
+
+    _debug(
+        args,
+        "Running VGGSfM prior tracking: "
+        f"group_strategy={GROUP_STRATEGY}, "
+        f"neighbors_per_center={args.neighbors_per_center}, "
+        f"query_points={args.vggsfm_query_points}, "
+        f"query_source={QUERY_SOURCE}, tracker_input={TRACKER_INPUT}",
+    )
+    t0 = time.time()
+    prior_tracks, prior_stats = ref.run_vggsfm_prior_tracks(
+        args,
+        coarse_state.images,
+        None,
+        pairs,
+        metadata,
+        extrinsic,
+        image_names,
+    )
+    stats["timing"]["vggsfm_prior_tracks"] = time.time() - t0
+    stats["vggsfm"] = prior_stats
+    _debug(
+        args,
+        "VGGSfM prior done: "
+        f"groups={prior_stats['num_groups']}, "
+        f"tracks={prior_stats['num_tracks']}, "
+        f"observations={prior_stats['num_observations']}, "
+        f"time={stats['timing']['vggsfm_prior_tracks']:.2f}s",
+    )
+
+    _debug(args, "Preparing prefilter SIFT database")
+    t0 = time.time()
+    prefilter_intrinsics_mapping = {idx: 0 for idx in range(len(image_names))}
+    features, sift_prefilter_stats = ref.prepare_sift_database_for_refine(
+        args,
+        output_dir,
+        output_dir,
+        image_names,
+        pairs,
+        CAMERA_MODEL,
+        prefilter_intrinsics_mapping,
+    )
+    stats["timing"]["prepare_sift_database_prefilter"] = time.time() - t0
+    stats["s_database"] = {
+        "mode": S_DATABASE_MODE,
+        "prefilter": sift_prefilter_stats,
+        "prefilter_database_ready": True,
+    }
+    s_counts = np.asarray(
+        sift_prefilter_stats["observations_per_image"], dtype=np.int64
+    )
+    p_counts = ref.count_track_observations(prior_tracks, len(image_names))
+    _debug(args, ref.format_count_summary("S observations/frame", s_counts))
+    _debug(args, ref.format_count_summary("P observations/frame", p_counts))
+    _debug(
+        args, ref.format_count_summary("S+P observations/frame", s_counts + p_counts)
+    )
+
+    (
+        image_names,
+        images,
+        extrinsic,
+        features,
+        pairs,
+        _unused_matches,
+        prior_tracks,
+        coverage_stats,
+    ) = ref.filter_low_coverage_frames(
+        image_names,
+        coarse_state.images,
+        extrinsic,
+        features,
+        pairs,
+        None,
+        prior_tracks,
+        s_counts,
+        p_counts,
+        args.min_frame_observations,
+        enabled=True,
+    )
+    stats["frame_filtering"] = coverage_stats
+    stats["num_images_after_filter"] = len(image_names)
+    _debug(
+        args,
+        "Frame filtering: "
+        f"min_obs={coverage_stats['min_frame_observations']}, "
+        f"dropped={len(coverage_stats['dropped_indices'])}, "
+        f"remaining={len(image_names)}",
+    )
+    if coverage_stats["dropped_indices"]:
+        _debug(
+            args,
+            "Dropped frames: "
+            + ", ".join(
+                f"{idx}:{name}"
+                for idx, name in zip(
+                    coverage_stats["dropped_indices"],
+                    coverage_stats["dropped_names"],
+                    strict=False,
+                )
+            ),
+        )
+
+    kept_indices = np.asarray(coverage_stats["kept_indices"], dtype=np.int64)
+    initial_intrinsics = initial_intrinsics_all[kept_indices]
+    depth = coarse_state.raw_depth[kept_indices]
+    depth_conf = (
+        coarse_state.raw_depth_conf[kept_indices]
+        if coarse_state.raw_depth_conf is not None
+        else None
+    )
+
+    t0 = time.time()
+    (
+        averaged_intrinsics,
+        global_intrinsics,
+        intrinsics_mapping,
+    ) = ref.average_intrinsics_with_gluemap(initial_intrinsics, CAMERA_MODEL)
+    stats["timing"]["intrinsics_averaging"] = time.time() - t0
+    intrinsic = averaged_intrinsics[0]
+    stats["intrinsics"] = ref.summarize_intrinsics(
+        initial_intrinsics, averaged_intrinsics, CAMERA_MODEL
+    )
+    ref.save_intrinsics_artifacts(
+        output_dir,
+        initial_intrinsics,
+        averaged_intrinsics,
+        intrinsics_mapping,
+        image_names,
+    )
+    _debug(
+        args,
+        "Intrinsics averaged: "
+        f"fx={intrinsic[0, 0]:.2f}, fy={intrinsic[1, 1]:.2f}, "
+        f"cx={intrinsic[0, 2]:.2f}, cy={intrinsic[1, 2]:.2f}, "
+        f"time={stats['timing']['intrinsics_averaging']:.2f}s",
+    )
+
+    _debug(args, "Building virtual tracks")
+    t0 = time.time()
+    (
+        virtual_predictions_dict,
+        stats["virtual_tracks"],
+    ) = ref.build_virtual_track_diagnostics(
+        args,
+        output_dir,
+        depth,
+        depth_conf,
+        extrinsic,
+        initial_intrinsics,
+        global_intrinsics,
+        intrinsics_mapping,
+        pairs,
+        image_names,
+        image_size_hw,
+    )
+    stats["timing"]["virtual_tracks"] = time.time() - t0
+    vt = stats["virtual_tracks"]
+    final_vt = vt["update_virtual_tracks_global"]["virtual"]
+    _debug(
+        args,
+        "Virtual tracks done: "
+        f"groups={vt['num_groups']}, "
+        f"valid_obs={final_vt['valid_observations']}, "
+        f"time={stats['timing']['virtual_tracks']:.2f}s",
+    )
+
+    if coverage_stats["dropped_indices"]:
+        _debug(args, "Rebuilding SIFT database after frame filtering")
+        t0 = time.time()
+        features, sift_final_stats = ref.prepare_sift_database_for_refine(
+            args,
+            output_dir,
+            output_dir,
+            image_names,
+            pairs,
+            CAMERA_MODEL,
+            intrinsics_mapping,
+        )
+        stats["timing"]["prepare_sift_database_final"] = time.time() - t0
+    else:
+        sift_final_stats = stats["s_database"]["prefilter"]
+        stats["timing"]["prepare_sift_database_final"] = 0.0
+    stats["s_database"]["final"] = sift_final_stats
+    _debug(
+        args,
+        "SIFT DB ready: "
+        f"keypoints={sift_final_stats['num_keypoints_total']}, "
+        f"pairs={sift_final_stats['num_pairs']}, "
+        f"matches={sift_final_stats['num_matches']}",
+    )
+
+    _debug(args, "Writing VGGSfM prior database")
+    t0 = time.time()
+    stats["prior_database"] = ref.write_tracks_database(
+        str(output_dir / "database_vggsfm_prior.db"),
+        image_names,
+        image_size_hw,
+        intrinsic,
+        CAMERA_MODEL,
+        prior_tracks,
+        features=features,
+        snap_to_features=True,
+        snap_threshold=args.prior_snap_threshold,
+        keep_unsnapped=True,
+        merge_threshold=args.prior_keypoint_merge_threshold,
+        snap_target="sift",
+    )
+    stats["timing"]["write_prior_db"] = time.time() - t0
+    prior_db_stats = stats["prior_database"]
+    snap_stats = prior_db_stats["snap"]
+    _debug(
+        args,
+        "Prior DB written: "
+        f"tracks={prior_db_stats['num_tracks']}, "
+        f"pairs={prior_db_stats['num_pairs']}, "
+        f"raw_kp={prior_db_stats['keypoint_merge']['raw_total']}, "
+        f"merged_kp={prior_db_stats['keypoint_merge']['merged_total']}, "
+        f"snapped={snap_stats['snapped_observations']}",
+    )
+
+    from gluemap.utils.colmap import merge_colmap_databases  # noqa: PLC0415
+
+    _debug(args, "Merging VGGSfM prior and SIFT databases")
+    t0 = time.time()
+    merge_colmap_databases(
+        str(output_dir / "database_vggsfm_prior.db"),
+        str(output_dir / "database_sift.db"),
+        str(output_dir / "database_merged.db"),
+        primary_features_first=False,
+    )
+    stats["timing"]["merge_databases"] = time.time() - t0
+
+    coarse_dir = output_dir / "coarse"
+    _debug(args, f"Writing coarse reconstruction: {coarse_dir}")
+    t0 = time.time()
+    ref.write_coarse_reconstruction(
+        coarse_dir,
+        image_names,
+        image_size_hw,
+        extrinsic,
+        intrinsic,
+        CAMERA_MODEL,
+    )
+    stats["timing"]["write_coarse"] = time.time() - t0
+
+    _debug(
+        args,
+        "Running augmented refinement: "
+        f"iterations={args.num_refinement_iterations}, "
+        f"ba_max_iters={args.ba_max_num_iterations}",
+    )
+    t0 = time.time()
+    (
+        reconstruction,
+        virtual_reconstruction,
+        augmented_stats,
+    ) = ref.run_merg3r_augmented_refinement_loop(
+        args,
+        pycolmap,
+        output_dir,
+        image_names,
+        image_size_hw,
+        CAMERA_MODEL,
+        extrinsic,
+        global_intrinsics,
+        intrinsics_mapping,
+        virtual_predictions_dict,
+        features,
+        output_dir / "database_merged.db",
+    )
+    stats["timing"]["augmented_refinement"] = time.time() - t0
+    stats["augmented_refinement"] = augmented_stats
+
+    refined_dir = output_dir / "refined_gluemap_aba"
+    refined_dir.mkdir(parents=True, exist_ok=True)
+    reconstruction.write(str(refined_dir))
+    virtual_dir = output_dir / "virtual_gluemap_aba"
+    if virtual_reconstruction is not None:
+        virtual_dir.mkdir(parents=True, exist_ok=True)
+        virtual_reconstruction.write(str(virtual_dir))
+
+    stats["timing"]["total"] = time.time() - t_start
+    stats["output"] = {
+        "coarse_dir": str(coarse_dir),
+        "database_merged": str(output_dir / "database_merged.db"),
+        "refined_dir": str(refined_dir),
+        "virtual_refined_dir": str(virtual_dir),
+    }
+    _write_json(output_dir / "refine_stats.json", stats)
+
+    _debug(
+        args,
+        "Augmented refinement done: "
+        f"real_points={augmented_stats['final']['real']['points3D']}, "
+        f"virtual_points={augmented_stats['final']['virtual']['points3D']}, "
+        f"time={stats['timing']['augmented_refinement']:.2f}s",
+    )
+
+    return GluemapSpvRefineResult(
+        image_names=image_names,
+        extrinsic=extrinsic,
+        pairs=pairs,
+        intrinsic=intrinsic,
+        intrinsics_mapping=intrinsics_mapping,
+        stats=stats,
+        refined_dir=refined_dir,
+        virtual_refined_dir=virtual_dir,
+    )

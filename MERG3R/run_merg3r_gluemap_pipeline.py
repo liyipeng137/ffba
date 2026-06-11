@@ -16,13 +16,18 @@ from algos.utils import (
     restore_predictions_order,
     run_inference_step_by_step,
 )
+from utils.gluemap_spv_refine import (
+    CAMERA_MODEL as PIPELINE_CAMERA_MODEL,
+    GROUP_STRATEGY as PIPELINE_GROUP_STRATEGY,
+    QUERY_SOURCE as PIPELINE_QUERY_SOURCE,
+    S_DATABASE_MODE as PIPELINE_S_DATABASE_MODE,
+    TRACK_MODE as PIPELINE_TRACK_MODE,
+    TRACKER_INPUT as PIPELINE_TRACKER_INPUT,
+    GluemapSpvRefineConfig,
+    run_gluemap_spv_refinement,
+)
 
 PIPELINE_MODEL = "pi3x"
-PIPELINE_CAMERA_MODEL = "SIMPLE_PINHOLE"
-PIPELINE_S_DATABASE_MODE = "sift"
-PIPELINE_QUERY_SOURCE = "aliked"
-PIPELINE_GROUP_STRATEGY = "pose"
-PIPELINE_TRACK_MODE = "SPV"
 
 
 @dataclass
@@ -42,8 +47,8 @@ class Merg3rCoarseState:
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        "Run the integrated Merg3r + GlueMap pipeline. "
-        "Current implementation stops after the Merg3r coarse stage."
+        "Run the integrated Merg3r + GlueMap pipeline with fixed "
+        "pi3x + SIMPLE_PINHOLE + SIFT + ALIKED + pose groups + SPV."
     )
     parser.add_argument("--dataset", type=str, required=True)
     parser.add_argument("--output_dir", type=str, required=True)
@@ -86,6 +91,49 @@ def parse_args():
             "fewer than pair_k_pose, fill the remaining slots by camera-center "
             "distance. This keeps the graph dense enough for pose groups."
         ),
+    )
+    parser.add_argument(
+        "--path_tracker",
+        type=str,
+        default="/root/.cache/torch/hub/checkpoints/vggsfm_v2_tracker.pt",
+    )
+    parser.add_argument("--neighbors_per_center", type=int, default=25)
+    parser.add_argument("--vggsfm_query_points", type=int, default=1024)
+    parser.add_argument("--aliked_detection_threshold", type=float, default=0.005)
+    parser.add_argument("--vggsfm_vis_threshold", type=float, default=0.5)
+    parser.add_argument("--vggsfm_score_threshold", type=float, default=0.0)
+    parser.add_argument("--vggsfm_fine_tracking", action="store_true")
+    parser.add_argument("--prior_snap_threshold", type=float, default=1.0)
+    parser.add_argument("--prior_keypoint_merge_threshold", type=float, default=1e-3)
+    parser.add_argument("--min_frame_observations", type=int, default=10)
+    parser.add_argument("--ba_max_num_iterations", type=int, default=100)
+    parser.add_argument("--num_refinement_iterations", type=int, default=2)
+    parser.add_argument("--augmented_ba_max_filter_iterations", type=int, default=3)
+    parser.add_argument(
+        "--augmented_ba_normalized_reproj_threshold",
+        type=float,
+        default=1e-2,
+    )
+    parser.add_argument("--tri_min_angle", type=float, default=1.0)
+    parser.add_argument("--tri_create_max_angle_error", type=float, default=0.5)
+    parser.add_argument("--select_track_min_support", type=int, default=512)
+    parser.add_argument(
+        "--filter_reproj_error_type",
+        type=str,
+        default="angular",
+        choices=["angular", "pixel", "normalized"],
+    )
+    parser.add_argument("--filter_reproj_error_threshold", type=float, default=0.5)
+    parser.add_argument("--virtual_init_angular_error_threshold", type=float)
+    parser.add_argument(
+        "--save_virtual_tracks_debug",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument(
+        "--debug_print",
+        action=argparse.BooleanOptionalAction,
+        default=True,
     )
     parser.add_argument("--device", type=str, default="cuda")
     return parser.parse_args()
@@ -317,13 +365,14 @@ def write_stage_a_summary(output_dir, args, state, timing):
     summary = {
         "source": "MERG3R/run_merg3r_gluemap_pipeline.py",
         "stage": "merg3r_coarse",
-        "status": "stops_after_stage_a",
+        "status": "stage_a_completed",
         "dataset": args.dataset,
         "pipeline_defaults": {
             "model": PIPELINE_MODEL,
             "camera_model": PIPELINE_CAMERA_MODEL,
             "s_database_mode": PIPELINE_S_DATABASE_MODE,
             "vggsfm_query_source": PIPELINE_QUERY_SOURCE,
+            "vggsfm_tracker_input": PIPELINE_TRACKER_INPUT,
             "group_strategy": PIPELINE_GROUP_STRATEGY,
             "track_mode": PIPELINE_TRACK_MODE,
         },
@@ -372,6 +421,7 @@ def main():
                     "camera_model": PIPELINE_CAMERA_MODEL,
                     "s_database_mode": PIPELINE_S_DATABASE_MODE,
                     "vggsfm_query_source": PIPELINE_QUERY_SOURCE,
+                    "vggsfm_tracker_input": PIPELINE_TRACKER_INPUT,
                     "group_strategy": PIPELINE_GROUP_STRATEGY,
                     "track_mode": PIPELINE_TRACK_MODE,
                 },
@@ -400,6 +450,40 @@ def main():
         f"p90={state.pair_graph_stats['degree_p90']:.1f}, "
         f"max={state.pair_graph_stats['degree_max']}, "
         f"zero={state.pair_graph_stats['zero_degree_images']}"
+    )
+
+    refine_config = GluemapSpvRefineConfig(
+        path_tracker=args.path_tracker,
+        device=args.device,
+        neighbors_per_center=args.neighbors_per_center,
+        vggsfm_query_points=args.vggsfm_query_points,
+        aliked_detection_threshold=args.aliked_detection_threshold,
+        vggsfm_vis_threshold=args.vggsfm_vis_threshold,
+        vggsfm_score_threshold=args.vggsfm_score_threshold,
+        vggsfm_fine_tracking=args.vggsfm_fine_tracking,
+        prior_snap_threshold=args.prior_snap_threshold,
+        prior_keypoint_merge_threshold=args.prior_keypoint_merge_threshold,
+        min_frame_observations=args.min_frame_observations,
+        ba_max_num_iterations=args.ba_max_num_iterations,
+        num_refinement_iterations=args.num_refinement_iterations,
+        augmented_ba_max_filter_iterations=args.augmented_ba_max_filter_iterations,
+        augmented_ba_normalized_reproj_threshold=(
+            args.augmented_ba_normalized_reproj_threshold
+        ),
+        tri_min_angle=args.tri_min_angle,
+        tri_create_max_angle_error=args.tri_create_max_angle_error,
+        select_track_min_support=args.select_track_min_support,
+        filter_reproj_error_type=args.filter_reproj_error_type,
+        filter_reproj_error_threshold=args.filter_reproj_error_threshold,
+        virtual_init_angular_error_threshold=args.virtual_init_angular_error_threshold,
+        save_virtual_tracks_debug=args.save_virtual_tracks_debug,
+        debug_print=args.debug_print,
+    )
+    refine_result = run_gluemap_spv_refinement(state, output_dir, refine_config)
+    print(
+        "[PIPELINE] Refinement done: "
+        f"refined_dir={refine_result.refined_dir}, "
+        f"virtual_dir={refine_result.virtual_refined_dir}"
     )
 
 
