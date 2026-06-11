@@ -1,18 +1,49 @@
-# Merg3r -> Gluemap Refinement 验证计划与进展
+# Merg3r -> Gluemap Refinement 缝合进展
 
 ## 目标
 
 验证 **Merg3r coarse pose + Gluemap/COLMAP-style refinement** 是否能在速度可控的前提下提升长序列 pose 质量。
 
-当前阶段仍然是验证型两阶段 pipeline，不构建完整项目管线：
+## 阶段状态
+
+截至 2026-06-11，Merg3r 与 GlueMap refinement 的核心缝合阶段已完成。
+
+当前两阶段 pipeline 已经能够完整跑通：
+
+- A 阶段：Merg3r 前馈推理、sequence 对齐、coarse pose/depth/artifact 导出。
+- B 阶段：读取 A artifacts，构建 `S + P + V`，执行 GlueMap-style SelectTrack、SelectVirtualTrack、reprojection filtering、多轮 augmented BA，并输出 `refined_gluemap_aba/` 与 `virtual_gluemap_aba/`。
+
+最新实验中，切到 `pi3x` 前馈模型并将 S 分支改为原版 GlueMap 风格 SIFT 后，关键数值已经接近原版 GlueMap：
+
+```text
+original GlueMap iter2 real angular:
+  mean=0.2077 deg, median=0.1219 deg, <0.5deg=91.4%
+
+MERG3R+GlueMap, pi3x + SIFT + SPV/star-like iter2:
+  mean=0.2390 deg, median=0.1568 deg, <0.5deg=92.1%
+  final real tracks=103500, original GlueMap ~=103631
+
+MERG3R+GlueMap, pi3x + SIFT + SPV/pose iter2:
+  mean=0.2352 deg, median=0.1587 deg, <0.5deg=92.4%
+```
+
+因此当前主线从“能否缝合并接近原版”切换为“工程化和小优化”：
+
+1. 图片 resize / restore：像原版 GlueMap 一样支持任意分辨率输入，在内部 resize 到模型/跟踪需要的尺寸，并把坐标、内参、输出 reconstruction 恢复到原图域。
+2. 代码整理：把当前验证脚本中的阶段逻辑拆分、命名、配置和 debug 输出整理成更清晰的 pipeline。
+3. 加速：减少重复 SIFT/VGGSfM/virtual-track 计算，增加缓存和更合理的 ablation 开关。
+
+当前仍保留两阶段验证型 pipeline，尚未整理成正式项目管线：
 
 - A 脚本：在 MERG3R 环境中跑到 `align_extrinsics()` 完成，导出 coarse pose、图像、SuperPoint/LightGlue artifacts。
 - B 脚本：在 Gluemap 环境中读取 A artifacts，构建 `S + P` tracks，接入 Gluemap-style intrinsics averaging，并构建 `V` virtual tracks。`SP` 仍走标准 pycolmap BA；`SPV` 已接入 virtual reconstruction、SelectVirtualTrack 和 Gluemap-style augmented BA。
 
 当前可跑两条主线：
 
-- `S`: SuperPoint extraction + LightGlue matching，替代原版 Gluemap 的 SIFT extraction + SIFT matching。
-- `P`: ALIKED query -> VGGSfM prior tracks -> snap to SuperPoint -> TrackEstablishment-like DB writer。
+- `S`: 支持两种来源：
+  - `lightglue`：A 阶段导出的 SuperPoint + LightGlue database，保留为 ablation。
+  - `sift`：B 阶段复刻原版 GlueMap 的 SIFT extraction + matching，是当前推荐主线。
+- `P`: ALIKED query -> VGGSfM prior tracks -> snap to SIFT/SuperPoint -> TrackEstablishment-like DB writer。
 - `SP`: `S + P -> merged DB -> triangulation -> SelectTrack/filter -> standard pycolmap BA`。
 - `SPV`: `S + P + V -> virtual reconstruction -> SelectTrack + SelectVirtualTrack -> reprojection filtering -> augmented BA`。
 
@@ -31,7 +62,7 @@ MERG3R/export_merg3r_refine_inputs.py
 - 复用 Merg3r 的图像加载、sequence 构建、模型推理、`align_extrinsics()`、`restore_predictions_order()`。
 - 在 align 完成后停止，不执行 Merg3r 原有 gradient BA。
 - 基于 aligned pose 构建 pairs。
-- 提取 SuperPoint features，并用 LightGlue 对 pairs 做 matching。
+- 提取 SuperPoint features，并用 LightGlue 对 pairs 做 matching；该分支当前保留为 ablation，最新推荐主线使用 B 阶段 SIFT，不再依赖 A 阶段 LightGlue 数据库作为 S。
 - 额外导出未 mask 的 raw `final_predictions["depth"]`，以及存在时的 `depth_conf`，供 B 阶段 virtual-track 构建使用。
 - 导出 B 脚本需要的 artifacts 到：
 
@@ -54,6 +85,7 @@ MERG3R/export_merg3r_refine_inputs.py
 
 - `raw_geometry.npz` 中的 raw depth/depth_conf 用于 B 阶段复刻 Gluemap virtual-track 构建。
 - `single_frame_depth/` 是 Merg3r aligned pose 同源 dense depth，当前与 BA refine 主线无关，暂不用于 B 阶段。
+- `features_lightglue/` 与 `matches_lightglue.npz` 当前主要用于 `--s_database_mode lightglue` ablation；`--s_database_mode sift` 时 B 阶段会自行构建 SIFT database。
 
 pair 构建当前使用 HLoc-style pose pair：
 
@@ -100,6 +132,9 @@ gluemap/run_merg3r_pycolmap_refine.py
 
 - 读取 A 脚本 artifacts。
 - 使用 A 输出的 `pairs.npy` 构建 VGGSfM groups。
+- 支持两种 group 构建：
+  - `group_strategy=star`：复用 GlueMap `BaseStarDataset` 风格的 star-like pruning。
+  - `group_strategy=pose`：按 camera center distance 从 pair adjacency 中取邻居。
 - 在 low-coverage frame filtering 后，对保留帧的每帧初始内参执行 Gluemap `intrinsics_averaging()`，替代原先的简单全局均值。
 - 保存每帧初始内参、averaged 后的 shared global intrinsic、intrinsics mapping。
 - 构建 Gluemap-style `V` virtual tracks 诊断数据：
@@ -108,8 +143,8 @@ gluemap/run_merg3r_pycolmap_refine.py
   - 使用 filtering 后的 image order，depth/depth_conf 同步 drop 废弃帧。
   - `SP` 模式只写指标；`SPV` 模式会把结果转成 virtual reconstruction 并进入 augmented BA。
 - `track_mode` 目前只保留两个测试入口：`SP` 和 `SPV`。
-- 默认 camera model 已改为 `SIMPLE_PINHOLE`，不再默认沿用 A 阶段 metadata 中的 `PINHOLE`。这样 pycolmap/GlueMap 的 normalized reprojection filter 会使用单 focal 相机模型；当前 averaged `fx/fy` 差异很小，适合作为先跑通 SPV+BA 的默认路径。
-- 每个 frame 可作为 center，邻居来自 pair adjacency。
+- 默认 camera model 已改为 `SIMPLE_PINHOLE`，不再默认沿用 A 阶段 metadata 中的 `PINHOLE`。这样 pycolmap/GlueMap 的 normalized reprojection filter 会使用单 focal 相机模型；在 `pi3x` 路径下该假设与原版 GlueMap/pi3x 更一致，是当前推荐默认路径。
+- 每个 frame 可作为 center，邻居来自 pair adjacency；star-like 和 pose group 的 angular error 已验证差异较小，group strategy 不是当前主瓶颈。
 - group 形式：
 
 ```text
@@ -129,7 +164,7 @@ then frame_id
 ```text
 ALIKED query
 -> VGGSfM tracker
--> snap to same-image SuperPoint keypoints
+-> snap to same-image SIFT/SuperPoint keypoints
 -> 1e-3 KDTree near-duplicate merge
 -> prior COLMAP database
 ```
@@ -140,7 +175,9 @@ ALIKED query
 --vggsfm_query_source aliked       # 默认，旧行为可设为 superpoint
 --aliked_detection_threshold 0.005 # 对齐原版 Gluemap
 --vggsfm_query_points 1024
---prior_snap_to_superpoint
+--vggsfm_tracker_input 1024        # GlueMap-style 1024 tracker input，并映射回当前图像域
+--prior_snap_to_sift               # s_database_mode=sift 时的推荐路径
+--prior_snap_to_superpoint         # s_database_mode=lightglue 时的旧路径
 --prior_snap_threshold 1.0
 --prior_keep_unsnapped
 --prior_keypoint_merge_threshold 1e-3
@@ -149,18 +186,31 @@ ALIKED query
 当前 S 分支：
 
 ```text
-SuperPoint features + LightGlue matches
--> database_lightglue.db
+--s_database_mode lightglue:
+  SuperPoint features + LightGlue matches
+  -> database_lightglue.db
+
+--s_database_mode sift:
+  GlueMap/COLMAP SIFT extraction + matching
+  -> database_sift.db
 ```
 
 当前 SP merge：
 
 ```text
-database_lightglue.db + database_vggsfm_prior.db
--> database_merged.db
+lightglue mode:
+  database_lightglue.db + database_vggsfm_prior.db
+  -> database_merged.db
+
+sift mode:
+  database_vggsfm_prior.db + database_sift.db
+  -> database_merged.db
 ```
 
-merge 时 `primary_features_first=True`，因此每张图前半部分 keypoints 是 S 分支 SuperPoint，后半部分是 P 分支 prior keypoints。这满足原版 `select_tracks_from_merged()` 依赖的 offset 语义。
+merge 后每张图前半部分 keypoints 都保持为 S 分支，后半部分是 P 分支 prior keypoints。这满足原版 `select_tracks_from_merged()` 依赖的 offset 语义：
+
+- `lightglue` mode 通过 `primary_features_first=True` 保持 SuperPoint 在前。
+- `sift` mode 通过原版风格 `primary_features_first=False`，让 secondary `database_sift.db` 排在前。
 
 当前 `SP` 主流程：
 
@@ -171,7 +221,7 @@ count S/P frame observations
 drop low-coverage frames
 intrinsics_averaging on kept frames
 build virtual-track diagnostics
-write LightGlue DB
+write S database (LightGlue or SIFT)
 write VGGSfM prior DB
 merge DBs
 write Merg3r coarse reconstruction
@@ -192,7 +242,7 @@ count S/P frame observations
 drop low-coverage frames
 intrinsics_averaging on kept frames
 build virtual tracks + diagnostics
-write LightGlue DB
+write S database (LightGlue or SIFT)
 write VGGSfM prior DB
 merge DBs
 write Merg3r coarse reconstruction
@@ -450,7 +500,9 @@ B 脚本默认开启 debug，可通过 `--no-debug_print` 关闭。
   - final valid virtual observations。
   - subsample 后 points/group。
   - virtual-track 构建耗时。
-- LightGlue DB 写入规模。
+- S database 写入规模：
+  - LightGlue mode: SuperPoint/LightGlue keypoints/matches。
+  - SIFT mode: SIFT keypoints/matches。
 - Prior snap 统计：
   - total snapped / unsnapped / dropped
   - mean/max snap distance
@@ -818,9 +870,67 @@ ValueError: Check failed: idxs.size() == 1 (2 vs. 1)
 
 原因是本次使用 `PINHOLE` camera model，pycolmap 的 `camera.focal_length` 只支持单 focal 模型；`PINHOLE` 有 `fx/fy` 两个 focal 参数。为快速跑通当前 SPV+BA 主线，B 脚本默认 camera model 已切到 `SIMPLE_PINHOLE`。后续如果要继续支持 `PINHOLE`，应把 `reprojection_error.py` 中 normalized error 的 focal 归一化改成 `mean(camera.params[camera.focal_length_idxs()])`。
 
+### 009：pi3x + SIFT as S 后接近原版 GlueMap
+
+背景：
+
+- 早期测试实际使用 `vggt_omega`，其当前导出路径没有约束 `fx=fy`。
+- 当前 B 阶段默认 `SIMPLE_PINHOLE`，并使用 GlueMap-style shared intrinsic。
+- 这会让 `vggt_omega` 的非 `fx=fy` K 与 B 阶段相机假设不一致，导致 real angular error 长期停在 `mean ~= 0.58-0.61 deg`。
+- 切换到 `pi3x` 后，mogo 内参恢复隐式约束 `fx=fy`，与原版 GlueMap/pi3x 和当前 `SIMPLE_PINHOLE` 更一致。
+- 再把 S 分支从 LightGlue 改为原版风格 SIFT 后，S-only 和 P-only angular error 都明显改善。
+
+关键日志：
+
+```text
+spv_log/logs_181_spv_all_09_sift_debug.log
+spv_log/logs_181_spv_all_10_pose_debug.log
+```
+
+star-like + SIFT：
+
+```text
+SIFT DB ready: keypoints=115553, pairs=442, matches=25067
+Prior DB written: input_tracks=156119, pairs=2508, raw_kp=727558
+
+iter 2:
+  S-only mean=0.1819, median=0.1193, <0.5deg=94.4%
+  P-only mean=0.2415, median=0.1586, <0.5deg=92.0%
+  real mean=0.2390, median=0.1568, <0.5deg=92.1%
+  Final: 103500 real tracks, 20782 virtual tracks
+```
+
+pose group + SIFT：
+
+```text
+SIFT DB ready: keypoints=122104, pairs=355, matches=21763
+Prior DB written: input_tracks=156529, pairs=2801, raw_kp=800540
+
+iter 2:
+  S-only mean=0.1675, median=0.1075, <0.5deg=95.4%
+  P-only mean=0.2377, median=0.1608, <0.5deg=92.2%
+  real mean=0.2352, median=0.1587, <0.5deg=92.4%
+  Final: 99437 real tracks, 20851 virtual tracks
+```
+
+原版 GlueMap 对照：
+
+```text
+iter 2:
+  real mean=0.2077, median=0.1219, <0.5deg=91.4%
+  final real tracks ~= 103631
+```
+
+结论：
+
+- Merg3r + GlueMap SPV/ABA 缝合链路已经完成，数值已接近原版 GlueMap。
+- 此前 high angular error 的主因不是 virtual tracks、star group 或 pair density，而是 `vggt_omega` 的 K/camera 假设与 `SIMPLE_PINHOLE` 不一致。
+- 在 `pi3x + SIFT as S` 下，S-only/P-only 都进入合理范围，说明当前剩余差异更多是工程 parity 和实现细节，不是核心流程缺失。
+- star-like 与 pose group 的 angular error 差别很小；若目标是贴近原版，仍建议保留 star-like 作为正式对齐方向，pose 可作为 sanity check。
+
 ## 当前与原版 Gluemap refinement 的差异
 
-当前仍不是完整 Gluemap refinement。
+当前核心 refinement 链路已经贴近原版 Gluemap，但仍不是完全同构实现。
 
 原版 Gluemap 默认：
 
@@ -868,34 +978,25 @@ per iteration:
 - 没有原版 `pose_inconsistent`。当前 center-local extrinsics 直接由 global w2c 构造，因此 local/global pose discrepancy 近似为 0；若后续引入独立 local star pose 或 global pose averaging，需要补 pose-inconsistent diagnostics/pruning。
 - `predictions_dict["tracks"]` 的真实 P tracks 没有复刻成原版 tensor 结构；real tracks 仍通过 COLMAP database + pycolmap triangulation 产生。
 - `SPV` 的 augmented BA 是 Merg3r-adapted GlueMap 流程，不是直接调用原版 `run_refinement_pipeline()` 的完整输入。
-- 默认 camera model 已改为 `SIMPLE_PINHOLE`，便于先跑通当前 pycolmap fallback filter；若需要保留 `PINHOLE`，需要修 normalized reprojection focal 归一化。
+- 默认 camera model 已改为 `SIMPLE_PINHOLE`，与当前 `pi3x` 主线更一致；若需要保留 `PINHOLE`，需要修 normalized reprojection focal 归一化。
+- 当前还没有原版 GlueMap 的任意输入分辨率 resize/restore 工程能力；A 阶段目前默认输入已经是预处理好的同域图像。
 
 ## 当前判断
 
-当前最合理主线分两步：
+缝合阶段已经结束。当前最合理主线是：
 
 ```text
-SP baseline:
 Merg3r aligned coarse pose
--> HLoc-style pose pairs
--> SuperPoint/LightGlue S
--> ALIKED query + VGGSfM P
--> snap P to SuperPoint where possible
+-> dense/pose pairs
+-> SIFT S database
+-> ALIKED query + VGGSfM P on 1024 tracker input
+-> snap P to SIFT where possible
 -> keep unsnapped P
 -> 1e-3 P near-duplicate merge
 -> drop low-coverage frames
 -> Gluemap intrinsics_averaging
--> build VirtualTrack diagnostics
+-> build VirtualTracks
 -> merged DB
--> pycolmap triangulation
--> SelectTrack
--> angular reprojection filter
--> pycolmap BA
-```
-
-```text
-SPV validation:
-SP baseline through merged DB/coarse reconstruction
 -> build virtual reconstruction
 -> repeat num_refinement_iterations:
    triangulate real reconstruction
@@ -911,9 +1012,11 @@ SP baseline through merged DB/coarse reconstruction
 - ALIKED query 比 SuperPoint query 更像原版设计，也显著提升 P coverage。
 - snap rate 低是正常现象，不是当前瓶颈。
 - SelectTrack + reprojection filter 是当前最明确有效的增益点。
-- `SPV` augmented BA 的链路已接通，下一步需要用 `SIMPLE_PINHOLE` 默认重跑，确认能越过 normalized filter 并完成两轮 refinement。
+- `SPV` augmented BA 的链路已接通，并已完成两轮 refinement 输出。
+- `pi3x + SIMPLE_PINHOLE + SIFT as S` 是当前最接近原版 GlueMap 的组合。
+- `vggt_omega` 路径如果继续支持，需要单独处理 camera model / `fx=fy` 假设，不应直接混入当前主线结论。
 - 当前没有 `pose_inconsistent` 的直接风险较低，因为 local group extrinsics 和 global pose 同源；后续若引入原版 GlobalGluer/pose averaging，需要补 diagnostics。
-- 最终质量仍需以 Gaussian 训练结果判断，不应只看 BA reprojection cost。
+- 现在的重点不再是验证能否接近原版，而是工程化、resize/restore、代码整理和加速。
 
 ## Depth 与 refined pose 的同源性
 
@@ -965,21 +1068,28 @@ python MERG3R/export_merg3r_refine_inputs.py \
   --output_dir /path/to/output
 ```
 
-B 脚本当前主线：
+B 脚本当前推荐主线：
 
 ```bash
 python gluemap/run_merg3r_pycolmap_refine.py \
   --artifact_dir /path/to/output/gluemap_refine_inputs \
-  --track_mode SP \
+  --track_mode SPV \
+  --s_database_mode sift \
   --vggsfm_query_source aliked \
+  --vggsfm_tracker_input 1024 \
+  --group_strategy star \
   --enable_select_tracks \
-  --enable_reprojection_filter
+  --enable_reprojection_filter \
+  --num_refinement_iterations 2 \
+  --augmented_ba_max_filter_iterations 3
 ```
 
 说明：
 
 - 当前默认 `--camera_model SIMPLE_PINHOLE`。如果显式传 `--camera_model PINHOLE`，旧 pycolmap 版本的 Python fallback normalized reprojection filter 仍可能因 `camera.focal_length` 只支持单 focal 而报错。
 - 当前默认 `--build_virtual_tracks`，因此 A artifacts 需要包含 `raw_geometry.npz`。
+- 当前 `--s_database_mode sift` 更贴近原版 GlueMap，也是最新数值接近原版的推荐配置；`lightglue` 主要保留为 ablation。
+- `--group_strategy star` 更贴近原版 star graph；`pose` 可作为 sanity check，当前 angular error 差别不大。
 - 如果只想复现旧的 `S + P -> BA` 主线，可加：
 
 ```bash
@@ -992,17 +1102,17 @@ python gluemap/run_merg3r_pycolmap_refine.py \
 --save_virtual_tracks_debug
 ```
 
-B 脚本 SPV / augmented BA：
+B 脚本 SP / standard BA ablation：
 
 ```bash
 python gluemap/run_merg3r_pycolmap_refine.py \
   --artifact_dir /path/to/output/gluemap_refine_inputs \
-  --track_mode SPV \
+  --track_mode SP \
+  --s_database_mode sift \
   --vggsfm_query_source aliked \
+  --vggsfm_tracker_input 1024 \
   --enable_select_tracks \
-  --enable_reprojection_filter \
-  --num_refinement_iterations 2 \
-  --augmented_ba_max_filter_iterations 3
+  --enable_reprojection_filter
 ```
 
 常用 ablation：
@@ -1021,6 +1131,12 @@ python gluemap/run_merg3r_pycolmap_refine.py \
 # 增加 VGGSfM group 邻居
 --neighbors_per_center 16
 --neighbors_per_center 24
+
+# 切换到 pose group sanity check
+--group_strategy pose
+
+# 旧 S 分支 ablation
+--s_database_mode lightglue
 
 # 跳过 virtual-track diagnostics
 --no-build_virtual_tracks
@@ -1043,42 +1159,97 @@ python -m py_compile gluemap/gluemap/estimators/track_snapping.py
 
 实际运行环境在云端，本地不验证完整 AI/SfM 依赖。
 
-## 后续候选方向
+## 下一阶段优化方向
 
-短期：
+缝合验证阶段结束后，下一阶段目标是小幅工程优化，不再优先大改核心算法。
 
-- 用 Gaussian 训练最终产物比较：
-  - 005：ALIKED query，无 SelectTrack/filter。
-  - 006：ALIKED query + SelectTrack + 0.5deg filter。
-  - 006 + `--filter_reproj_error_threshold 0.75`。
-  - 006 + `--filter_reproj_error_threshold 1.0`。
-- 观察 0.5deg filter 是否导致局部覆盖不足或 pose connectivity 变弱。
-- 重跑修正后的 generation validity 统计，重点看：
-  - generation center/neighbor valid observations。
-  - generation pair coverage。
-  - generation negative observations。
-  - 与 `_update_virtual_tracks` 后指标的差异。
-- 用默认 `SIMPLE_PINHOLE` 重跑 `track_mode=SPV`，确认能越过 augmented BA 后的 normalized reprojection filter，并完整写出 `refined_gluemap_aba/` 与 `virtual_gluemap_aba/`。
-- 对比 `SP` vs `SPV`：
-  - real points / observations。
-  - virtual points / observations。
-  - augmented BA cost 与 termination。
-  - Gaussian 训练结果。
-- 对 BA 前后 track length、每帧 points coverage 做进一步 debug。
-- 加 local/global relative pose inconsistency diagnostics，判断当前是否需要复刻原版 `pose_inconsistent` pruning。
-- 如果 Gaussian 训练需要原图文件名，修复 artifact image naming。
-- 暂不处理 TSDF/depth-pose mismatch；当前只记录现象，主线仍专注 pose。
+### 1. 图片 resize / restore
 
-中期：
+目标：像原版 GlueMap 一样支持任意分辨率输入图片。
 
-- 尝试增大 `neighbors_per_center` 到 16/24，评估 P coverage、filter 后剩余 tracks、BA 稳定性与下游质量。
-- 评估 BA 后 per-frame depth correction，用 refined sparse geometry 校正 A 阶段 dense depth，再用于 TSDF/mesh。
-- 如果需要继续支持 `PINHOLE`，修复 `gluemap/math/reprojection_error.py` 中 normalized error 对多 focal 相机的归一化。
-- 对 SPV 的多轮外层循环做稳定性评估：第一轮从 coarse reconstruction 开始，后续轮使用上一轮 augmented BA 后的 real/virtual reconstruction。
+当前限制：
 
-长期：
+- A 阶段默认输入图片已经是预处理好的尺寸。
+- A 导出的 image、depth、intrinsic 当前假设同域。
+- B 阶段 tracker input 已支持 GlueMap-style 1024，但完整 pipeline 还没有“原图域 <-> 处理域 <-> 输出域”的统一坐标恢复机制。
 
-- 若验证效果稳定，再把 A/B 两阶段整理成正式 pipeline。
-- 支持更完整的 camera/intrinsics mapping。
-- 支持高分辨率图像路径与低分辨率坐标缩放。
-- 评估是否进一步迁移原版 GlobalGluer / pose averaging / pose_inconsistent pruning。
+计划：
+
+- A 阶段记录原始 image size、处理后 image size、resize scale、padding/crop 信息。
+- 所有 2D keypoints / tracks / virtual tracks 在内部处理域运行，但写 COLMAP reconstruction 时能恢复到原图域。
+- intrinsic 按 resize scale 做一致变换：
+  - 处理域 K 用于模型、tracking、virtual-track generation。
+  - 输出域 K 用于最终 reconstruction / 下游 Gaussian。
+- depth / depth_conf 与 image resize 保持同域；如需输出原图域 depth，增加 restore 逻辑。
+- 明确 `artifact_image_names` 与 `original_image_names` 的映射，必要时最终 reconstruction 恢复原始 basename。
+
+验收：
+
+- 任意输入分辨率图片可以直接传入 A 阶段，不需要用户预先 resize。
+- B 阶段输出的 COLMAP image size、intrinsic、keypoints 坐标域一致。
+- 与当前预 resize 输入相比，数值指标没有明显退化。
+
+### 2. 代码整理
+
+目标：把当前验证脚本整理成可维护的两阶段 pipeline。
+
+计划：
+
+- 拆分 `run_merg3r_pycolmap_refine.py` 中的长函数：
+  - artifact loading / filtering
+  - S database construction
+  - P prior tracking/database writing
+  - virtual-track construction
+  - triangulation / SelectTrack / filtering
+  - augmented BA
+  - stats/debug writer
+- 统一配置命名，把实验遗留参数分成：
+  - recommended path
+  - ablation switches
+  - debug-only switches
+- 清理 LightGlue legacy 路径，保留为明确的 `s_database_mode=lightglue` ablation。
+- 把 star/pose group、SIFT/LightGlue、SP/SPV 的 stats 输出统一字段，便于后续横向比较。
+- 将“场景外远点”相关诊断加入 stats，而不是直接做硬删除：
+  - `xyz_norm`
+  - depth 分位数
+  - track length
+  - triangulation angle
+  - S-only / P-only / mixed 来源。
+
+验收：
+
+- 默认命令就是当前推荐主线。
+- ablation 参数不会改变无关路径。
+- `refine_stats.json` 和 `virtual_track_stats.json` 字段稳定、可比较。
+
+### 3. 加速
+
+目标：减少重复计算，让常用 ablation 更快。
+
+候选优化：
+
+- 缓存 SIFT database：
+  - 同一组 image/pairs/intrinsic 不重复 extract/match。
+- 缓存 VGGSfM prior tracks：
+  - group strategy、neighbors、tracker input、query source 不变时复用。
+- 缓存 virtual-track diagnostics：
+  - image/depth/extrinsic/K/groups 不变时复用。
+- 减少重复 pycolmap triangulation 输出目录 IO。
+- 对 debug 统计增加轻量/完整两级：
+  - 默认只打印核心数值。
+  - `--debug_full_stats` 再计算昂贵分桶。
+- 对 SIFT/BA/virtual-track 阶段分别记录 wall time，优先优化耗时最高环节。
+
+验收：
+
+- 常规 `pi3x + SIFT + SPV` 实验重跑速度下降。
+- star/pose、filter threshold、SP/SPV 等 ablation 能复用前置缓存。
+- 加速不改变默认数值输出。
+
+### 保留观察项
+
+- 继续用 Gaussian 训练最终产物做质量判断，不只看 BA reprojection cost。
+- 保留 `SP` vs `SPV` 对照。
+- 保留 `star` vs `pose` 严格对照，但当前不作为主瓶颈。
+- 暂不优先处理 TSDF/depth-pose mismatch；若后续需要 refined pose + dense depth，再做 BA 后 per-frame depth correction。
+- 如果后续继续支持 `vggt_omega`，单独评估 `PINHOLE` 或 A 阶段强制/恢复 `fx=fy`，避免复现非 `fx=fy` K 强行进入 `SIMPLE_PINHOLE` 的问题。
