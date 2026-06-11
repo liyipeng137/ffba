@@ -22,12 +22,18 @@
 | `logs_181_spv_all_05_1024.log` | tracker input=1024 | iter 1 | 0.5947 | 0.4420 | 56.1% | 216,432 obs / 8,406 tracks |
 | `logs_181_spv_all_05_1024.log` | tracker input=1024 | iter 2 | 0.5827 | 0.4260 | 57.7% | 211,230 obs / 8,067 tracks |
 | `logs_181_spv_all_06_1024_star.log` | tracker input=1024, star-like group | iter 1 | 0.5956 | 0.4314 | 57.0% | 201,483 obs / 7,918 tracks |
-| `logs_181_spv_all_08_1024_star_debug.log` | pi3x, tracker input=1024, star-like group | iter 1 | 0.3501 | 0.2419 | 82.6% | 79,078 obs / 1,732 tracks |
-| `logs_181_spv_all_08_1024_star_debug.log` | pi3x, tracker input=1024, star-like group | iter 2 | 0.3230 | 0.2113 | 84.6% | 69,737 obs / 1,395 tracks |
+| `logs_181_spv_all_08_1024_star_debug.log` | pi3x, LightGlue as S, tracker input=1024, star-like group | iter 1 | 0.3501 | 0.2419 | 82.6% | 79,078 obs / 1,732 tracks |
+| `logs_181_spv_all_08_1024_star_debug.log` | pi3x, LightGlue as S, tracker input=1024, star-like group | iter 2 | 0.3230 | 0.2113 | 84.6% | 69,737 obs / 1,395 tracks |
+| `logs_181_spv_all_09_sift_debug.log` | pi3x, SIFT as S, tracker input=1024, star-like group | iter 1 | 0.2835 | 0.2040 | 89.7% | 57,260 obs / 1,554 tracks |
+| `logs_181_spv_all_09_sift_debug.log` | pi3x, SIFT as S, tracker input=1024, star-like group | iter 2 | 0.2390 | 0.1568 | 92.1% | 43,590 obs / 1,065 tracks |
+| `logs_181_spv_all_10_pose_debug.log` | pi3x, SIFT as S, tracker input=1024, pose group | iter 1 | 0.2758 | 0.2057 | 90.4% | 未完整记录 |
+| `logs_181_spv_all_10_pose_debug.log` | pi3x, SIFT as S, tracker input=1024, pose group | iter 2 | 0.2352 | 0.1587 | 92.4% | 45,091 obs / 958 tracks |
 
 阶段性结论：早期测试使用的前馈模型是 `vggt_omega`，其当前实现没有约束 `fx=fy`。在 B 阶段使用 `SIMPLE_PINHOLE` 和 GlueMap 风格 shared intrinsic 时，这会导致相机模型约束与导出 K 的假设不一致，表现为 real angular error 长期停在 `mean ~= 0.58-0.61 deg, median ~= 0.42-0.44 deg`。
 
 切换到 `pi3x` 后，pi3x 使用 mogo 恢复内参，隐式约束 `fx=fy`，与原版 GlueMap 的 pi3x 逻辑及当前 `SIMPLE_PINHOLE` 更一致。重新跑后 real angular error 改善到 `mean=0.3501 deg, median=0.2419 deg, <0.5deg=82.6%`，已经明显接近原版 GlueMap iter 1 的 `mean=0.2926 deg, median=0.2138 deg, <0.5deg=85.7%`。
+
+进一步把 S 分支从 A 阶段导出的 LightGlue database 改为原版 GlueMap 风格的 SIFT extract + match 后，real angular error 已经达到或接近原版量级：star-like group 下 iter 2 为 `mean=0.2390 deg, median=0.1568 deg, <0.5deg=92.1%`，pose group 下 iter 2 为 `mean=0.2352 deg, median=0.1587 deg, <0.5deg=92.4%`。
 
 ## 已做实验
 
@@ -201,6 +207,146 @@ Final: 72022 real tracks (366057 obs), 21005 virtual tracks (520852 obs)
 - 切到 pi3x 后，相机内参约束与原版 GlueMap/pi3x 更一致，因此 real angular error 大幅改善；
 - 当前剩余差距主要集中在 S-only，而不是 P-only。
 
+### 6. S 分支从 LightGlue 改为原版 GlueMap 风格 SIFT
+
+背景：
+
+- 原版 GlueMap 的 S 分支是 `database_sift.db`；
+- 当前融合脚本此前使用 A 阶段导出的 LightGlue database 作为 S；
+- 为贴近原版，B 脚本新增 `s_database_mode=sift`，不再依赖 A 阶段导出的 LightGlue 特征和匹配；
+- prior track snap 逻辑对应增加 `prior_snap_to_sift`，让 P/prior keypoint 尝试 snap 到当前 SIFT keypoint。
+
+新日志：`spv_log/logs_181_spv_all_09_sift_debug.log`
+
+配置：
+
+```text
+SIFT DB ready: keypoints=115553, pairs=442, matches=25067
+Prior snap to sift: snapped=7259, unsnapped_kept=720299, mean_dist=0.688,
+center_snap=0.5%, neighbor_snap=1.1%
+Prior DB written: input_tracks=156119, tracks=156119, pairs=2508,
+raw_kp=727558, merged_kp=725690
+```
+
+iter 1：
+
+```text
+SelectTrack: kept 7781 SIFT + 98097/148094 non-SIFT, removed 49997
+SelectTrack: points=155875 -> 105878, observations=722586 -> 545479
+S-only: tracks=7781, track_obs=22889, mean=0.2225, median=0.1549, <0.5deg=92.3%
+P-only: tracks=98097, track_obs=522590, mean=0.2862, median=0.2063, <0.5deg=89.6%
+real: angular reprojection errors: mean=0.2835 deg, median=0.2040 deg, < 0.5 deg: 89.7%
+```
+
+iter 2：
+
+```text
+SelectTrack: kept 7797 SIFT + 97969/148131 non-SIFT, removed 50162
+SelectTrack: points=155928 -> 105766, observations=723339 -> 545390
+S-only: tracks=7797, track_obs=22976, mean=0.1819, median=0.1193, <0.5deg=94.4%
+P-only: tracks=97969, track_obs=522414, mean=0.2415, median=0.1586, <0.5deg=92.0%
+real: angular reprojection errors: mean=0.2390 deg, median=0.1568 deg, < 0.5 deg: 92.1%
+Final: 103500 real tracks (490627 obs), 20782 virtual tracks (512471 obs)
+```
+
+观察：
+
+- SIFT DB 的 match 数量不比 LightGlue 多，甚至更少，但 S-only angular error 明显更好；
+- LightGlue as S 的 iter 2 S-only 为 `mean=0.4907, median=0.3346, <0.5deg=64.7%`；
+- SIFT as S 的 iter 2 S-only 降到 `mean=0.1819, median=0.1193, <0.5deg=94.4%`；
+- P-only 也随之从 LightGlue as S 的 `mean=0.2849, median=0.1960, <0.5deg=89.2%` 改善到 `mean=0.2415, median=0.1586, <0.5deg=92.0%`；
+- final real points 达到 103,500，已经非常接近原版 GlueMap 的 103,631。
+
+判断：
+
+- 在 pi3x 修正 K/camera 假设后，剩余主要差距确实来自 S 分支；
+- SIFT 的数量不一定更多，但几何质量更贴近原版 GlueMap 的三角化/SelectTrack 假设；
+- SIFT as S 后，当前融合流程的 angular error 和 final real point 数量都已接近原版。
+
+### 7. pose group 与 star-like group 对照
+
+新日志：`spv_log/logs_181_spv_all_10_pose_debug.log`
+
+配置：
+
+- `s_database_mode=sift`
+- `vggsfm_tracker_input=1024`
+- `group_strategy=pose`
+- 当前日志从 `SIFT DB ready` 后开始截取，没有包含完整 header。
+
+关键结果：
+
+```text
+SIFT DB ready: keypoints=122104, pairs=355, matches=21763
+Prior snap to sift: snapped=7883, unsnapped_kept=792657, mean_dist=0.690,
+center_snap=0.5%, neighbor_snap=1.1%
+Prior DB written: input_tracks=156529, tracks=156529, pairs=2801,
+raw_kp=800540, merged_kp=798478
+```
+
+iter 1：
+
+```text
+SelectTrack: kept 7534 SIFT + 93857/148625 non-SIFT, removed 54768
+SelectTrack: points=156159 -> 101391, observations=794965 -> 581328
+S-only: tracks=7534, track_obs=21075, mean=0.2077, median=0.1467, <0.5deg=93.7%
+P-only: tracks=93857, track_obs=560253, mean=0.2784, median=0.2080, <0.5deg=90.2%
+real: angular reprojection errors: mean=0.2758 deg, median=0.2057 deg, < 0.5 deg: 90.4%
+```
+
+iter 2：
+
+```text
+SelectTrack: kept 7539 SIFT + 94026/148676 non-SIFT, removed 54650
+SelectTrack: points=156215 -> 101565, observations=795708 -> 583137
+S-only: tracks=7539, track_obs=21162, mean=0.1675, median=0.1075, <0.5deg=95.4%
+P-only: tracks=94026, track_obs=561975, mean=0.2377, median=0.1608, <0.5deg=92.2%
+real: angular reprojection errors: mean=0.2352 deg, median=0.1587 deg, < 0.5 deg: 92.4%
+Final: 99437 real tracks (525608 obs), 20851 virtual tracks (520596 obs)
+```
+
+与 star-like + SIFT 对比：
+
+| 指标 | star-like + SIFT | pose + SIFT | 判断 |
+| --- | ---: | ---: | --- |
+| iter 1 real mean | 0.2835 | 0.2758 | 基本一致，pose 略低 |
+| iter 2 real mean | 0.2390 | 0.2352 | 基本一致 |
+| iter 2 `<0.5deg` | 92.1% | 92.4% | 基本一致 |
+| final real tracks | 103,500 | 99,437 | pose 少约 4k |
+| final virtual tracks | 20,782 | 20,851 | 基本一致 |
+
+观察：
+
+- pose group 的 angular error 与 star-like 差别很小；
+- pose group 产生的 prior DB 更密，`raw_kp=800540` 高于 star-like 的 `727558`；
+- 但 pose 的 SelectTrack 剪枝更重，final real tracks 比 star-like 少约 4k；
+- 这次对比里 SIFT DB 本身也有差异，`pairs/matches/keypoints` 不完全一致，因此不是严格只改 `group_strategy` 的 A/B 对照。
+
+判断：
+
+- `group_strategy` 不是当前 angular error 的主要影响项；
+- 如果目标是贴近原版 GlueMap，star-like 仍然是更合理默认；
+- pose 可作为 sanity check，但目前没有证据说明它优于 star-like。
+
+### 8. star 图结构确认
+
+GlueMap 的 star 图构建没有 camera-center radius 或 spatial radius 配置。相关控制主要是：
+
+- `valid_dg_threshold`：Doppelgangers score 过滤；
+- `max_neighbors` / 当前 B 脚本的 `neighbors_per_center`：每个 center 最多保留多少邻居；
+- `sequential_edges` / 当前 B 脚本的 `star_sequential_window`：可选保留顺序边；
+- connectivity repair：如果图断开，会补回部分边保证连通。
+
+star group 内部结构是：
+
+```text
+center_i -> [neighbor_a, neighbor_b, neighbor_c, ...]
+```
+
+单个 group 不会递归展开 neighbor-of-neighbor。全局图当然可以有多跳路径，例如 `frame_0 -- frame_1 -- frame_2`，但每个 star inference/refinement group 只使用 center 的直接邻居。
+
+在当前 `skip_doppelgangers=True` 时，如果所有 pair score 都设为 `1.0`，star-like group 的 top-K 邻居选择没有真实 score 区分，更多依赖输入 pair 顺序和 connectivity repair；pose group 则按 camera-center distance 排 direct neighbors。这解释了两者结果相近但不完全一致。
+
 ## 与原版 GlueMap 流程的关键差异
 
 ### 数据库 merge 本身基本一致
@@ -218,7 +364,7 @@ merge_colmap_databases(
 
 这会让 SIFT keypoints 在 merged DB 中排在前面，tracks/prior keypoints 排在后面。
 
-当前 B 脚本调用：
+当前 B 脚本在 `s_database_mode=lightglue` 时调用：
 
 ```python
 merge_colmap_databases(
@@ -231,7 +377,18 @@ merge_colmap_databases(
 
 这同样让 S/LightGlue keypoints 在前，P/prior keypoints 在后。
 
-因此，当前 `sift_count`/`s_keypoint_count` 分区与原版 SelectTrack 的前后区间逻辑是一致的。
+当前 B 脚本在 `s_database_mode=sift` 时已改为更贴近原版：
+
+```python
+merge_colmap_databases(
+    database_vggsfm_prior,
+    database_sift,
+    database_merged,
+    primary_features_first=False,
+)
+```
+
+因此，当前 `sift_count`/`s_keypoint_count` 分区与原版 SelectTrack 的前后区间逻辑是一致的。SIFT mode 下，数据库 merge 顺序也已经贴近原版 GlueMap。
 
 ### prior database 构建方式仍有差异
 
@@ -247,7 +404,7 @@ merge_colmap_databases(
 - 内部通过 `tracks_to_keypoints_and_matches(...)` 把 VGGSfM tracks 转成 keypoints/matches；
 - 当前实现会把同一条 prior track 的所有 observations 做 all-pairs clique correspondences。
 
-这个差异可能影响三角化出来的 P-only track 结构，但由于 S-only 也偏高，它未必是 angular error 偏高的首要原因。
+这个差异可能影响三角化出来的 P-only track 结构。当前 SIFT mode 已经让 angular error 和 final real points 接近原版，因此它更像是后续做 strict parity 时需要继续收敛的差异，而不是此前 `mean ~= 0.60 deg` 的首要原因。
 
 ## 当前判断
 
@@ -258,41 +415,47 @@ merge_colmap_databases(
 3. group 改为 star-like 后，angular error 仍基本不变。
 4. 使用 `vggt_omega` 时，S-only 与 P-only angular error 都高，且 `mixed=0`。
 5. 切换到 `pi3x` 后，P-only angular error 大幅改善，整体 real angular error 接近原版；说明 camera/K 约束一致性是此前最大问题。
+6. S 分支从 LightGlue 改为原版风格 SIFT 后，S-only、P-only 和整体 angular error 都进一步接近原版。
+7. star-like 与 pose group 的 angular error 差别很小，group strategy 不是当前主影响项。
 
-因此当前最可疑方向是：
+因此当前判断是：
 
 1. 对 `vggt_omega` 路径，需要明确是否应该使用 `PINHOLE` 或在 A 阶段强制/恢复 `fx=fy` 后再进 B；
-2. 对当前 `pi3x` 路径，剩余差距主要集中在 S-only，可能来自 SuperPoint/LightGlue 与原版 SIFT 的匹配差异、S keypoint 坐标域、或 LightGlue DB 写入/过滤策略；
-3. 当前 prior DB 的 all-pairs clique 构建方式仍不同于原版 `TrackEstablishment` 的 star correspondence，但它已不是解释 pi3x 后整体 angular error 的首要问题。
+2. 对当前 `pi3x + SIFT` 路径，angular error 已接近原版，主要关注点应转向 strict parity：final real observations、pair graph、frame filtering、prior DB 构建方式是否与原版一致；
+3. 当前 prior DB 的 all-pairs clique 构建方式仍不同于原版 `TrackEstablishment` 的 star correspondence，但它已不是解释此前高 angular error 的首要问题。
 
 ## 建议下一步 debug
 
-### A. 先隔离 S-only
+### A. 做严格 star vs pose 对照
 
-只跑当前 MERG3R coarse pose + global K + `database_lightglue.db`：
+用完全相同的 A 输出、frame filtering 结果和 SIFT DB 输入，只切换：
 
-- 不引入 P/prior；
-- 不引入 virtual tracks；
-- triangulate 后直接统计 angular error。
-
-目的：
-
-- 如果 S-only 仍是 `mean ~= 0.6`，问题基本在 camera/K/坐标域或 S match 本身；
-- 如果只跑 S 明显变好，则问题可能来自 merged DB、SelectTrack 或 P/S 并存后的三角化行为。
-
-### B. 比较 shared K vs per-frame K
-
-用同一套 S 数据库做两次 coarse reconstruction/triangulation：
-
-1. `intrinsics_averaging` 后的 shared K；
-2. 每帧 MERG3R 初始 K。
+- `group_strategy=star`
+- `group_strategy=pose`
 
 目的：
 
-- 判断 global K 是否把 angular error 放大；
-- 特别检查 `SIMPLE_PINHOLE` 是否过强约束了 `fx/fy`。
+- 排除当前 `logs_181_spv_all_09_sift_debug.log` 与 `logs_181_spv_all_10_pose_debug.log` 中 SIFT DB 自身不一致带来的干扰；
+- 确认 group strategy 对 final real tracks 少约 4k 的影响是否稳定。
 
-### C. 打印 keypoint 坐标域诊断
+### B. 对齐原版 prior DB 构建方式
+
+尝试把当前 VGGSfM prior tracks 组织成 `predictions_dict["tracks"] / ["scores"] / ["indexes"]`，复用原版 `prepare_glomap_prior(...)` 或 `TrackEstablishment.establish_keypoints_and_correspondences(...)` 生成 prior database。
+
+目的：
+
+- 排除 `tracks_to_keypoints_and_matches` 的 all-pairs clique 与原版 star correspondence 差异；
+- 让 P/prior database 更贴近原版 GlueMap；
+- 观察 final real observations 和 SelectTrack 剪枝行为是否更接近原版。
+
+### C. 固定 181 帧与 frame filtering
+
+目的：
+
+- 当前部分日志显示 merged DB 为 179 images，说明 frame filtering 可能 drop 了帧；
+- 若要与原版 181 帧严格比较，需要固定 drop 策略，或先关闭低覆盖帧过滤。
+
+### D. 继续保留 keypoint 坐标域诊断
 
 对 S keypoints 和 P keypoints 分别打印：
 
@@ -305,20 +468,13 @@ merge_colmap_databases(
 
 - 排除坐标映射、width/height、1024 -> artifact image 域回映射污染等问题。
 
-### D. 直接评估 pose/K 的 epipolar consistency
+### E. 对 vggt_omega 路径单独决策 camera model
 
-抽样 LightGlue matches，用当前 MERG3R `R,t,K` 直接计算 pair-level epipolar/angular residual，不经过三角化。
+如果后续仍要支持 `vggt_omega`：
 
-目的：
-
-- 如果 epipolar residual 已经高，说明 camera/K 与 2D matches 不一致；
-- 如果 epipolar residual 低但 triangulation angular 高，再查数据库写入、triangulation options 和 track 构建。
-
-### E. 对齐 prior DB 构建方式
-
-尝试把当前 VGGSfM prior tracks 组织成 `predictions_dict["tracks"] / ["scores"] / ["indexes"]`，复用原版 `prepare_glomap_prior(...)` 或 `TrackEstablishment.establish_keypoints_and_correspondences(...)` 生成 prior database。
+- 评估是否应使用 `PINHOLE` 而不是 `SIMPLE_PINHOLE`；
+- 或在 A 阶段对导出内参显式恢复/约束 `fx=fy`。
 
 目的：
 
-- 排除 `tracks_to_keypoints_and_matches` 的 all-pairs clique 与原版 star correspondence 差异；
-- 让 P/prior database 更贴近原版 GlueMap。
+- 避免再次把非 `fx=fy` 的 K 强行喂给 `SIMPLE_PINHOLE`，复现 `mean ~= 0.60 deg` 的错误模式。
