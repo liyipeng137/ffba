@@ -21,7 +21,7 @@ def _ensure_local_bae_on_path():
         sys.path.insert(0, _LOCAL_BAE_ROOT)
 
 
-_ensure_local_bae_on_path()
+# _ensure_local_bae_on_path()
 
 import pypose as pp
 import torch.nn as nn
