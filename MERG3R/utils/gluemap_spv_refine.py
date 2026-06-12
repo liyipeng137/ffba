@@ -134,9 +134,15 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
     output_dir.mkdir(parents=True, exist_ok=True)
 
     t_start = time.time()
-    images_dir, image_names = _save_work_images(coarse_state.images, output_dir)
-    image_size_hw = tuple(coarse_state.image_size_hw)
-    initial_intrinsics_all = np.asarray(coarse_state.intrinsic, dtype=np.float64)
+    images_dir, image_names = _save_work_images(coarse_state.high_images, output_dir)
+    image_size_hw = tuple(coarse_state.high_image_size_hw)
+    depth_image_size_hw = tuple(coarse_state.low_image_size_hw)
+    initial_intrinsics_high_all = np.asarray(
+        coarse_state.intrinsic_high, dtype=np.float64
+    )
+    initial_intrinsics_low_all = np.asarray(
+        coarse_state.intrinsic_low, dtype=np.float64
+    )
     extrinsic = np.asarray(coarse_state.extrinsic, dtype=np.float64)
     pairs = np.asarray(coarse_state.pairs, dtype=np.int64)
     metadata = {"image_size_hw": image_size_hw}
@@ -152,7 +158,11 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
         "work_images": {
             "images_dir": str(images_dir),
             "image_names": image_names,
-            "source_image_names": list(coarse_state.image_names),
+            "source_low_image_names": list(coarse_state.low_image_names),
+            "source_high_image_names": list(coarse_state.high_image_names),
+            "low_image_size_hw": list(depth_image_size_hw),
+            "high_image_size_hw": list(image_size_hw),
+            "image_pyramid": coarse_state.image_pyramid,
         },
     }
 
@@ -160,7 +170,9 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
         args,
         "Loaded coarse state: "
         f"images={len(image_names)}, pairs={pairs.shape[0]}, "
-        f"image_size_hw={image_size_hw}, camera_model={CAMERA_MODEL}",
+        f"high_image_size_hw={image_size_hw}, "
+        f"low_image_size_hw={depth_image_size_hw}, "
+        f"camera_model={CAMERA_MODEL}",
     )
 
     _debug(
@@ -174,7 +186,7 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
     t0 = time.time()
     prior_tracks, prior_stats = ref.run_vggsfm_prior_tracks(
         args,
-        coarse_state.images,
+        coarse_state.high_images,
         None,
         pairs,
         metadata,
@@ -231,7 +243,7 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
         coverage_stats,
     ) = ref.filter_low_coverage_frames(
         image_names,
-        coarse_state.images,
+        coarse_state.high_images,
         extrinsic,
         features,
         pairs,
@@ -265,7 +277,8 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
         )
 
     kept_indices = np.asarray(coverage_stats["kept_indices"], dtype=np.int64)
-    initial_intrinsics = initial_intrinsics_all[kept_indices]
+    initial_intrinsics_high = initial_intrinsics_high_all[kept_indices]
+    initial_intrinsics_low = initial_intrinsics_low_all[kept_indices]
     depth = coarse_state.raw_depth[kept_indices]
     depth_conf = (
         coarse_state.raw_depth_conf[kept_indices]
@@ -278,15 +291,15 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
         averaged_intrinsics,
         global_intrinsics,
         intrinsics_mapping,
-    ) = ref.average_intrinsics_with_gluemap(initial_intrinsics, CAMERA_MODEL)
+    ) = ref.average_intrinsics_with_gluemap(initial_intrinsics_high, CAMERA_MODEL)
     stats["timing"]["intrinsics_averaging"] = time.time() - t0
     intrinsic = averaged_intrinsics[0]
     stats["intrinsics"] = ref.summarize_intrinsics(
-        initial_intrinsics, averaged_intrinsics, CAMERA_MODEL
+        initial_intrinsics_high, averaged_intrinsics, CAMERA_MODEL
     )
     ref.save_intrinsics_artifacts(
         output_dir,
-        initial_intrinsics,
+        initial_intrinsics_high,
         averaged_intrinsics,
         intrinsics_mapping,
         image_names,
@@ -310,12 +323,13 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
         depth,
         depth_conf,
         extrinsic,
-        initial_intrinsics,
+        initial_intrinsics_low,
         global_intrinsics,
         intrinsics_mapping,
         pairs,
         image_names,
         image_size_hw,
+        depth_image_size_hw=depth_image_size_hw,
     )
     stats["timing"]["virtual_tracks"] = time.time() - t0
     vt = stats["virtual_tracks"]

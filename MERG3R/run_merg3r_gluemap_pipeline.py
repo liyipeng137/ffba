@@ -12,9 +12,14 @@ from algos.sequence import create_sequence
 from algos.utils import (
     get_sim_matrix,
     load_model,
-    process_images,
     restore_predictions_order,
     run_inference_step_by_step,
+)
+from utils.image_pyramid import (
+    build_two_resolution_image_pyramid,
+    load_image_tensors_from_dir,
+    load_matching_high_images,
+    scale_intrinsics_low_to_high,
 )
 from utils.gluemap_spv_refine import (
     CAMERA_MODEL as PIPELINE_CAMERA_MODEL,
@@ -32,17 +37,22 @@ PIPELINE_MODEL = "pi3x"
 
 @dataclass
 class Merg3rCoarseState:
-    images: torch.Tensor
-    image_names: list[str]
-    image_size_hw: tuple[int, int]
+    low_images: torch.Tensor
+    high_images: torch.Tensor
+    low_image_names: list[str]
+    high_image_names: list[str]
+    low_image_size_hw: tuple[int, int]
+    high_image_size_hw: tuple[int, int]
     final_predictions: dict
     extrinsic: np.ndarray
-    intrinsic: np.ndarray
+    intrinsic_low: np.ndarray
+    intrinsic_high: np.ndarray
     image_ids: np.ndarray
     pairs: np.ndarray
     pair_graph_stats: dict
     raw_depth: np.ndarray
     raw_depth_conf: np.ndarray | None
+    image_pyramid: dict | None
 
 
 def parse_args():
@@ -61,6 +71,27 @@ def parse_args():
     parser.add_argument("--num_images", type=int, default=-1)
     parser.add_argument("--subsample", type=int, default=1)
     parser.add_argument("--multi_dirs", action="store_true")
+    parser.add_argument(
+        "--image_pyramid",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Preprocess the input image directory into low/high resolution "
+            "sets. Low-res images feed MERG3R; high-res images feed SIFT, "
+            "VGGSfM prior, refinement, and final outputs."
+        ),
+    )
+    parser.add_argument("--stage1_downscale_n", type=int, default=4)
+    parser.add_argument("--stage1_multiple", type=int, default=14)
+    parser.add_argument(
+        "--stage2_scale_factor",
+        type=int,
+        default=0,
+        help=(
+            "High-res scale relative to stage1 after crop. 0 means use "
+            "stage1_downscale_n, making stage2 approximately original size."
+        ),
+    )
     parser.add_argument("--sequence_type", type=str, default="shortest_path")
     parser.add_argument("--subset_size", type=int, default=100)
     parser.add_argument("--overlap", type=int, default=5)
@@ -272,19 +303,60 @@ def summarize_pair_graph(pairs, num_images):
 
 def run_merg3r_coarse_stage(args, output_dir):
     t0 = time.time()
-    images, image_names = process_images(
-        args.dataset,
-        args.subsample,
-        args.device,
-        args.num_images,
-        args.multi_dirs,
-        PIPELINE_MODEL,
+    image_pyramid_result = None
+    dataset_for_coarse = args.dataset
+    if args.image_pyramid:
+        stage2_scale_factor = (
+            None if args.stage2_scale_factor == 0 else args.stage2_scale_factor
+        )
+        image_pyramid_result = build_two_resolution_image_pyramid(
+            args.dataset,
+            output_dir / "image_pyramid",
+            stage1_downscale_n=args.stage1_downscale_n,
+            multiple=args.stage1_multiple,
+            stage2_scale_factor=stage2_scale_factor,
+            recursive=args.multi_dirs,
+        )
+        dataset_for_coarse = str(image_pyramid_result.low_dir)
+
+    low_images, low_image_names = load_image_tensors_from_dir(
+        dataset_for_coarse,
+        device=args.device,
+        subsample=args.subsample,
+        num_images=args.num_images,
+        recursive=args.multi_dirs,
     )
-    image_size_hw = tuple(int(x) for x in images.shape[-2:])
+    low_image_size_hw = tuple(int(x) for x in low_images.shape[-2:])
+    if image_pyramid_result is not None:
+        high_images, high_image_names = load_matching_high_images(
+            image_pyramid_result.high_dir,
+            low_image_names,
+            image_pyramid_result.low_dir,
+            device="cpu",
+        )
+        high_image_size_hw = tuple(int(x) for x in high_images.shape[-2:])
+        image_pyramid_metadata = {
+            "enabled": True,
+            "manifest_path": str(image_pyramid_result.manifest_path),
+            "low_dir": str(image_pyramid_result.low_dir),
+            "high_dir": str(image_pyramid_result.high_dir),
+            "stage1_downscale_n": int(args.stage1_downscale_n),
+            "stage1_multiple": int(args.stage1_multiple),
+            "stage2_scale_factor": (
+                int(args.stage1_downscale_n)
+                if args.stage2_scale_factor == 0
+                else int(args.stage2_scale_factor)
+            ),
+        }
+    else:
+        high_images = low_images.detach().cpu()
+        high_image_names = list(low_image_names)
+        high_image_size_hw = low_image_size_hw
+        image_pyramid_metadata = None
 
     sequence = create_sequence(
-        images,
-        image_names,
+        low_images,
+        low_image_names,
         sequence_type=args.sequence_type,
         subset_size=args.subset_size,
         overlap=args.overlap,
@@ -300,7 +372,7 @@ def run_merg3r_coarse_stage(args, output_dir):
     sequence.predictions = run_inference_step_by_step(
         model,
         batches,
-        image_size_hw,
+        low_image_size_hw,
         args.device,
         need_features=False,
         pi3x_intrinsics_method=args.pi3x_intrinsics_method,
@@ -320,12 +392,21 @@ def run_merg3r_coarse_stage(args, output_dir):
 
     extrinsic = _normalize_extrinsic(final_predictions["extrinsic"]).astype(np.float32)
     intrinsic = np.asarray(final_predictions["intrinsic"], dtype=np.float32)
+    if image_pyramid_result is not None:
+        intrinsic_high = scale_intrinsics_low_to_high(
+            intrinsic,
+            low_image_names,
+            image_pyramid_result.low_dir,
+            image_pyramid_result.records,
+        ).astype(np.float32)
+    else:
+        intrinsic_high = intrinsic.astype(np.float32, copy=True)
     image_ids = np.asarray(
         final_predictions.get("image_ids", np.arange(extrinsic.shape[0])),
         dtype=np.int64,
     )
     pairs = build_mixed_pairs(
-        images,
+        low_images,
         extrinsic,
         args.pair_k_similarity,
         args.pair_k_pose,
@@ -346,17 +427,22 @@ def run_merg3r_coarse_stage(args, output_dir):
         )
 
     state = Merg3rCoarseState(
-        images=images,
-        image_names=list(image_names),
-        image_size_hw=image_size_hw,
+        low_images=low_images,
+        high_images=high_images,
+        low_image_names=list(low_image_names),
+        high_image_names=list(high_image_names),
+        low_image_size_hw=low_image_size_hw,
+        high_image_size_hw=high_image_size_hw,
         final_predictions=final_predictions,
         extrinsic=extrinsic,
-        intrinsic=intrinsic,
+        intrinsic_low=intrinsic,
+        intrinsic_high=intrinsic_high,
         image_ids=image_ids,
         pairs=pairs,
         pair_graph_stats=pair_graph_stats,
         raw_depth=raw_depth,
         raw_depth_conf=raw_depth_conf,
+        image_pyramid=image_pyramid_metadata,
     )
     return state, {"seconds": time.time() - t0}
 
@@ -376,13 +462,18 @@ def write_stage_a_summary(output_dir, args, state, timing):
             "group_strategy": PIPELINE_GROUP_STRATEGY,
             "track_mode": PIPELINE_TRACK_MODE,
         },
-        "image_names": state.image_names,
-        "image_size_hw": list(state.image_size_hw),
+        "low_image_names": state.low_image_names,
+        "high_image_names": state.high_image_names,
+        "low_image_size_hw": list(state.low_image_size_hw),
+        "high_image_size_hw": list(state.high_image_size_hw),
         "num_images": int(state.extrinsic.shape[0]),
         "extrinsic_shape": list(state.extrinsic.shape),
-        "intrinsic_shape": list(state.intrinsic.shape),
+        "intrinsic_low_shape": list(state.intrinsic_low.shape),
+        "intrinsic_high_shape": list(state.intrinsic_high.shape),
+        "image_pyramid": state.image_pyramid,
         "raw_geometry": {
             "depth_shape": list(state.raw_depth.shape),
+            "depth_coordinate_system": "low",
             "has_depth_conf": state.raw_depth_conf is not None,
             "depth_conf_shape": (
                 list(state.raw_depth_conf.shape)
@@ -439,7 +530,8 @@ def main():
         "[PIPELINE] "
         f"images={state.extrinsic.shape[0]}, "
         f"pairs={state.pairs.shape[0]}, "
-        f"image_size_hw={state.image_size_hw}, "
+        f"low_image_size_hw={state.low_image_size_hw}, "
+        f"high_image_size_hw={state.high_image_size_hw}, "
         f"camera_model={PIPELINE_CAMERA_MODEL}"
     )
     print(

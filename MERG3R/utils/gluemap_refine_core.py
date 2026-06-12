@@ -319,12 +319,13 @@ def build_virtual_track_diagnostics(
     depth,
     depth_conf,
     extrinsic,
-    initial_intrinsics,
+    depth_intrinsics,
     global_intrinsics,
     intrinsics_mapping,
     pairs,
     image_names,
     image_size_hw,
+    depth_image_size_hw=None,
 ):
     from gluemap.estimators.covisibility_extraction import (  # noqa: PLC0415
         CovisibilityExtraction,
@@ -334,10 +335,12 @@ def build_virtual_track_diagnostics(
     )
 
     num_images = len(image_names)
-    if tuple(depth.shape[1:3]) != tuple(image_size_hw):
+    if depth_image_size_hw is None:
+        depth_image_size_hw = image_size_hw
+    if tuple(depth.shape[1:3]) != tuple(depth_image_size_hw):
         raise ValueError(
             f"Depth resolution {tuple(depth.shape[1:3])} does not match "
-            f"image_size_hw={tuple(image_size_hw)}"
+            f"depth_image_size_hw={tuple(depth_image_size_hw)}"
         )
 
     centers = camera_centers_from_w2c(extrinsic)
@@ -375,7 +378,7 @@ def build_virtual_track_diagnostics(
             "extrinsics": torch.from_numpy(local_extrinsic).to(
                 device=device, dtype=torch.float32
             )[None],
-            "intrinsics": torch.from_numpy(initial_intrinsics[group_np]).to(
+            "intrinsics": torch.from_numpy(depth_intrinsics[group_np]).to(
                 device=device, dtype=torch.float32
             )[None],
         }
@@ -430,6 +433,8 @@ def build_virtual_track_diagnostics(
         "skipped_centers": skipped_centers,
         "depth": {
             "shape": list(depth.shape),
+            "image_size_hw": list(depth_image_size_hw),
+            "refine_image_size_hw": list(image_size_hw),
             "has_depth_conf": depth_conf is not None,
             "positive_pixels": int(np.sum(depth[..., 0] > 0)),
         },
@@ -444,6 +449,18 @@ def build_virtual_track_diagnostics(
     rotations, global_centers = global_pose_dicts_from_w2c(extrinsic)
     preparation = VirtualTrackPreparation()
     indexes_range = range(len(predictions_dict["indexes"]))
+    for idx in indexes_range:
+        predictions_dict["intrinsics"][idx] = (
+            torch.stack(
+                [
+                    global_intrinsics[intrinsics_mapping[image_idx]]
+                    for image_idx in predictions_dict["indexes"][idx]
+                ],
+                dim=1,
+            )
+            .detach()
+            .cpu()
+        )
 
     before_update = clone_virtual_tracks(predictions_dict)
     t0 = time.time()
