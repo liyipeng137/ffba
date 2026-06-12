@@ -1,6 +1,4 @@
-import importlib.util
 import json
-import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -8,6 +6,8 @@ from types import SimpleNamespace
 
 import numpy as np
 from PIL import Image
+
+from utils import gluemap_refine_core as ref
 
 CAMERA_MODEL = "SIMPLE_PINHOLE"
 S_DATABASE_MODE = "sift"
@@ -54,32 +54,6 @@ class GluemapSpvRefineResult:
     stats: dict
     refined_dir: Path
     virtual_refined_dir: Path
-
-
-_REFINE_MODULE = None
-
-
-def _load_refine_module():
-    global _REFINE_MODULE
-    if _REFINE_MODULE is not None:
-        return _REFINE_MODULE
-
-    gluemap_root = Path(__file__).resolve().parents[1] / "gluemap"
-    module_path = gluemap_root / "run_merg3r_pycolmap_refine.py"
-    if str(gluemap_root) not in sys.path:
-        sys.path.insert(0, str(gluemap_root))
-
-    spec = importlib.util.spec_from_file_location(
-        "_merg3r_gluemap_refine_legacy", module_path
-    )
-    if spec is None or spec.loader is None:
-        raise ImportError(f"Cannot load GlueMap refine module from {module_path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    module._ensure_gluemap_imports()
-    _REFINE_MODULE = module
-    return module
 
 
 def _make_refine_args(config: GluemapSpvRefineConfig):
@@ -153,7 +127,7 @@ def _write_json(path, payload):
 
 
 def run_gluemap_spv_refinement(coarse_state, output_dir, config):
-    ref = _load_refine_module()
+    ref._ensure_gluemap_imports()
     pycolmap = ref._lazy_import_pycolmap()
     args = _make_refine_args(config)
     output_dir = Path(output_dir)
@@ -218,6 +192,7 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
         f"time={stats['timing']['vggsfm_prior_tracks']:.2f}s",
     )
 
+    prefilter_image_names = list(image_names)
     _debug(args, "Preparing prefilter SIFT database")
     t0 = time.time()
     prefilter_intrinsics_mapping = {idx: 0 for idx in range(len(image_names))}
@@ -252,7 +227,6 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
         extrinsic,
         features,
         pairs,
-        _unused_matches,
         prior_tracks,
         coverage_stats,
     ) = ref.filter_low_coverage_frames(
@@ -261,7 +235,6 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
         extrinsic,
         features,
         pairs,
-        None,
         prior_tracks,
         s_counts,
         p_counts,
@@ -356,20 +329,21 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
     )
 
     if coverage_stats["dropped_indices"]:
-        _debug(args, "Rebuilding SIFT database after frame filtering")
+        _debug(args, "Filtering SIFT database after frame filtering")
         t0 = time.time()
-        features, sift_final_stats = ref.prepare_sift_database_for_refine(
-            args,
-            output_dir,
-            output_dir,
-            image_names,
+        features, sift_final_stats = ref.filter_sift_database_for_refine(
+            output_dir / "database_sift.db",
+            output_dir / "database_sift.db",
+            prefilter_image_names,
+            coverage_stats["kept_indices"],
             pairs,
-            CAMERA_MODEL,
             intrinsics_mapping,
         )
-        stats["timing"]["prepare_sift_database_final"] = time.time() - t0
+        stats["timing"]["filter_sift_database_final"] = time.time() - t0
+        stats["timing"]["prepare_sift_database_final"] = 0.0
     else:
         sift_final_stats = stats["s_database"]["prefilter"]
+        stats["timing"]["filter_sift_database_final"] = 0.0
         stats["timing"]["prepare_sift_database_final"] = 0.0
     stats["s_database"]["final"] = sift_final_stats
     _debug(

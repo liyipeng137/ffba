@@ -2252,32 +2252,45 @@ def get_sim_matrix(
         """
         _RESNET_MEAN = [0.485, 0.456, 0.406]
         _RESNET_STD = [0.229, 0.224, 0.225]
+        # use_dinov3 = model_name == "dinov3"
         use_hf_dinov3 = model_name == "dinov3"
-        if use_hf_dinov3:
-            # repo_dir = os.environ.get(
-            #     "MERG3R_DINOV3_REPO_DIR",
-            #     os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "third_party", "dinov3"),
-            # )
-            # weights_url = os.environ.get("MERG3R_DINOV3_WEIGHTS_URL", None)
-            # if not os.path.isdir(repo_dir):
-            #     raise ValueError(
-            #         f"DINOv3 repo directory not found: {repo_dir}. "
-            #         "Use model_name='dinov2' for the default public model."
-            #     )
-            # model = torch.hub.load(
-            #     repo_dir, "dinov3_vitb16", source="local", weights=weights_url
-            # )
-
+        # dinov3_backend = os.environ.get("MERG3R_DINOV3_BACKEND", "local").lower()
+        # use_hf_dinov3 = use_dinov3 and dinov3_backend == "hf"
+        # use_local_dinov3 = use_dinov3 and dinov3_backend != "hf"
+        # if use_local_dinov3:
+        #     repo_dir = os.environ.get(
+        #         "MERG3R_DINOV3_REPO_DIR",
+        #         os.path.join(
+        #             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        #             "third_party",
+        #             "dinov3",
+        #         ),
+        #     )
+        #     weights_url = os.environ.get("MERG3R_DINOV3_WEIGHTS_URL", None)
+        #     if not os.path.isdir(repo_dir):
+        #         raise ValueError(
+        #             f"DINOv3 repo directory not found: {repo_dir}. "
+        #             "Set MERG3R_DINOV3_REPO_DIR, set "
+        #             "MERG3R_DINOV3_BACKEND=hf, or use model_name='dinov2'."
+        #         )
+        #     hub_kwargs = {"source": "local"}
+        #     if weights_url:
+        #         hub_kwargs["weights"] = weights_url
+        #     model = torch.hub.load(repo_dir, "dinov3_vitb16", **hub_kwargs)
+        # elif use_hf_dinov3:
+        try:
             from transformers import AutoModel
+
             model_id = os.environ.get(
                 "MERG3R_DINOV3_MODEL_ID",
                 "facebook/dinov3-vitb16-pretrain-lvd1689m",
             )
-            model = AutoModel.from_pretrained(
-                model_id,
-            )
-        else:
-            model = torch.hub.load("facebookresearch/dinov2", "dinov2_vitb14_reg")
+            model = AutoModel.from_pretrained(model_id)
+        except Exception as e:
+            print(f"[UTILS] Error loading DINOv3 model: {e}")
+            raise e
+        # else:
+        #     model = torch.hub.load("facebookresearch/dinov2", "dinov2_vitb14_reg")
 
         model.eval()
         model = model.to(device)
