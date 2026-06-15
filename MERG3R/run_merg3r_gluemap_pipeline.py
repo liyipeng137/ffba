@@ -84,6 +84,12 @@ def parse_args():
     parser.add_argument("--stage1_downscale_n", type=int, default=4)
     parser.add_argument("--stage1_multiple", type=int, default=14)
     parser.add_argument(
+        "--image_pyramid_workers",
+        type=int,
+        default=16,
+        help="Number of concurrent workers for image pyramid preprocessing.",
+    )
+    parser.add_argument(
         "--stage2_scale_factor",
         type=int,
         default=0,
@@ -316,6 +322,7 @@ def run_merg3r_coarse_stage(args, output_dir):
             multiple=args.stage1_multiple,
             stage2_scale_factor=stage2_scale_factor,
             recursive=args.multi_dirs,
+            num_workers=args.image_pyramid_workers,
         )
         dataset_for_coarse = str(image_pyramid_result.low_dir)
 
@@ -333,6 +340,7 @@ def run_merg3r_coarse_stage(args, output_dir):
             low_image_names,
             image_pyramid_result.low_dir,
             device="cpu",
+            num_workers=args.image_pyramid_workers,
         )
         high_image_size_hw = tuple(int(x) for x in high_images.shape[-2:])
         image_pyramid_metadata = {
@@ -342,6 +350,7 @@ def run_merg3r_coarse_stage(args, output_dir):
             "high_dir": str(image_pyramid_result.high_dir),
             "stage1_downscale_n": int(args.stage1_downscale_n),
             "stage1_multiple": int(args.stage1_multiple),
+            "num_workers": int(args.image_pyramid_workers),
             "stage2_scale_factor": (
                 int(args.stage1_downscale_n)
                 if args.stage2_scale_factor == 0
@@ -570,6 +579,7 @@ def main():
         virtual_init_angular_error_threshold=args.virtual_init_angular_error_threshold,
         save_virtual_tracks_debug=args.save_virtual_tracks_debug,
         debug_print=args.debug_print,
+        work_image_workers=args.image_pyramid_workers,
     )
     refine_result = run_gluemap_spv_refinement(state, output_dir, refine_config)
     print(

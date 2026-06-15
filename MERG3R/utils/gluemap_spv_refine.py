@@ -1,5 +1,6 @@
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -42,6 +43,7 @@ class GluemapSpvRefineConfig:
     virtual_init_angular_error_threshold: float | None = None
     save_virtual_tracks_debug: bool = False
     debug_print: bool = True
+    work_image_workers: int = 16
 
 
 @dataclass
@@ -108,16 +110,37 @@ def _debug(args, message):
         print(f"[PIPELINE-REFINE] {message}", flush=True)
 
 
-def _save_work_images(images, output_dir):
+def _save_one_work_image(item):
+    idx, image, images_dir = item
+    name = f"frame_{idx:06d}.png"
+    array = (image.permute(1, 2, 0).numpy() * 255.0).round().astype(np.uint8)
+    Image.fromarray(array).save(images_dir / name)
+    return name
+
+
+def _save_work_images(images, output_dir, num_workers=16):
     images_dir = output_dir / "images"
     images_dir.mkdir(parents=True, exist_ok=True)
-    image_names = []
     images_cpu = images.detach().cpu().float().clamp(0, 1)
-    for idx, image in enumerate(images_cpu):
-        name = f"frame_{idx:06d}.png"
-        array = (image.permute(1, 2, 0).numpy() * 255.0).round().astype(np.uint8)
-        Image.fromarray(array).save(images_dir / name)
-        image_names.append(name)
+
+    num_workers = int(num_workers)
+    if num_workers <= 0:
+        raise ValueError("num_workers must be >= 1")
+    if int(images_cpu.shape[0]) == 0:
+        raise ValueError("Cannot save work images from an empty tensor")
+    worker_count = min(num_workers, int(images_cpu.shape[0]))
+
+    work_items = [(idx, image, images_dir) for idx, image in enumerate(images_cpu)]
+    if worker_count == 1:
+        image_names = [_save_one_work_image(item) for item in work_items]
+    else:
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            image_names = list(executor.map(_save_one_work_image, work_items))
+
+    print(
+        "[PIPELINE-REFINE] Saved work images: "
+        f"images={len(image_names)}, workers={worker_count}, images_dir={images_dir}"
+    )
     return images_dir, image_names
 
 
@@ -134,7 +157,13 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
     output_dir.mkdir(parents=True, exist_ok=True)
 
     t_start = time.time()
-    images_dir, image_names = _save_work_images(coarse_state.high_images, output_dir)
+    t0 = time.time()
+    images_dir, image_names = _save_work_images(
+        coarse_state.high_images,
+        output_dir,
+        num_workers=config.work_image_workers,
+    )
+    save_work_images_seconds = time.time() - t0
     image_size_hw = tuple(coarse_state.high_image_size_hw)
     depth_image_size_hw = tuple(coarse_state.low_image_size_hw)
     initial_intrinsics_high_all = np.asarray(
@@ -154,10 +183,11 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
         "vggsfm_query_source": QUERY_SOURCE,
         "vggsfm_tracker_input": TRACKER_INPUT,
         "group_strategy": GROUP_STRATEGY,
-        "timing": {},
+        "timing": {"save_work_images": save_work_images_seconds},
         "work_images": {
             "images_dir": str(images_dir),
             "image_names": image_names,
+            "num_workers": int(config.work_image_workers),
             "source_low_image_names": list(coarse_state.low_image_names),
             "source_high_image_names": list(coarse_state.high_image_names),
             "low_image_size_hw": list(depth_image_size_hw),

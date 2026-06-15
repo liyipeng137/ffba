@@ -1,4 +1,5 @@
 import json
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -116,6 +117,70 @@ def save_image(image, path):
         image.save(path)
 
 
+def _build_image_pyramid_record(
+    source_path,
+    images_dir,
+    low_dir,
+    high_dir,
+    stage1_downscale_n,
+    stage2_scale_factor,
+    multiple,
+):
+    relative_path = source_path.relative_to(images_dir)
+    low_path = low_dir / relative_path
+    high_path = high_dir / relative_path
+
+    with Image.open(source_path) as image_raw:
+        image = ImageOps.exif_transpose(image_raw).convert("RGB")
+        width0, height0 = image.size
+
+        low_width_base = max(1, width0 // stage1_downscale_n)
+        low_height_base = max(1, height0 // stage1_downscale_n)
+        low_base = image.resize(
+            (low_width_base, low_height_base),
+            resample=Image.Resampling.LANCZOS,
+        )
+        low_crop_box = center_crop_to_multiple(
+            low_width_base,
+            low_height_base,
+            multiple,
+        )
+        low_image = low_base.crop(low_crop_box)
+        save_image(low_image, low_path)
+
+        high_width_base = low_width_base * stage2_scale_factor
+        high_height_base = low_height_base * stage2_scale_factor
+        high_base = image.resize(
+            (high_width_base, high_height_base),
+            resample=Image.Resampling.LANCZOS,
+        )
+        high_crop_box = scale_box(low_crop_box, stage2_scale_factor)
+        high_image = high_base.crop(high_crop_box)
+        save_image(high_image, high_path)
+
+    low_width = low_crop_box[2] - low_crop_box[0]
+    low_height = low_crop_box[3] - low_crop_box[1]
+    high_width = high_crop_box[2] - high_crop_box[0]
+    high_height = high_crop_box[3] - high_crop_box[1]
+    return ImagePyramidRecord(
+        source_path=str(source_path),
+        relative_path=str(relative_path),
+        low_path=str(low_path),
+        high_path=str(high_path),
+        source_size_wh=(int(width0), int(height0)),
+        low_base_size_wh=(int(low_width_base), int(low_height_base)),
+        low_size_wh=(int(low_width), int(low_height)),
+        low_crop_box=tuple(int(v) for v in low_crop_box),
+        high_base_size_wh=(int(high_width_base), int(high_height_base)),
+        high_size_wh=(int(high_width), int(high_height)),
+        high_crop_box=tuple(int(v) for v in high_crop_box),
+        low_to_high_scale_xy=(
+            float(high_width) / float(low_width),
+            float(high_height) / float(low_height),
+        ),
+    )
+
+
 def build_two_resolution_image_pyramid(
     images_dir,
     output_dir,
@@ -123,6 +188,7 @@ def build_two_resolution_image_pyramid(
     multiple=14,
     stage2_scale_factor=None,
     recursive=False,
+    num_workers=16,
 ):
     images_dir = Path(images_dir)
     output_dir = Path(output_dir)
@@ -139,67 +205,50 @@ def build_two_resolution_image_pyramid(
     stage2_scale_factor = int(stage2_scale_factor)
     if stage2_scale_factor <= 0:
         raise ValueError("stage2_scale_factor must be >= 1")
+    num_workers = int(num_workers)
+    if num_workers <= 0:
+        raise ValueError("num_workers must be >= 1")
 
-    records = []
-    for source_path in iter_image_files(images_dir, recursive=recursive):
-        relative_path = source_path.relative_to(images_dir)
-        low_path = low_dir / relative_path
-        high_path = high_dir / relative_path
+    image_paths = iter_image_files(images_dir, recursive=recursive)
+    if not image_paths:
+        raise ValueError(f"No images found in {images_dir}")
 
-        with Image.open(source_path) as image_raw:
-            image = ImageOps.exif_transpose(image_raw).convert("RGB")
-            width0, height0 = image.size
-
-            low_width_base = max(1, width0 // stage1_downscale_n)
-            low_height_base = max(1, height0 // stage1_downscale_n)
-            low_base = image.resize(
-                (low_width_base, low_height_base),
-                resample=Image.Resampling.LANCZOS,
-            )
-            low_crop_box = center_crop_to_multiple(
-                low_width_base,
-                low_height_base,
+    worker_count = min(num_workers, len(image_paths))
+    if worker_count == 1:
+        records = [
+            _build_image_pyramid_record(
+                source_path,
+                images_dir,
+                low_dir,
+                high_dir,
+                stage1_downscale_n,
+                stage2_scale_factor,
                 multiple,
             )
-            low_image = low_base.crop(low_crop_box)
-            save_image(low_image, low_path)
-
-            high_width_base = low_width_base * stage2_scale_factor
-            high_height_base = low_height_base * stage2_scale_factor
-            high_base = image.resize(
-                (high_width_base, high_height_base),
-                resample=Image.Resampling.LANCZOS,
+            for source_path in image_paths
+        ]
+    else:
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            records = list(
+                executor.map(
+                    lambda source_path: _build_image_pyramid_record(
+                        source_path,
+                        images_dir,
+                        low_dir,
+                        high_dir,
+                        stage1_downscale_n,
+                        stage2_scale_factor,
+                        multiple,
+                    ),
+                    image_paths,
+                )
             )
-            high_crop_box = scale_box(low_crop_box, stage2_scale_factor)
-            high_image = high_base.crop(high_crop_box)
-            save_image(high_image, high_path)
 
-        low_width = low_crop_box[2] - low_crop_box[0]
-        low_height = low_crop_box[3] - low_crop_box[1]
-        high_width = high_crop_box[2] - high_crop_box[0]
-        high_height = high_crop_box[3] - high_crop_box[1]
-        records.append(
-            ImagePyramidRecord(
-                source_path=str(source_path),
-                relative_path=str(relative_path),
-                low_path=str(low_path),
-                high_path=str(high_path),
-                source_size_wh=(int(width0), int(height0)),
-                low_base_size_wh=(int(low_width_base), int(low_height_base)),
-                low_size_wh=(int(low_width), int(low_height)),
-                low_crop_box=tuple(int(v) for v in low_crop_box),
-                high_base_size_wh=(int(high_width_base), int(high_height_base)),
-                high_size_wh=(int(high_width), int(high_height)),
-                high_crop_box=tuple(int(v) for v in high_crop_box),
-                low_to_high_scale_xy=(
-                    float(high_width) / float(low_width),
-                    float(high_height) / float(low_height),
-                ),
-            )
-        )
-
-    if not records:
-        raise ValueError(f"No images found in {images_dir}")
+    print(
+        "[IMAGE_PYRAMID] Built two-resolution images: "
+        f"images={len(records)}, workers={worker_count}, low_dir={low_dir}, "
+        f"high_dir={high_dir}"
+    )
 
     manifest_path = output_dir / "image_pyramid_manifest.json"
     with open(manifest_path, "w") as f:
@@ -211,6 +260,7 @@ def build_two_resolution_image_pyramid(
                 "stage1_downscale_n": int(stage1_downscale_n),
                 "stage2_scale_factor": int(stage2_scale_factor),
                 "multiple": int(multiple),
+                "num_workers": int(worker_count),
                 "same_fov_low_high": True,
                 "records": [asdict(record) for record in records],
             },
@@ -226,31 +276,68 @@ def build_two_resolution_image_pyramid(
     )
 
 
-def load_matching_high_images(high_dir, low_image_names, low_dir, device="cpu"):
+def _load_matching_high_image(low_name, high_dir, low_dir):
+    low_path = Path(low_name).resolve()
+    relative_path = low_path.relative_to(low_dir)
+    high_path = high_dir / relative_path
+    if not high_path.exists():
+        raise FileNotFoundError(f"Missing high-resolution match: {high_path}")
+    with Image.open(high_path) as image:
+        image = ImageOps.exif_transpose(image).convert("RGB")
+        array = np.asarray(image, dtype=np.float32) / 255.0
+    tensor = torch.from_numpy(array).permute(2, 0, 1)
+    return tensor, str(high_path)
+
+
+def load_matching_high_images(
+    high_dir,
+    low_image_names,
+    low_dir,
+    device="cpu",
+    num_workers=16,
+):
     high_dir = Path(high_dir).resolve()
     low_dir = Path(low_dir).resolve()
-    tensors = []
-    high_paths = []
-    shapes = set()
-    for low_name in low_image_names:
-        low_path = Path(low_name).resolve()
-        relative_path = low_path.relative_to(low_dir)
-        high_path = high_dir / relative_path
-        if not high_path.exists():
-            raise FileNotFoundError(f"Missing high-resolution match: {high_path}")
-        with Image.open(high_path) as image:
-            image = ImageOps.exif_transpose(image).convert("RGB")
-            array = np.asarray(image, dtype=np.float32) / 255.0
-        tensor = torch.from_numpy(array).permute(2, 0, 1)
-        tensors.append(tensor)
-        high_paths.append(str(high_path))
-        shapes.add(tuple(tensor.shape[-2:]))
+    low_image_names = list(low_image_names)
+    if not low_image_names:
+        raise ValueError("low_image_names is empty")
+
+    num_workers = int(num_workers)
+    if num_workers <= 0:
+        raise ValueError("num_workers must be >= 1")
+    worker_count = min(num_workers, len(low_image_names))
+
+    if worker_count == 1:
+        loaded = [
+            _load_matching_high_image(low_name, high_dir, low_dir)
+            for low_name in low_image_names
+        ]
+    else:
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            loaded = list(
+                executor.map(
+                    lambda low_name: _load_matching_high_image(
+                        low_name,
+                        high_dir,
+                        low_dir,
+                    ),
+                    low_image_names,
+                )
+            )
+
+    tensors = [item[0] for item in loaded]
+    high_paths = [item[1] for item in loaded]
+    shapes = {tuple(tensor.shape[-2:]) for tensor in tensors}
 
     if len(shapes) != 1:
         raise ValueError(
             "High-resolution pipeline images must have a common shape. "
             f"Got shapes: {sorted(shapes)}"
         )
+    print(
+        "[IMAGE_PYRAMID] Loaded matching high images: "
+        f"images={len(high_paths)}, workers={worker_count}, shape={tensors[0].shape}"
+    )
     return torch.stack(tensors).to(device), high_paths
 
 
