@@ -983,6 +983,33 @@ def build_vggsfm_query_points(
 
 
 @torch.no_grad()
+def precompute_vggsfm_tracker_fmaps(tracker, args, tracker_images, chunk_size=32):
+    t0 = time.time()
+    chunk_size = int(chunk_size)
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be >= 1")
+
+    fmaps_chunks = []
+    num_images = int(tracker_images.shape[0])
+    for start in range(0, num_images, chunk_size):
+        end = min(start + chunk_size, num_images)
+        images_chunk = tracker_images[start:end].to(args.device, non_blocking=True)
+        fmaps_chunk = tracker.process_images_to_fmaps(images_chunk)
+        fmaps_chunks.append(fmaps_chunk.detach().cpu())
+        del images_chunk, fmaps_chunk
+        if str(args.device).startswith("cuda"):
+            torch.cuda.empty_cache()
+
+    tracker_fmaps = torch.cat(fmaps_chunks, dim=0)
+    return tracker_fmaps, {
+        "enabled": True,
+        "chunk_size": int(chunk_size),
+        "seconds": time.time() - t0,
+        "shape": [int(v) for v in tracker_fmaps.shape],
+    }
+
+
+@torch.no_grad()
 def run_vggsfm_prior_tracks(
     args, images, features, pairs, metadata, extrinsic, image_names
 ):
@@ -1017,7 +1044,13 @@ def run_vggsfm_prior_tracks(
         features,
         tracker_image_changes=tracker_image_changes,
     )
+    tracker_fmaps, fmaps_stats = precompute_vggsfm_tracker_fmaps(
+        tracker,
+        args,
+        tracker_images,
+    )
 
+    t_group = time.time()
     for group in groups:
         center = group[0]
         query_np = sample_query_points(
@@ -1025,15 +1058,20 @@ def run_vggsfm_prior_tracks(
         )
         if query_np.shape[0] == 0:
             continue
-        group_tensor = tracker_images[group].unsqueeze(0).to(args.device)
+        group_tensor = tracker_images[group].unsqueeze(0)
+        if args.vggsfm_fine_tracking:
+            group_tensor = group_tensor.to(args.device)
+        group_fmaps = tracker_fmaps[group].unsqueeze(0).to(args.device)
         query = (
             torch.from_numpy(query_np).to(args.device, dtype=torch.float32).unsqueeze(0)
         )
         pred_track, _, pred_vis, pred_score = tracker(
             group_tensor,
             query,
+            fmaps=group_fmaps,
             fine_tracking=args.vggsfm_fine_tracking,
         )
+        del group_fmaps
         pred_track = pred_track[0].detach().cpu().numpy()
         pred_vis = pred_vis[0].detach().cpu().numpy()
         pred_score = pred_score[0].detach().cpu().numpy()
@@ -1062,6 +1100,7 @@ def run_vggsfm_prior_tracks(
             if len(obs) >= 2:
                 observations += len(obs)
                 tracks.append(obs)
+    group_tracking_time = time.time() - t_group
 
     return tracks, {
         "num_groups": len(groups),
@@ -1071,6 +1110,8 @@ def run_vggsfm_prior_tracks(
         "group_strategy": args.group_strategy,
         "group_stats": group_stats,
         "query_points": args.vggsfm_query_points,
+        "precompute_fmaps": fmaps_stats,
+        "group_tracking_time": group_tracking_time,
         **tracker_stats,
         **query_stats,
     }

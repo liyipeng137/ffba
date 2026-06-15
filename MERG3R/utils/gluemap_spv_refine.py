@@ -233,6 +233,8 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
         f"groups={prior_stats['num_groups']}, "
         f"tracks={prior_stats['num_tracks']}, "
         f"observations={prior_stats['num_observations']}, "
+        f"fmap_precompute={prior_stats['precompute_fmaps']['seconds']:.2f}s, "
+        f"group_tracking={prior_stats['group_tracking_time']:.2f}s, "
         f"time={stats['timing']['vggsfm_prior_tracks']:.2f}s",
     )
 
