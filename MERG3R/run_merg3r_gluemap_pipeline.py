@@ -142,6 +142,17 @@ def parse_args():
     parser.add_argument("--vggsfm_fine_tracking", action="store_true")
     parser.add_argument("--prior_snap_threshold", type=float, default=1.0)
     parser.add_argument("--prior_keypoint_merge_threshold", type=float, default=1e-3)
+    parser.add_argument(
+        "--prior_match_topology",
+        type=str,
+        default="all_pairs",
+        choices=["all_pairs", "star"],
+        help=(
+            "Topology used to convert VGGSfM prior tracks into COLMAP pair "
+            "matches. 'star' writes only center-neighbor correspondences, "
+            "matching GlueMap TrackEstablishment more closely."
+        ),
+    )
     parser.add_argument("--min_frame_observations", type=int, default=10)
     parser.add_argument("--ba_max_num_iterations", type=int, default=100)
     parser.add_argument("--num_refinement_iterations", type=int, default=2)
@@ -564,6 +575,7 @@ def main():
         vggsfm_fine_tracking=args.vggsfm_fine_tracking,
         prior_snap_threshold=args.prior_snap_threshold,
         prior_keypoint_merge_threshold=args.prior_keypoint_merge_threshold,
+        prior_match_topology=args.prior_match_topology,
         min_frame_observations=args.min_frame_observations,
         ba_max_num_iterations=args.ba_max_num_iterations,
         num_refinement_iterations=args.num_refinement_iterations,

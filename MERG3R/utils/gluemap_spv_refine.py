@@ -30,6 +30,7 @@ class GluemapSpvRefineConfig:
     vggsfm_fine_tracking: bool = False
     prior_snap_threshold: float = 1.0
     prior_keypoint_merge_threshold: float = 1e-3
+    prior_match_topology: str = "all_pairs"
     min_frame_observations: int = 10
     ba_max_num_iterations: int = 100
     num_refinement_iterations: int = 2
@@ -81,6 +82,7 @@ def _make_refine_args(config: GluemapSpvRefineConfig):
         prior_snap_threshold=config.prior_snap_threshold,
         prior_keep_unsnapped=True,
         prior_keypoint_merge_threshold=config.prior_keypoint_merge_threshold,
+        prior_match_topology=config.prior_match_topology,
         drop_low_coverage_frames=True,
         min_frame_observations=config.min_frame_observations,
         device=config.device,
@@ -413,6 +415,7 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
         keep_unsnapped=True,
         merge_threshold=args.prior_keypoint_merge_threshold,
         snap_target="sift",
+        match_topology=args.prior_match_topology,
     )
     stats["timing"]["write_prior_db"] = time.time() - t0
     prior_db_stats = stats["prior_database"]
@@ -421,6 +424,7 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
         args,
         "Prior DB written: "
         f"tracks={prior_db_stats['num_tracks']}, "
+        f"topology={prior_db_stats['keypoint_merge']['match_topology']}, "
         f"pairs={prior_db_stats['num_pairs']}, "
         f"raw_kp={prior_db_stats['keypoint_merge']['raw_total']}, "
         f"merged_kp={prior_db_stats['keypoint_merge']['merged_total']}, "

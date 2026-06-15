@@ -1379,7 +1379,13 @@ def tracks_to_keypoints_and_matches(
     tracks,
     num_images,
     merge_threshold=1e-3,
+    match_topology="all_pairs",
 ):
+    if match_topology not in {"all_pairs", "star"}:
+        raise ValueError(
+            "match_topology must be 'all_pairs' or 'star', " f"got {match_topology!r}"
+        )
+
     raw_keypoints = [[] for _ in range(num_images)]
     raw_tracks = []
 
@@ -1417,14 +1423,26 @@ def tracks_to_keypoints_and_matches(
             continue
         kept_tracks += 1
         track_lengths.append(len(obs_indices))
-        for a in range(len(obs_indices)):
-            for b in range(a + 1, len(obs_indices)):
-                i, pi = obs_indices[a]
-                j, pj = obs_indices[b]
-                if i > j:
-                    i, j = j, i
-                    pi, pj = pj, pi
-                pair_matches[(i, j)].add((pi, pj))
+        if match_topology == "all_pairs":
+            index_pairs = (
+                (a, b)
+                for a in range(len(obs_indices))
+                for b in range(a + 1, len(obs_indices))
+            )
+        else:
+            # Match GlueMap TrackEstablishment's star-style prior: each
+            # tracker group emits correspondences between the center view
+            # (first observation) and each visible neighbor.
+            index_pairs = ((0, b) for b in range(1, len(obs_indices)))
+        for a, b in index_pairs:
+            i, pi = obs_indices[a]
+            j, pj = obs_indices[b]
+            if i == j:
+                continue
+            if i > j:
+                i, j = j, i
+                pi, pj = pj, pi
+            pair_matches[(i, j)].add((pi, pj))
 
     matches_np = {
         key: np.asarray(sorted(value), dtype=np.uint32)
@@ -1433,6 +1451,7 @@ def tracks_to_keypoints_and_matches(
 
     merge_stats["input_tracks"] = int(len(tracks))
     merge_stats["kept_tracks"] = int(kept_tracks)
+    merge_stats["match_topology"] = match_topology
     merge_stats["track_length_mean"] = (
         float(np.mean(track_lengths)) if track_lengths else 0.0
     )
@@ -1456,6 +1475,7 @@ def write_tracks_database(
     keep_unsnapped=True,
     merge_threshold=1e-3,
     snap_target="features",
+    match_topology="all_pairs",
 ):
     pycolmap = _lazy_import_pycolmap()
     if os.path.exists(db_path):
@@ -1481,6 +1501,7 @@ def write_tracks_database(
         tracks_for_database,
         len(image_names),
         merge_threshold=merge_threshold,
+        match_topology=match_topology,
     )
     database = pycolmap.Database.open(db_path)
     _write_cameras_and_images(
