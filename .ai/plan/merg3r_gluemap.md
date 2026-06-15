@@ -6,12 +6,28 @@
 
 ## 阶段状态
 
-截至 2026-06-11，Merg3r 与 GlueMap refinement 的核心缝合阶段已完成。
+截至 2026-06-15，Merg3r 与 GlueMap refinement 的两阶段脚本缝合已经推进到单脚本 pipeline。
 
-当前两阶段 pipeline 已经能够完整跑通：
+当前主入口：
 
-- A 阶段：Merg3r 前馈推理、sequence 对齐、coarse pose/depth/artifact 导出。
-- B 阶段：读取 A artifacts，构建 `S + P + V`，执行 GlueMap-style SelectTrack、SelectVirtualTrack、reprojection filtering、多轮 augmented BA，并输出 `refined_gluemap_aba/` 与 `virtual_gluemap_aba/`。
+```text
+MERG3R/run_merg3r_gluemap_pipeline.py
+```
+
+该脚本已经把原先两阶段流程串到同一条管线中：
+
+- Stage 1：Merg3r 前馈推理、sequence 对齐、coarse pose/depth 构建。
+- Stage 2：构建 `S + P + V`，执行 GlueMap-style SelectTrack、SelectVirtualTrack、reprojection filtering、多轮 augmented BA。
+- 输出 `refined_gluemap_aba/`、`virtual_gluemap_aba/`、`refine_stats.json` 等 refinement 结果。
+
+原先两个阶段脚本仍保留为历史对照和 debug 入口：
+
+```text
+MERG3R/export_merg3r_refine_inputs.py
+MERG3R/gluemap/run_merg3r_pycolmap_refine.py
+```
+
+但当前工程主线不再依赖 `artifact_dir` 在两个独立脚本之间传递中间产物。
 
 最新实验中，切到 `pi3x` 前馈模型并将 S 分支改为原版 GlueMap 风格 SIFT 后，关键数值已经接近原版 GlueMap：
 
@@ -27,29 +43,158 @@ MERG3R+GlueMap, pi3x + SIFT + SPV/pose iter2:
   mean=0.2352 deg, median=0.1587 deg, <0.5deg=92.4%
 ```
 
-因此当前主线从“能否缝合并接近原版”切换为“工程化和小优化”：
+因此当前主线已经从“能否缝合并接近原版”切换为“整理成稳定可复现实验管线”。
 
-1. 图片 resize / restore：像原版 GlueMap 一样支持任意分辨率输入，在内部 resize 到模型/跟踪需要的尺寸，并把坐标、内参、输出 reconstruction 恢复到原图域。
-2. 代码整理：把当前验证脚本中的阶段逻辑拆分、命名、配置和 debug 输出整理成更清晰的 pipeline。
-3. 加速：减少重复 SIFT/VGGSfM/virtual-track 计算，增加缓存和更合理的 ablation 开关。
+当前固定流程为：
 
-当前仍保留两阶段验证型 pipeline，尚未整理成正式项目管线：
+```text
+pi3x
++ SIMPLE_PINHOLE
++ SIFT as S
++ ALIKED/VGGSfM prior as P
++ group_strategy = pose
++ SPV augmented BA
+```
 
-- A 脚本：在 MERG3R 环境中跑到 `align_extrinsics()` 完成，导出 coarse pose、图像、SuperPoint/LightGlue artifacts。
-- B 脚本：在 Gluemap 环境中读取 A artifacts，构建 `S + P` tracks，接入 Gluemap-style intrinsics averaging，并构建 `V` virtual tracks。`SP` 仍走标准 pycolmap BA；`SPV` 已接入 virtual reconstruction、SelectVirtualTrack 和 Gluemap-style augmented BA。
+已移除或收敛掉的分支：
 
-当前可跑两条主线：
-
-- `S`: 支持两种来源：
-  - `lightglue`：A 阶段导出的 SuperPoint + LightGlue database，保留为 ablation。
-  - `sift`：B 阶段复刻原版 GlueMap 的 SIFT extraction + matching，是当前推荐主线。
-- `P`: ALIKED query -> VGGSfM prior tracks -> snap to SIFT/SuperPoint -> TrackEstablishment-like DB writer。
-- `SP`: `S + P -> merged DB -> triangulation -> SelectTrack/filter -> standard pycolmap BA`。
-- `SPV`: `S + P + V -> virtual reconstruction -> SelectTrack + SelectVirtualTrack -> reprojection filtering -> augmented BA`。
+- 不再保留 LightGlue/SuperPoint 作为主线 `S` 分支。
+- 不再保留 `SP` mode 作为 pipeline 主流程，固定走 `SPV`。
+- `group_strategy` 固定为 `pose`，不再接入 star-like mode。
+- `vggsfm_query_source` 固定为 `aliked`。
+- `vggsfm_tracker_input` 固定为 `1024`。
+- `s_database_mode` 固定为 `sift`。
+- `prior_snap_to_sift`、`prior_keep_unsnapped`、`drop_low_coverage_frames`、`enable_select_tracks`、`enable_reprojection_filter` 均作为默认启用逻辑，不再作为主线命令行开关。
 
 ## 当前实现状态
 
-### A 脚本：Merg3r coarse + S artifacts
+### 整合 pipeline
+
+文件：
+
+```text
+MERG3R/run_merg3r_gluemap_pipeline.py
+```
+
+当前职责：
+
+- 在单脚本内完成 Merg3r coarse stage 与 GlueMap-style refinement stage。
+- Stage 1 使用低分辨率图像运行 `pi3x` 前馈推理、sequence 构建、`align_extrinsics()`、`restore_predictions_order()`。
+- Stage 1 结束后直接把 coarse pose、low-res depth/depth_conf、pairs、low/high intrinsics、low/high images 传入 Stage 2，不再通过 `gluemap_refine_inputs/` artifact 目录中转。
+- Stage 2 使用高分辨率图像与高分辨率内参构建 SIFT database、VGGSfM prior、merged DB、virtual reconstruction，并执行 SPV augmented BA。
+- pipeline metadata 会记录当前固定配置、image pyramid 配置、coarse/refine timing 和 refine stats。
+
+当前固定主线：
+
+```text
+MERG3R low-res inference/align
+-> high-res SIFT S database
+-> ALIKED query + VGGSfM tracker input 1024
+-> P tracks snap to SIFT where possible
+-> keep unsnapped P
+-> filter low-coverage frames
+-> Gluemap intrinsics_averaging
+-> virtual-track diagnostics/preparation
+-> merged S+P database
+-> virtual reconstruction
+-> SelectTrack + SelectVirtualTrack
+-> real/virtual reprojection filtering
+-> iterative augmented BA
+```
+
+### 工具模块整理
+
+新增/整理到 `MERG3R/utils/` 的主流程工具：
+
+```text
+MERG3R/utils/gluemap_spv_refine.py
+MERG3R/utils/gluemap_refine_core.py
+MERG3R/utils/image_pyramid.py
+```
+
+职责拆分：
+
+- `gluemap_spv_refine.py`：Stage 2 顶层编排，固定 `SIMPLE_PINHOLE + SIFT + ALIKED + pose groups + SPV` 主线。
+- `gluemap_refine_core.py`：从旧 B 脚本抽出的 GlueMap/COLMAP 工具函数，包括 SIFT database、VGGSfM prior、frame filtering、intrinsics averaging、virtual tracks、merged DB、triangulation、SelectTrack、SelectVirtualTrack、augmented BA 等。
+- `image_pyramid.py`：整合 `scripts/crop_img.py` 的整数比例 crop/resize 思路，构建低/高分辨率两组图片，并提供 low/high image tensor 读取和 low/high K 缩放工具。
+
+当前 `run_merg3r_pycolmap_refine.py` 不再作为 pipeline 的运行依赖，后续只作为历史参考和回归对照。
+
+### 高低分辨率处理
+
+当前 pipeline 默认启用 image pyramid：
+
+```bash
+--image_pyramid
+--stage1_downscale_n 4
+--stage1_multiple 14
+--stage2_scale_factor 0
+```
+
+含义：
+
+- 输入图片先经过整数比例 crop/resize，输出 low/high 两组图片。
+- low-res 图片用于 Merg3r/pi3x 前馈推理、align、coarse depth、coarse pose。
+- high-res 图片用于 SIFT、VGGSfM prior、COLMAP database、final reconstruction 和后续 Gaussian 训练对齐。
+- `stage2_scale_factor=0` 表示 high-res 侧使用 `stage1_downscale_n` 对应的比例，通常接近原始输入分辨率。
+- Stage 2 的全局内参由 Stage 1 low-res intrinsic 按 low->high 尺度线性缩放得到。
+
+当前坐标域约定：
+
+- `build_virtual_track_diagnostics` 的 CovisibilityExtraction / generation 阶段直接使用 Stage 1 low-res depth 与 low-res K，不额外 resize depth。
+- `VirtualTrackPreparation` 阶段回到 high-res 图像域，使用 high-res global intrinsic 做 virtual track 更新、subsample 和 global update。
+- SIFT 直接读取 high-res 图像。
+- VGGSfM tracker 仍固定使用 `1024` input，并通过 tracker image changes 映射回 high-res 图像域。
+
+最近一次 high/low 切换对比显示：
+
+- high K 相对 low K 约为 `4x` 缩放，符合预期。
+- high-res SIFT keypoints/matches 显著增加，final real points 增加。
+- virtual track 数量基本稳定，未观察到明显坐标系错误。
+- high-res 流程耗时明显增加，因此已继续加入 SIFT 提取限制。
+
+### SIFT database 复用与限制
+
+当前 refinement 会先构建一次 prefilter SIFT database，用于统计 `S + P` observation 并执行 low-coverage frame filtering。
+
+过滤帧后不再重新跑完整 SIFT extract + match，而是通过：
+
+```text
+filter_sift_database_for_refine()
+```
+
+从第一遍 SIFT database 复制并过滤出 final SIFT database：
+
+- 删除 dropped frames。
+- 保留未 drop 图像的 keypoints/descriptors。
+- 重写 images/cameras，并重新映射 image id。
+- 过滤 matches/two-view geometries 中涉及 dropped frames 的 pair。
+
+这样避免第二遍重复执行高分辨率 `pycolmap.extract_features()` 和 `pycolmap.match_image_pairs()`。
+
+当前 high-res SIFT 速度瓶颈仍主要来自第一遍 extraction/matching，因此已在 `MERG3R/gluemap/gluemap/utils/colmap.py` 的 `prepare_sift_database()` 中限制 SIFT 提取规模：
+
+```text
+FeatureExtractionOptions.max_image_size = 1024
+FeatureExtractionOptions.sift.max_num_features = 4096
+```
+
+判断：
+
+- `max_image_size=1024` 限制 SIFT 提取阶段的输入尺度，优先降低像素处理成本。
+- `max_num_features=4096` 限制每图 SIFT descriptor 数量，进一步降低 matching 成本。
+- 暂未调整 `FeatureMatchingOptions.max_num_matches`，因为当前有效 matches/pair 远低于默认上限，主要瓶颈不是最终存储 match 数。
+
+后续可保留两档配置：
+
+```text
+质量/速度平衡: max_image_size=1600, max_num_features=8192
+速度优先:     max_image_size=1024, max_num_features=4096
+```
+
+当前代码先采用速度优先档，以验证 high-res pipeline 的整体吞吐。
+
+### 历史 A 脚本：Merg3r coarse + S artifacts
 
 文件：
 
@@ -120,7 +265,7 @@ frame_000001.png
 
 当前 B 脚本和输出 COLMAP reconstruction 使用的是 `artifact_image_names`，不是原始输入图片名。如果后续 Gaussian 训练需要和原始文件名对齐，需要改为保留原始 basename 或在 B 脚本写 reconstruction 时恢复原始 image name。
 
-### B 脚本：S/P/V tracks -> merged DB / virtual reconstruction -> refinement
+### 历史 B 脚本：S/P/V tracks -> merged DB / virtual reconstruction -> refinement
 
 文件：
 
@@ -979,7 +1124,7 @@ per iteration:
 - `predictions_dict["tracks"]` 的真实 P tracks 没有复刻成原版 tensor 结构；real tracks 仍通过 COLMAP database + pycolmap triangulation 产生。
 - `SPV` 的 augmented BA 是 Merg3r-adapted GlueMap 流程，不是直接调用原版 `run_refinement_pipeline()` 的完整输入。
 - 默认 camera model 已改为 `SIMPLE_PINHOLE`，与当前 `pi3x` 主线更一致；若需要保留 `PINHOLE`，需要修 normalized reprojection focal 归一化。
-- 当前还没有原版 GlueMap 的任意输入分辨率 resize/restore 工程能力；A 阶段目前默认输入已经是预处理好的同域图像。
+- 当前没有直接复刻原版 GlueMap 的 resize/restore 实现，而是采用 image pyramid：low-res 供 Stage 1 推理和 depth，high-res 供 Stage 2 refinement 和最终输出。
 
 ## 当前判断
 
@@ -1016,7 +1161,7 @@ Merg3r aligned coarse pose
 - `pi3x + SIMPLE_PINHOLE + SIFT as S` 是当前最接近原版 GlueMap 的组合。
 - `vggt_omega` 路径如果继续支持，需要单独处理 camera model / `fx=fy` 假设，不应直接混入当前主线结论。
 - 当前没有 `pose_inconsistent` 的直接风险较低，因为 local group extrinsics 和 global pose 同源；后续若引入原版 GlobalGluer/pose averaging，需要补 diagnostics。
-- 现在的重点不再是验证能否接近原版，而是工程化、resize/restore、代码整理和加速。
+- 现在的重点不再是验证能否接近原版，而是稳定 high/low 坐标域、参数配置化、运行耗时和下游 Gaussian 质量验证。
 
 ## Depth 与 refined pose 的同源性
 
@@ -1060,191 +1205,106 @@ refined pose + refined sparse points
 
 ## 使用示例
 
-A 脚本：
+当前推荐主线使用整合脚本：
 
 ```bash
-python MERG3R/export_merg3r_refine_inputs.py \
+python MERG3R/run_merg3r_gluemap_pipeline.py \
   --dataset /path/to/images \
-  --output_dir /path/to/output
+  --output_dir /path/to/output \
+  --path_tracker /path/to/vggsfm_tracker
 ```
 
-B 脚本当前推荐主线：
+默认配置已经固定为：
 
-```bash
-python gluemap/run_merg3r_pycolmap_refine.py \
-  --artifact_dir /path/to/output/gluemap_refine_inputs \
-  --track_mode SPV \
-  --s_database_mode sift \
-  --vggsfm_query_source aliked \
-  --vggsfm_tracker_input 1024 \
-  --group_strategy star \
-  --enable_select_tracks \
-  --enable_reprojection_filter \
-  --num_refinement_iterations 2 \
-  --augmented_ba_max_filter_iterations 3
+```text
+pi3x + SIMPLE_PINHOLE + SIFT + ALIKED + pose groups + SPV
+image_pyramid enabled
+stage1_downscale_n = 4
+stage1_multiple = 14
+stage2_scale_factor = 0
+pair_k_pose = 25
+num_refinement_iterations = 2
 ```
 
-说明：
-
-- 当前默认 `--camera_model SIMPLE_PINHOLE`。如果显式传 `--camera_model PINHOLE`，旧 pycolmap 版本的 Python fallback normalized reprojection filter 仍可能因 `camera.focal_length` 只支持单 focal 而报错。
-- 当前默认 `--build_virtual_tracks`，因此 A artifacts 需要包含 `raw_geometry.npz`。
-- 当前 `--s_database_mode sift` 更贴近原版 GlueMap，也是最新数值接近原版的推荐配置；`lightglue` 主要保留为 ablation。
-- `--group_strategy star` 更贴近原版 star graph；`pose` 可作为 sanity check，当前 angular error 差别不大。
-- 如果只想复现旧的 `S + P -> BA` 主线，可加：
+常用可调参数：
 
 ```bash
---no-build_virtual_tracks
-```
+# 输入采样
+--num_images 181
+--subsample 1
 
-- 如需保存完整 virtual-track tensor debug：
+# image pyramid
+--stage1_downscale_n 4
+--stage1_multiple 14
+--stage2_scale_factor 0
 
-```bash
+# pair 构建
+--pair_k_pose 25
+--pair_pose_rotation_threshold 30.0
+
+# VGGSfM group 与 BA
+--neighbors_per_center 25
+--num_refinement_iterations 2
+--ba_max_num_iterations 100
+
+# debug
 --save_virtual_tracks_debug
+--no-debug_print
 ```
 
-B 脚本 SP / standard BA ablation：
+旧两阶段脚本仍可用于对照：
 
-```bash
-python gluemap/run_merg3r_pycolmap_refine.py \
-  --artifact_dir /path/to/output/gluemap_refine_inputs \
-  --track_mode SP \
-  --s_database_mode sift \
-  --vggsfm_query_source aliked \
-  --vggsfm_tracker_input 1024 \
-  --enable_select_tracks \
-  --enable_reprojection_filter
+```text
+MERG3R/export_merg3r_refine_inputs.py
+MERG3R/gluemap/run_merg3r_pycolmap_refine.py
 ```
 
-常用 ablation：
-
-```bash
-# 旧 P query 行为
---vggsfm_query_source superpoint
-
-# strict snap，只保留 snapped P
---no-prior_keep_unsnapped
-
-# 放宽 reprojection filtering
---filter_reproj_error_threshold 0.75
---filter_reproj_error_threshold 1.0
-
-# 增加 VGGSfM group 邻居
---neighbors_per_center 16
---neighbors_per_center 24
-
-# 切换到 pose group sanity check
---group_strategy pose
-
-# 旧 S 分支 ablation
---s_database_mode lightglue
-
-# 跳过 virtual-track diagnostics
---no-build_virtual_tracks
-```
+但它们不再是当前工程主入口。
 
 ## 已完成检查
 
-本地静态检查已通过：
+最近一次代码整理后，本地静态检查已通过：
 
 ```bash
-ruff check MERG3R/export_merg3r_refine_inputs.py
-ruff check gluemap/run_merg3r_pycolmap_refine.py
-ruff check gluemap/gluemap/estimators/track_establishment.py
-ruff check gluemap/gluemap/estimators/track_snapping.py
-python -m py_compile MERG3R/export_merg3r_refine_inputs.py
-python -m py_compile gluemap/run_merg3r_pycolmap_refine.py
-python -m py_compile gluemap/gluemap/estimators/track_establishment.py
-python -m py_compile gluemap/gluemap/estimators/track_snapping.py
+black MERG3R/utils/image_pyramid.py \
+      MERG3R/utils/gluemap_refine_core.py \
+      MERG3R/utils/gluemap_spv_refine.py \
+      MERG3R/run_merg3r_gluemap_pipeline.py
+
+ruff check MERG3R/utils/image_pyramid.py \
+           MERG3R/utils/gluemap_refine_core.py \
+           MERG3R/utils/gluemap_spv_refine.py \
+           MERG3R/run_merg3r_gluemap_pipeline.py
+
+python -m py_compile MERG3R/utils/image_pyramid.py \
+                     MERG3R/utils/gluemap_refine_core.py \
+                     MERG3R/utils/gluemap_spv_refine.py \
+                     MERG3R/run_merg3r_gluemap_pipeline.py
 ```
 
-实际运行环境在云端，本地不验证完整 AI/SfM 依赖。
+完整 AI/SfM 运行仍以云端/目标 conda 环境为准，本地 `pycodex` 环境不验证 torch/pycolmap/vggsfm 全链路。
+
+## 已完成工程化事项
+
+- 两阶段脚本已缝合为 `run_merg3r_gluemap_pipeline.py`。
+- Stage 2 逻辑已从旧 B 脚本拆入 `MERG3R/utils/`。
+- 主线分支已收敛为 `pi3x + SIMPLE_PINHOLE + SIFT + ALIKED + pose + SPV`。
+- 高/低分辨率图片预处理已整合为 image pyramid。
+- Stage 1 low-res 与 Stage 2 high-res 的 image/K/depth 坐标域已经分离。
+- SIFT database 已支持 prefilter 后过滤复用，避免第二遍重复 extract + match。
+- 高分辨率 SIFT 已增加 `max_image_size=1024` 与 `max_num_features=4096` 限制，降低第一遍 SIFT 成本。
 
 ## 下一阶段优化方向
 
-缝合验证阶段结束后，下一阶段目标是小幅工程优化，不再优先大改核心算法。
+当前不再优先大改核心算法，后续重点是稳定性、可配置化和性能观测。
 
-### 1. 图片 resize / restore
-
-目标：像原版 GlueMap 一样支持任意分辨率输入图片。
-
-当前限制：
-
-- A 阶段默认输入图片已经是预处理好的尺寸。
-- A 导出的 image、depth、intrinsic 当前假设同域。
-- B 阶段 tracker input 已支持 GlueMap-style 1024，但完整 pipeline 还没有“原图域 <-> 处理域 <-> 输出域”的统一坐标恢复机制。
-
-计划：
-
-- A 阶段记录原始 image size、处理后 image size、resize scale、padding/crop 信息。
-- 所有 2D keypoints / tracks / virtual tracks 在内部处理域运行，但写 COLMAP reconstruction 时能恢复到原图域。
-- intrinsic 按 resize scale 做一致变换：
-  - 处理域 K 用于模型、tracking、virtual-track generation。
-  - 输出域 K 用于最终 reconstruction / 下游 Gaussian。
-- depth / depth_conf 与 image resize 保持同域；如需输出原图域 depth，增加 restore 逻辑。
-- 明确 `artifact_image_names` 与 `original_image_names` 的映射，必要时最终 reconstruction 恢复原始 basename。
-
-验收：
-
-- 任意输入分辨率图片可以直接传入 A 阶段，不需要用户预先 resize。
-- B 阶段输出的 COLMAP image size、intrinsic、keypoints 坐标域一致。
-- 与当前预 resize 输入相比，数值指标没有明显退化。
-
-### 2. 代码整理
-
-目标：把当前验证脚本整理成可维护的两阶段 pipeline。
-
-计划：
-
-- 拆分 `run_merg3r_pycolmap_refine.py` 中的长函数：
-  - artifact loading / filtering
-  - S database construction
-  - P prior tracking/database writing
-  - virtual-track construction
-  - triangulation / SelectTrack / filtering
-  - augmented BA
-  - stats/debug writer
-- 统一配置命名，把实验遗留参数分成：
-  - recommended path
-  - ablation switches
-  - debug-only switches
-- 清理 LightGlue legacy 路径，保留为明确的 `s_database_mode=lightglue` ablation。
-- 把 star/pose group、SIFT/LightGlue、SP/SPV 的 stats 输出统一字段，便于后续横向比较。
-- 将“场景外远点”相关诊断加入 stats，而不是直接做硬删除：
-  - `xyz_norm`
-  - depth 分位数
-  - track length
-  - triangulation angle
-  - S-only / P-only / mixed 来源。
-
-验收：
-
-- 默认命令就是当前推荐主线。
-- ablation 参数不会改变无关路径。
-- `refine_stats.json` 和 `virtual_track_stats.json` 字段稳定、可比较。
-
-### 3. 加速
-
-目标：减少重复计算，让常用 ablation 更快。
-
-候选优化：
-
-- 缓存 SIFT database：
-  - 同一组 image/pairs/intrinsic 不重复 extract/match。
-- 缓存 VGGSfM prior tracks：
-  - group strategy、neighbors、tracker input、query source 不变时复用。
-- 缓存 virtual-track diagnostics：
-  - image/depth/extrinsic/K/groups 不变时复用。
+- 把 SIFT 限制参数从硬编码整理为 pipeline 配置，支持 `1024/4096` 与 `1600/8192` 两档。
+- 缓存 VGGSfM prior tracks：group、neighbors、tracker input、query source 不变时复用。
+- 缓存 virtual-track diagnostics：image/depth/extrinsic/K/groups 不变时复用。
 - 减少重复 pycolmap triangulation 输出目录 IO。
-- 对 debug 统计增加轻量/完整两级：
-  - 默认只打印核心数值。
-  - `--debug_full_stats` 再计算昂贵分桶。
+- 对 debug 统计增加轻量/完整两级：默认只打印核心数值，完整模式再计算昂贵分桶。
 - 对 SIFT/BA/virtual-track 阶段分别记录 wall time，优先优化耗时最高环节。
-
-验收：
-
-- 常规 `pi3x + SIFT + SPV` 实验重跑速度下降。
-- star/pose、filter threshold、SP/SPV 等 ablation 能复用前置缓存。
-- 加速不改变默认数值输出。
+- 将“场景外远点”相关诊断加入 stats，而不是直接做硬删除：`xyz_norm`、depth 分位数、track length、triangulation angle、S-only/P-only/mixed 来源。
 
 ### 保留观察项
 

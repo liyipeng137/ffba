@@ -678,15 +678,23 @@ def prepare_sift_database(
     # Extract the features for all images
     reader_opts = pycolmap.ImageReaderOptions()
     reader_opts.camera_model = camera_model
+    feature_extraction_opts = pycolmap.FeatureExtractionOptions(
+        num_threads=16,
+        gpu_index=gpu_index,
+        use_gpu=use_gpu,
+    )
+    feature_extraction_opts.max_image_size = 1024
+    feature_extraction_opts.sift.max_num_features = 4096
     pycolmap.extract_features(
         datbase_dir,
         images_path,
         images_list,
         camera_mode,
         reader_opts,
-        extraction_options=pycolmap.FeatureExtractionOptions(
-            num_threads=16, gpu_index=gpu_index, use_gpu=use_gpu
-        ),
+        # extraction_options=pycolmap.FeatureExtractionOptions(
+        #     num_threads=16, gpu_index=gpu_index, use_gpu=use_gpu
+        # ),
+        extraction_options=feature_extraction_opts
     )  # use the same camera model for all images
 
     database = pycolmap.Database.open(datbase_dir)
