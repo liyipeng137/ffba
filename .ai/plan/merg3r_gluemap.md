@@ -194,6 +194,93 @@ FeatureExtractionOptions.sift.max_num_features = 4096
 
 当前代码先采用速度优先档，以验证 high-res pipeline 的整体吞吐。
 
+### VGGSfM prior / virtual-track 加速开关
+
+当前已完成三处不改变主线默认语义的加速改造：`precompute_vggsfm_tracker_fmaps` 默认开启，`prior_match_topology` 与 `virtual_verify_mode` 保留可切换模式，便于做速度/质量 A/B。
+
+#### `precompute_vggsfm_tracker_fmaps`
+
+`run_vggsfm_prior_tracks()` 现在会先对 Stage 2 tracker images 做一次全局 coarse feature map 预计算：
+
+```text
+precompute_vggsfm_tracker_fmaps()
+```
+
+然后每个 VGGSfM group 直接传入对应 group 的 `fmaps`，避免在每个 group 内重复执行 `tracker.process_images_to_fmaps()`。
+
+当前实现细节：
+
+- 预计算按 chunk 执行，避免一次性占用过多显存。
+- 预计算结果先 detach 到 CPU，每个 group tracking 时再按需搬回 tracker device。
+- stats 中记录 `precompute_fmaps` 与 `group_tracking_time`，日志中打印 `fmap_precompute` 和 `group_tracking`。
+- 该逻辑无命令行开关，作为默认行为启用。
+
+当前一次实测参考：
+
+```text
+VGGSfM prior done: groups=290, tracks=294506, observations=5319640,
+fmap_precompute=2.56s, group_tracking=206.12s, time=216.78s
+```
+
+相比 group 内重复提取 fmaps 的旧逻辑，已节省几十秒。后续若继续优化 VGGSfM prior，优先评估 fmaps 常驻 GPU、减少 CPU/GPU 往返；当前 `batch=2` 观测反而更慢，说明瓶颈不只是显存容量，batch 多 group 需要重新评估或回退。
+
+#### `prior_match_topology`
+
+VGGSfM prior 写入 COLMAP database 时新增：
+
+```bash
+--prior_match_topology all_pairs
+--prior_match_topology star
+```
+
+模式语义：
+
+- `all_pairs`：旧逻辑。对同一 prior track 内所有 observation 两两写 correspondences，形成 clique。默认仍保持该模式，保证与已有结果可比。
+- `star`：参考原版 GlueMap `track_establishment.py` 的 center-neighbor 思路，只写 center observation 到其他 observation 的 correspondences。
+
+`star` 的预期收益是减少 `write_tracks_database()` 产生的 pair/keypoint/match 规模，尤其在 prior track 较长时降低 SQLite 写入与 match merge 成本。
+
+质量风险判断：
+
+- 它不会改变 VGGSfM tracker 输出的 tracks，也不会改变 P track 的坐标。
+- 它只改变 prior DB 中同一 track 展开成 pairwise correspondences 的拓扑。
+- 原版 GlueMap 也采用 center-neighbor star 关系，因此该模式并不是任意删边。
+- 但当前 pipeline 后续的 pycolmap reconstruction/triangulation 与 merging 行为可能受 pair coverage 影响，所以暂不替换默认值，建议用 `all_pairs` vs `star` 做 A/B，并同时观察 final real tracks、BA cost、Gaussian 训练结果。
+
+stats 会记录：
+
+```text
+keypoint_merge.match_topology
+```
+
+#### `virtual_verify_mode`
+
+virtual-track diagnostics 中的 reprojection verification 新增：
+
+```bash
+--virtual_verify_mode n2
+--virtual_verify_mode center
+```
+
+模式语义：
+
+- `n2`：旧逻辑。对 group 内 image pairs 做 N^2 reprojection verification，并产生 dense `pose_scores`。默认仍保持该模式，保证与已有结果可比。
+- `center`：只做 center-to-neighbor verification，直接得到当前 pipeline 真正需要的 center 视角 `valid_mask_0`。
+
+为什么 `center` 可能是正向加速：
+
+- 原版 GlueMap 后续依赖 `pose_scores` 做全局图优化，包括 graph construction、rotation/similarity averaging、MST 等，因此 N^2 score 有明确用途。
+- 当前 Merg3r+GlueMap pipeline 已有 Merg3r pose，不走原版 `GlobalGluer` 的全局图优化路径。
+- 当前 virtual-track 构建主要使用 center 视角的有效 mask；dense `pose_scores` 更多是诊断/兼容信息。
+
+因此 `center` 模式可以跳过大量 pairwise verification 计算，预期加速 `build_virtual_track_diagnostics()`。但它会让 `pose_scores` 从 dense pair scores 变成 center-direct scores，后续如果重新接回原版 GlobalGluer 或依赖 dense scores 的逻辑，需要切回 `n2`。
+
+stats 会记录：
+
+```text
+virtual_tracks.verify_mode
+```
+
 ### 历史 A 脚本：Merg3r coarse + S artifacts
 
 文件：
@@ -1224,6 +1311,9 @@ stage1_multiple = 14
 stage2_scale_factor = 0
 pair_k_pose = 25
 num_refinement_iterations = 2
+precompute_vggsfm_tracker_fmaps enabled
+prior_match_topology = all_pairs
+virtual_verify_mode = n2
 ```
 
 常用可调参数：
@@ -1247,10 +1337,20 @@ num_refinement_iterations = 2
 --num_refinement_iterations 2
 --ba_max_num_iterations 100
 
+# 加速 / A-B 参数
+--prior_match_topology all_pairs     # 可切到 star，减少 prior DB pairwise correspondences
+--virtual_verify_mode n2             # 可切到 center，跳过 virtual N^2 verification
+
 # debug
 --save_virtual_tracks_debug
 --no-debug_print
 ```
+
+说明：
+
+- VGGSfM tracker fmaps 预计算已作为默认逻辑启用，无需额外命令行参数。
+- `prior_match_topology=all_pairs` 与 `virtual_verify_mode=n2` 保持旧行为，适合作为质量基线。
+- `prior_match_topology=star` 与 `virtual_verify_mode=center` 是当前主要加速 ablation 组合，需要用最终 reconstruction/BA/Gaussian 指标确认质量。
 
 旧两阶段脚本仍可用于对照：
 
@@ -1293,6 +1393,9 @@ python -m py_compile MERG3R/utils/image_pyramid.py \
 - Stage 1 low-res 与 Stage 2 high-res 的 image/K/depth 坐标域已经分离。
 - SIFT database 已支持 prefilter 后过滤复用，避免第二遍重复 extract + match。
 - 高分辨率 SIFT 已增加 `max_image_size=1024` 与 `max_num_features=4096` 限制，降低第一遍 SIFT 成本。
+- VGGSfM prior tracking 已默认预计算 tracker fmaps，避免每个 group 重复提取 coarse features。
+- prior DB 写入已支持 `prior_match_topology=all_pairs/star`，其中 `star` 参考原版 GlueMap center-neighbor correspondences。
+- virtual-track verification 已支持 `virtual_verify_mode=n2/center`，其中 `center` 可跳过当前 pipeline 不强依赖的 dense N^2 pose score。
 
 ## 下一阶段优化方向
 
@@ -1301,6 +1404,8 @@ python -m py_compile MERG3R/utils/image_pyramid.py \
 - 把 SIFT 限制参数从硬编码整理为 pipeline 配置，支持 `1024/4096` 与 `1600/8192` 两档。
 - 缓存 VGGSfM prior tracks：group、neighbors、tracker input、query source 不变时复用。
 - 缓存 virtual-track diagnostics：image/depth/extrinsic/K/groups 不变时复用。
+- 对 `prior_match_topology=star` 与 `virtual_verify_mode=center` 做正式 A/B，确认是否可作为默认加速配置。
+- 继续评估 VGGSfM prior tracking：当前 `batch=2` 观测更慢，后续优先看 fmaps 常驻 GPU、减少搬运和 tracker kernel 调度成本。
 - 减少重复 pycolmap triangulation 输出目录 IO。
 - 对 debug 统计增加轻量/完整两级：默认只打印核心数值，完整模式再计算昂贵分桶。
 - 对 SIFT/BA/virtual-track 阶段分别记录 wall time，优先优化耗时最高环节。

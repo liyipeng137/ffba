@@ -42,6 +42,7 @@ class GluemapSpvRefineConfig:
     filter_reproj_error_type: str = "angular"
     filter_reproj_error_threshold: float = 0.5
     virtual_init_angular_error_threshold: float | None = None
+    virtual_verify_mode: str = "n2"
     save_virtual_tracks_debug: bool = False
     debug_print: bool = True
     work_image_workers: int = 16
@@ -103,6 +104,7 @@ def _make_refine_args(config: GluemapSpvRefineConfig):
         virtual_init_angular_error_threshold=(
             config.virtual_init_angular_error_threshold
         ),
+        virtual_verify_mode=config.virtual_verify_mode,
         debug_print=config.debug_print,
     )
 
@@ -346,7 +348,7 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
         f"time={stats['timing']['intrinsics_averaging']:.2f}s",
     )
 
-    _debug(args, "Building virtual tracks")
+    _debug(args, f"Building virtual tracks: verify_mode={args.virtual_verify_mode}")
     t0 = time.time()
     (
         virtual_predictions_dict,
@@ -371,6 +373,7 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
     _debug(
         args,
         "Virtual tracks done: "
+        f"verify_mode={vt['verify_mode']}, "
         f"groups={vt['num_groups']}, "
         f"valid_obs={final_vt['valid_observations']}, "
         f"time={stats['timing']['virtual_tracks']:.2f}s",

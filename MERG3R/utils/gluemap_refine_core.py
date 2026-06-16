@@ -367,6 +367,12 @@ def build_virtual_track_diagnostics(
     }
     extractor = CovisibilityExtraction(include_track=False)
     device = torch.device(args.device)
+    virtual_verify_mode = getattr(args, "virtual_verify_mode", "n2")
+    if virtual_verify_mode not in {"n2", "center"}:
+        raise ValueError(
+            "virtual_verify_mode must be 'n2' or 'center', "
+            f"got {virtual_verify_mode!r}"
+        )
     t0 = time.time()
     for group in groups:
         group_np = np.asarray(group, dtype=np.int64)
@@ -394,11 +400,18 @@ def build_virtual_track_diagnostics(
             predictions["extrinsics"],
             predictions["intrinsics"],
         )
-        pose_scores, reprojection_valid_mask = extractor._verify_by_reprojection_n2(
-            depth_transformed,
-            predictions["extrinsics"],
-            predictions["intrinsics"],
-        )
+        if virtual_verify_mode == "n2":
+            pose_scores, reprojection_valid_mask = extractor._verify_by_reprojection_n2(
+                depth_transformed,
+                predictions["extrinsics"],
+                predictions["intrinsics"],
+            )
+        else:
+            pose_scores, reprojection_valid_mask = extractor._verify_by_reprojection(
+                depth_transformed,
+                predictions["extrinsics"],
+                predictions["intrinsics"],
+            )
         (
             tracks_virtual,
             points3d_virtual,
@@ -429,6 +442,7 @@ def build_virtual_track_diagnostics(
         "num_groups": int(len(groups)),
         "neighbors_per_center": int(args.neighbors_per_center),
         "group_strategy": args.group_strategy,
+        "verify_mode": virtual_verify_mode,
         "group_stats": group_stats,
         "skipped_centers": skipped_centers,
         "depth": {

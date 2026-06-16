@@ -174,6 +174,17 @@ def parse_args():
     parser.add_argument("--filter_reproj_error_threshold", type=float, default=0.5)
     parser.add_argument("--virtual_init_angular_error_threshold", type=float)
     parser.add_argument(
+        "--virtual_verify_mode",
+        type=str,
+        default="n2",
+        choices=["n2", "center"],
+        help=(
+            "Virtual-track covisibility verification mode. 'n2' matches "
+            "GlueMap's full N^2 verification; 'center' verifies only the "
+            "center-to-neighbor sweep used to build virtual-track masks."
+        ),
+    )
+    parser.add_argument(
         "--save_virtual_tracks_debug",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -589,6 +600,7 @@ def main():
         filter_reproj_error_type=args.filter_reproj_error_type,
         filter_reproj_error_threshold=args.filter_reproj_error_threshold,
         virtual_init_angular_error_threshold=args.virtual_init_angular_error_threshold,
+        virtual_verify_mode=args.virtual_verify_mode,
         save_virtual_tracks_debug=args.save_virtual_tracks_debug,
         debug_print=args.debug_print,
         work_image_workers=args.image_pyramid_workers,
