@@ -154,7 +154,32 @@ def parse_args():
         ),
     )
     parser.add_argument("--min_frame_observations", type=int, default=10)
+    parser.add_argument(
+        "--ba_backend",
+        type=str,
+        default="ceres",
+        choices=["ceres", "bae"],
+        help=(
+            "Bundle adjustment backend for GlueMap augmented BA. 'ceres' keeps "
+            "the original solver; 'bae' uses MERG3R/bae as an independent "
+            "PyTorch backend."
+        ),
+    )
     parser.add_argument("--ba_max_num_iterations", type=int, default=100)
+    parser.add_argument(
+        "--bae_max_num_iterations",
+        type=int,
+        default=20,
+        help="BAE optimizer iterations when --ba_backend=bae.",
+    )
+    parser.add_argument(
+        "--bae_optimize_intrinsics",
+        action="store_true",
+        help=(
+            "Let the BAE backend optimize SIMPLE_PINHOLE [f, cx, cy]. "
+            "Ignored by the Ceres backend."
+        ),
+    )
     parser.add_argument("--num_refinement_iterations", type=int, default=2)
     parser.add_argument("--augmented_ba_max_filter_iterations", type=int, default=3)
     parser.add_argument(
@@ -588,7 +613,10 @@ def main():
         prior_keypoint_merge_threshold=args.prior_keypoint_merge_threshold,
         prior_match_topology=args.prior_match_topology,
         min_frame_observations=args.min_frame_observations,
+        ba_backend=args.ba_backend,
         ba_max_num_iterations=args.ba_max_num_iterations,
+        bae_max_num_iterations=args.bae_max_num_iterations,
+        bae_optimize_intrinsics=args.bae_optimize_intrinsics,
         num_refinement_iterations=args.num_refinement_iterations,
         augmented_ba_max_filter_iterations=args.augmented_ba_max_filter_iterations,
         augmented_ba_normalized_reproj_threshold=(

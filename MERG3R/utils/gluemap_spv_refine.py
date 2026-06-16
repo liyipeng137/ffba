@@ -32,7 +32,10 @@ class GluemapSpvRefineConfig:
     prior_keypoint_merge_threshold: float = 1e-3
     prior_match_topology: str = "all_pairs"
     min_frame_observations: int = 10
+    ba_backend: str = "ceres"
     ba_max_num_iterations: int = 100
+    bae_max_num_iterations: int = 20
+    bae_optimize_intrinsics: bool = False
     num_refinement_iterations: int = 2
     augmented_ba_max_filter_iterations: int = 3
     augmented_ba_normalized_reproj_threshold: float = 1e-2
@@ -88,7 +91,10 @@ def _make_refine_args(config: GluemapSpvRefineConfig):
         min_frame_observations=config.min_frame_observations,
         device=config.device,
         camera_model=CAMERA_MODEL,
+        ba_backend=config.ba_backend,
         ba_max_num_iterations=config.ba_max_num_iterations,
+        bae_max_num_iterations=config.bae_max_num_iterations,
+        bae_optimize_intrinsics=config.bae_optimize_intrinsics,
         num_refinement_iterations=config.num_refinement_iterations,
         augmented_ba_max_filter_iterations=(config.augmented_ba_max_filter_iterations),
         augmented_ba_normalized_reproj_threshold=(
@@ -187,6 +193,8 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
         "vggsfm_query_source": QUERY_SOURCE,
         "vggsfm_tracker_input": TRACKER_INPUT,
         "group_strategy": GROUP_STRATEGY,
+        "ba_backend": config.ba_backend,
+        "bae_optimize_intrinsics": config.bae_optimize_intrinsics,
         "timing": {"save_work_images": save_work_images_seconds},
         "work_images": {
             "images_dir": str(images_dir),

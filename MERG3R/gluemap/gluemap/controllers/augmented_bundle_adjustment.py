@@ -242,6 +242,17 @@ class IterativeBAOptions:
     # Whether to filter virtual points same as real tracks
     filter_virtual_points: bool = True
 
+    # Bundle adjustment backend. "ceres" preserves the original GlueMap
+    # implementation; "bae" uses the independent PyTorch BAE solver.
+    ba_backend: str = "ceres"
+
+    # BAE-specific options. If bae_max_iterations is None, max_ba_iterations is
+    # reused for the BAE optimizer.
+    bae_device: str = "cuda"
+    bae_max_iterations: int | None = None
+    bae_optimize_intrinsics: bool = False
+    last_ba_summary: dict | None = None
+
 
 def prune_track_outliers(
     points3D: dict[int, pycolmap.Point3D],
@@ -446,7 +457,9 @@ def initialize_world_points(
     # Prune outliers from tracks (modify points3D in place)
     prune_track_outliers(points3D, inlier_mask)
 
-    logger.info(f"Tracks: {num_tracks_before} -> {len(points3D)} after pruning")
+    logger.info(
+        f"Tracks: {num_tracks_before} -> {len(points3D)} after pruning"
+    )
     logger.info(f"Initialized {num_initialized_virtual} virtual world points")
 
     return points3D
@@ -540,21 +553,58 @@ def iterative_bundle_adjustment(
             f"Tracks: real={len(reconstruction.points3D)}, "
             f"virtual={current_virtual_tracks}"
         )
-        logger.info(f"Threshold scaling: {scaling}x -> {current_threshold:.4f}")
-
-        # Run BA via bundle_adjustment
-        reconstruction, virtual_reconstruction, _summary = bundle_adjustment(
-            reconstruction,
-            virtual_reconstruction,
-            negative_depth_observations,
-            max_num_iterations=options.max_ba_iterations,
+        logger.info(
+            f"Threshold scaling: {scaling}x -> {current_threshold:.4f}"
         )
+
+        # Run BA via the selected backend.
+        if options.ba_backend == "ceres":
+            (
+                reconstruction,
+                virtual_reconstruction,
+                _summary,
+            ) = bundle_adjustment(
+                reconstruction,
+                virtual_reconstruction,
+                negative_depth_observations,
+                max_num_iterations=options.max_ba_iterations,
+            )
+        elif options.ba_backend == "bae":
+            from gluemap.estimators.bae_solver import (  # noqa: PLC0415
+                bundle_adjustment_bae,
+            )
+
+            bae_iterations = (
+                options.bae_max_iterations
+                if options.bae_max_iterations is not None
+                else options.max_ba_iterations
+            )
+            (
+                reconstruction,
+                virtual_reconstruction,
+                _summary,
+            ) = bundle_adjustment_bae(
+                reconstruction,
+                virtual_reconstruction,
+                negative_depth_observations,
+                max_num_iterations=bae_iterations,
+                device=options.bae_device,
+                optimize_intrinsics=options.bae_optimize_intrinsics,
+            )
+        else:
+            raise ValueError(
+                f"Unknown BA backend '{options.ba_backend}', expected "
+                "'ceres' or 'bae'"
+            )
+        options.last_ba_summary = _summary
 
         # Inner loop: filter and tighten threshold when too few tracks filtered
         # (matches C++ IterativeBundleAdjustment pattern)
         logger.info("Filtering tracks by reprojection ...")
         total_filtered = 0
-        should_stop = True  # Will be set to False if enough tracks are filtered
+        should_stop = (
+            True  # Will be set to False if enough tracks are filtered
+        )
 
         while iteration < options.max_filter_iterations:
             scaling = max(3 - iteration, 1)

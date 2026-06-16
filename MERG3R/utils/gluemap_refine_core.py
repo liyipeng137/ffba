@@ -2041,6 +2041,12 @@ def run_merg3r_augmented_refinement_loop(
         normalized_reproj_threshold=(args.augmented_ba_normalized_reproj_threshold),
         min_track_length=2,
         fix_rotations_first_pass=False,
+        ba_backend=getattr(args, "ba_backend", "ceres"),
+        bae_device=getattr(args, "device", "cuda"),
+        bae_max_iterations=getattr(args, "bae_max_num_iterations", None),
+        bae_optimize_intrinsics=getattr(
+            args, "bae_optimize_intrinsics", False
+        ),
     )
 
     reconstruction = None
@@ -2160,6 +2166,8 @@ def run_merg3r_augmented_refinement_loop(
                 "real": summarize_reconstruction(reconstruction),
                 "virtual": summarize_reconstruction(virtual_reconstruction),
             },
+            "backend": ba_options.ba_backend,
+            "summary": ba_options.last_ba_summary,
         }
         iter_stats["seconds"] = time.time() - t_iter
         stats["iterations"].append(iter_stats)
