@@ -145,7 +145,7 @@ def parse_args():
     parser.add_argument(
         "--prior_match_topology",
         type=str,
-        default="all_pairs",
+        default="star",
         choices=["all_pairs", "star"],
         help=(
             "Topology used to convert VGGSfM prior tracks into COLMAP pair "
@@ -176,7 +176,7 @@ def parse_args():
     parser.add_argument(
         "--virtual_verify_mode",
         type=str,
-        default="n2",
+        default="center",
         choices=["n2", "center"],
         help=(
             "Virtual-track covisibility verification mode. 'n2' matches "
