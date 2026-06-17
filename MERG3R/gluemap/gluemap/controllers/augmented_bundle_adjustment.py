@@ -251,6 +251,7 @@ class IterativeBAOptions:
     bae_device: str = "cuda"
     bae_max_iterations: int | None = None
     bae_optimize_intrinsics: bool = False
+    bae_real_only: bool = False
     last_ba_summary: dict | None = None
 
 
@@ -590,6 +591,7 @@ def iterative_bundle_adjustment(
                 max_num_iterations=bae_iterations,
                 device=options.bae_device,
                 optimize_intrinsics=options.bae_optimize_intrinsics,
+                real_only=options.bae_real_only,
             )
         else:
             raise ValueError(

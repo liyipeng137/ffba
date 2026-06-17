@@ -98,9 +98,10 @@ MERG3R/bae/ba_colmap.py
 
 第一版 BAE backend 按以下约束实现：
 
-- 不做 real-only 中间版本，直接拼接 real + virtual observations。
+- 默认直接拼接 real + virtual observations；可通过 `--bae_real_only`
+  诊断性跳过 virtual residual/point 参数。
 - 默认不优化 intrinsics；开启 `--bae_optimize_intrinsics` 时，仅对
-  `SIMPLE_PINHOLE` 优化 `[f, cx, cy]`。
+  `SIMPLE_PINHOLE` 优化 `f`，固定 `cx/cy`。
 - 不做 gauge fixing。
 - 不实现 robust loss，先用 plain squared loss。
 - camera model 假设所有 image 共享同一个 camera。
@@ -186,8 +187,8 @@ len(reconstruction.cameras) == 1
 ### Intrinsics
 
 BAE backend 默认固定 intrinsics。开启 `--bae_optimize_intrinsics` 时，
-只允许 `SIMPLE_PINHOLE`，并以 `[f, cx, cy]` 作为优化变量，因此
-`fx=fy=f` 是参数化天然保证的约束。
+只允许 `SIMPLE_PINHOLE`，并只优化 `f`，固定 `cx/cy`；`fx=fy=f`
+是参数化天然保证的约束。
 
 `SIMPLE_PINHOLE` 直接使用 COLMAP 原生三参数：
 
@@ -204,8 +205,8 @@ BAE intrinsics        = [fx, fy, cx, cy]
 ```
 
 不开启 `--bae_optimize_intrinsics` 时不更新 camera params。开启后将
-优化后的 `[f, cx, cy]` 写回 real reconstruction 的 shared camera，并同步
-给 virtual reconstruction 的同 id camera。
+优化后的 `[f, fixed cx, fixed cy]` 写回 real reconstruction 的 shared
+camera，并同步给 virtual reconstruction 的同 id camera。
 
 ### Pose
 
@@ -488,7 +489,7 @@ BAE summary 建议包含：
   "seconds": 0.0,
   "optimize_intrinsics": true,
   "intrinsics_initial": [1000.0, 512.0, 384.0],
-  "intrinsics_final": [1002.5, 511.8, 384.2],
+  "intrinsics_final": [1002.5, 512.0, 384.0],
   "fix_gauge": false,
   "loss": "plain_squared"
 }
@@ -609,10 +610,11 @@ Ceres / COLMAP 对 `z <= eps` residual 置零。BAE 如果直接除以 z，可�
 ```text
 新增 bae_solver.py
 -> 从 real reconstruction 抽 camera/real points/real obs
--> 从 virtual reconstruction 抽 virtual points/virtual obs/negative mask
+-> 默认从 virtual reconstruction 抽 virtual points/virtual obs/negative mask
+-> 可通过 --bae_real_only 跳过 virtual residual/point 参数
 -> 拼成一个 BAE problem
 -> fixed shared intrinsics by default
--> optional SIMPLE_PINHOLE [f, cx, cy] intrinsics optimization
+-> optional SIMPLE_PINHOLE f-only intrinsics optimization with fixed cx/cy
 -> plain squared loss
 -> no gauge fix
 -> solve

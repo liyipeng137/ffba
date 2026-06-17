@@ -176,8 +176,16 @@ def parse_args():
         "--bae_optimize_intrinsics",
         action="store_true",
         help=(
-            "Let the BAE backend optimize SIMPLE_PINHOLE [f, cx, cy]. "
+            "Let the BAE backend optimize SIMPLE_PINHOLE f while fixing cx/cy. "
             "Ignored by the Ceres backend."
+        ),
+    )
+    parser.add_argument(
+        "--bae_real_only",
+        action="store_true",
+        help=(
+            "Use only real observations in the BAE solve. Virtual reconstruction "
+            "is kept for downstream filtering/evaluation but not added to BAE."
         ),
     )
     parser.add_argument("--num_refinement_iterations", type=int, default=2)
@@ -617,6 +625,7 @@ def main():
         ba_max_num_iterations=args.ba_max_num_iterations,
         bae_max_num_iterations=args.bae_max_num_iterations,
         bae_optimize_intrinsics=args.bae_optimize_intrinsics,
+        bae_real_only=args.bae_real_only,
         num_refinement_iterations=args.num_refinement_iterations,
         augmented_ba_max_filter_iterations=args.augmented_ba_max_filter_iterations,
         augmented_ba_normalized_reproj_threshold=(

@@ -2047,6 +2047,7 @@ def run_merg3r_augmented_refinement_loop(
         bae_optimize_intrinsics=getattr(
             args, "bae_optimize_intrinsics", False
         ),
+        bae_real_only=getattr(args, "bae_real_only", False),
     )
 
     reconstruction = None

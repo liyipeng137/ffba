@@ -259,6 +259,7 @@ def _build_bae_problem(
     virtual_reconstruction,
     negative_depth_observations,
     bae_root,
+    include_virtual=True,
 ):
     camera_id, camera = _shared_camera(reconstruction)
     intrinsics, camera_model = _intrinsics_from_camera(camera)
@@ -269,9 +270,12 @@ def _build_bae_problem(
         reconstruction, real_point_ids, real_point_idx
     )
     virtual_point_ids = []
+    virtual_reconstruction_for_bae = (
+        virtual_reconstruction if include_virtual else None
+    )
     virtual_obs, virtual_skipped = _collect_virtual_observations(
         reconstruction,
-        virtual_reconstruction,
+        virtual_reconstruction_for_bae,
         negative_depth_observations,
         len(real_point_ids),
         virtual_point_ids,
@@ -300,10 +304,10 @@ def _build_bae_problem(
     ]
     virtual_points = (
         [
-            _point_xyz(virtual_reconstruction.points3D[point3D_id])
+            _point_xyz(virtual_reconstruction_for_bae.points3D[point3D_id])
             for point3D_id in virtual_point_ids
         ]
-        if virtual_reconstruction is not None
+        if virtual_reconstruction_for_bae is not None
         else []
     )
     points_3d = np.asarray(real_points + virtual_points, dtype=np.float64)
@@ -375,7 +379,8 @@ def _make_bae_model(runtime, camera_model, optimize_intrinsics):
     def reprojection_residual_simple_pinhole(
         points,
         camera_params,
-        intrinsics,
+        focal,
+        principal_point,
         points_2d,
         point_sign,
     ):
@@ -385,9 +390,9 @@ def _make_bae_model(runtime, camera_model, optimize_intrinsics):
         valid = z > 1e-12
         z_safe = torch.where(valid, z, torch.ones_like(z))
 
-        f = intrinsics[..., 0:1]
-        cx = intrinsics[..., 1:2]
-        cy = intrinsics[..., 2:3]
+        f = focal[..., 0:1]
+        cx = principal_point[..., 0:1]
+        cy = principal_point[..., 1:2]
         x = f * points_cam[..., 0:1] / z_safe + cx
         y = f * points_cam[..., 1:2] / z_safe + cy
         residual = torch.cat([x, y], dim=-1) - points_2d
@@ -423,7 +428,12 @@ def _make_bae_model(runtime, camera_model, optimize_intrinsics):
                         "BAE intrinsic optimization currently only supports "
                         "SIMPLE_PINHOLE"
                     )
-                self.shared_intr = pp.Parameter(intrinsics, sjac=True)
+                self.shared_focal = pp.Parameter(
+                    intrinsics[..., 0:1], sjac=True
+                )
+                self.register_buffer(
+                    "shared_principal_point", intrinsics[..., 1:3]
+                )
             else:
                 self.register_buffer("shared_intr", intrinsics)
 
@@ -443,6 +453,23 @@ def _make_bae_model(runtime, camera_model, optimize_intrinsics):
             point_sign = input_dict["point_sign"]
 
             zero_indices = torch.zeros_like(camera_indices)
+            if camera_model == "SIMPLE_PINHOLE":
+                if optimize_intrinsics:
+                    focal = self.shared_focal[zero_indices]
+                    principal_point = self.shared_principal_point[zero_indices]
+                else:
+                    intrinsics = self.shared_intr[zero_indices]
+                    focal = intrinsics[..., 0:1]
+                    principal_point = intrinsics[..., 1:3]
+                return residual_fn(
+                    self.points_3d[point_indices],
+                    self.pose[camera_indices],
+                    focal,
+                    principal_point,
+                    points_2d,
+                    point_sign,
+                )
+
             intrinsics = self.shared_intr[zero_indices]
             return residual_fn(
                 self.points_3d[point_indices],
@@ -451,6 +478,24 @@ def _make_bae_model(runtime, camera_model, optimize_intrinsics):
                 points_2d,
                 point_sign,
             )
+
+        def optimized_intrinsics(self):
+            if camera_model == "SIMPLE_PINHOLE":
+                if optimize_intrinsics:
+                    focal = self.shared_focal.detach().as_subclass(
+                        torch.Tensor
+                    )
+                    principal_point = (
+                        self.shared_principal_point.detach().as_subclass(
+                            torch.Tensor
+                        )
+                    )
+                    return torch.cat(
+                        [focal, principal_point],
+                        dim=-1,
+                    )
+                return self.shared_intr
+            return self.shared_intr
 
     return GluemapBaeResidual
 
@@ -519,6 +564,10 @@ def _intrinsics_as_list(intrinsics):
         float(value)
         for value in np.asarray(intrinsics, dtype=np.float64).reshape(-1)
     ]
+
+
+def _format_float_list(values):
+    return "[" + ", ".join(f"{value:.6g}" for value in values) + "]"
 
 
 def _camera_params_from_intrinsics(camera_model, intrinsics):
@@ -594,6 +643,7 @@ def bundle_adjustment_bae(
     max_num_iterations: int = 20,
     device: str = "cuda",
     optimize_intrinsics: bool = False,
+    real_only: bool = False,
 ):
     runtime = _ensure_bae_runtime()
     problem = _build_bae_problem(
@@ -601,6 +651,7 @@ def bundle_adjustment_bae(
         virtual_reconstruction,
         negative_depth_observations,
         runtime.bae_root,
+        include_virtual=not real_only,
     )
     if optimize_intrinsics and problem.camera_model != "SIMPLE_PINHOLE":
         raise ValueError(
@@ -615,7 +666,8 @@ def bundle_adjustment_bae(
         f"{int((~problem.is_virtual).sum())} real obs, "
         f"{int(problem.is_virtual.sum())} virtual obs, "
         f"{int(problem.is_negative.sum())} negative obs, "
-        f"optimize_intrinsics={optimize_intrinsics}"
+        f"optimize_intrinsics={optimize_intrinsics}, "
+        f"real_only={real_only}"
     )
 
     torch_device = torch.device(device)
@@ -677,7 +729,14 @@ def bundle_adjustment_bae(
 
     optimized_camera_params = model.pose.detach().cpu().numpy()
     optimized_points = model.points_3d.detach().cpu().numpy()
-    optimized_intrinsics = model.shared_intr.detach().cpu().numpy().reshape(-1)
+    optimized_intrinsics = (
+        model.optimized_intrinsics().detach().cpu().numpy().reshape(-1)
+    )
+    intrinsics_initial = _intrinsics_as_list(problem.intrinsics)
+    intrinsics_final = _intrinsics_as_list(optimized_intrinsics)
+    pose_drift = _pose_drift_summary(
+        problem.camera_params, optimized_camera_params
+    )
     _write_optimized_reconstruction(
         reconstruction,
         virtual_reconstruction,
@@ -703,19 +762,37 @@ def bundle_adjustment_bae(
         "ending_loss": float(ending_loss),
         "seconds": float(seconds),
         "optimize_intrinsics": bool(optimize_intrinsics),
-        "intrinsics_initial": _intrinsics_as_list(problem.intrinsics),
-        "intrinsics_final": _intrinsics_as_list(optimized_intrinsics),
+        "real_only": bool(real_only),
+        "intrinsics_initial": intrinsics_initial,
+        "intrinsics_final": intrinsics_final,
         "fix_gauge": False,
         "loss": "plain_squared",
         "camera_model": problem.camera_model,
         "skipped": problem.skipped,
-        "pose_drift": _pose_drift_summary(
-            problem.camera_params, optimized_camera_params
-        ),
+        "pose_drift": pose_drift,
     }
     logger.info(
         "BAE bundle adjustment done: "
         f"loss {initial_loss:.6e} -> {ending_loss:.6e}, "
-        f"time={seconds:.2f}s"
+        f"time={seconds:.2f}s, real_only={real_only}"
+    )
+    logger.info(
+        "BAE intrinsics: "
+        f"model={problem.camera_model}, "
+        f"optimize={optimize_intrinsics}, "
+        f"initial={_format_float_list(intrinsics_initial)}, "
+        f"final={_format_float_list(intrinsics_final)}"
+    )
+    logger.info(
+        "BAE pose drift: "
+        "center_shift="
+        f"{pose_drift['camera_center_centroid_shift']:.6g}, "
+        f"scale_before={pose_drift['camera_center_scale_before']:.6g}, "
+        f"scale_after={pose_drift['camera_center_scale_after']:.6g}, "
+        f"scale_ratio={pose_drift['camera_center_scale_ratio']}, "
+        f"translation_delta_mean={pose_drift['translation_delta_mean']:.6g}, "
+        f"translation_delta_max={pose_drift['translation_delta_max']:.6g}, "
+        f"rotation_delta_deg_mean={pose_drift['rotation_delta_deg_mean']:.6g}, "
+        f"rotation_delta_deg_max={pose_drift['rotation_delta_deg_max']:.6g}"
     )
     return reconstruction, virtual_reconstruction, summary
