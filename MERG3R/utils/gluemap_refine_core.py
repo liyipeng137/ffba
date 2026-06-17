@@ -2048,6 +2048,7 @@ def run_merg3r_augmented_refinement_loop(
             args, "bae_optimize_intrinsics", False
         ),
         bae_real_only=getattr(args, "bae_real_only", False),
+        bae_fix_gauge=getattr(args, "bae_fix_gauge", "two_cams"),
     )
 
     reconstruction = None

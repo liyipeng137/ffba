@@ -16,6 +16,86 @@ from warp.optim import linear
 from bae.sparse.warp_wrappers import format_vec_for_bsr, torchbsr2wp, wp2torchbsr
 
 
+def _fixed_dof_mask(param):
+    mask = getattr(param, "fixed_dof_mask", None)
+    if mask is None:
+        return None
+    mask = torch.as_tensor(mask, dtype=torch.bool, device=param.device)
+    expected_shape = parameter_update_shape(param)
+    if mask.shape != expected_shape:
+        raise ValueError(
+            "fixed_dof_mask shape mismatch: "
+            f"expected {expected_shape}, got {mask.shape}"
+        )
+    return mask.reshape(-1)
+
+
+def _free_dof_mask(params):
+    masks = []
+    has_fixed = False
+    for param in params:
+        if not param.requires_grad:
+            continue
+        fixed = _fixed_dof_mask(param)
+        numel = torch.Size(parameter_update_shape(param)).numel()
+        if fixed is None:
+            masks.append(
+                torch.ones(numel, dtype=torch.bool, device=param.device)
+            )
+        else:
+            masks.append(~fixed)
+            has_fixed = True
+    if not has_fixed:
+        return None
+    return torch.cat(masks)
+
+
+def _apply_sparse_col_mask_(matrix, free_mask):
+    if free_mask is None:
+        return
+    values = matrix.values()
+    col_scale = free_mask[matrix.col_indices().to(torch.long)].to(
+        dtype=values.dtype
+    )
+    while col_scale.ndim < values.ndim:
+        col_scale = col_scale.unsqueeze(-1)
+    values.mul_(col_scale)
+
+
+def _csr_row_indices(matrix):
+    crow = matrix.crow_indices()
+    counts = (crow[1:] - crow[:-1]).to(torch.long)
+    return torch.repeat_interleave(
+        torch.arange(
+            counts.numel(),
+            device=crow.device,
+            dtype=torch.long,
+        ),
+        counts,
+    ).to(matrix.col_indices().dtype)
+
+
+def _apply_normal_mask_(normal_matrix, rhs, free_mask):
+    if free_mask is None:
+        return
+    values = normal_matrix.values()
+    if values.ndim != 1:
+        raise NotImplementedError(
+            "fixed_dof_mask currently expects scalar CSR normal matrices"
+        )
+    rows = _csr_row_indices(normal_matrix).to(torch.long)
+    cols = normal_matrix.col_indices().to(torch.long)
+    row_free = free_mask[rows]
+    col_free = free_mask[cols]
+    values.mul_((row_free & col_free).to(dtype=values.dtype))
+
+    fixed_diag = (rows == cols) & ~row_free
+    if fixed_diag.any():
+        values[fixed_diag] = 1.0
+
+    rhs.mul_(free_mask.to(dtype=rhs.dtype).view(-1, 1))
+
+
 class LM(ppLM):
     def __init__(self, *args, matrix_free_normal: bool = False, **kwargs):
         self.matrix_free_normal = matrix_free_normal
@@ -32,11 +112,13 @@ class LM(ppLM):
             if isinstance(R, TrackingTensor):
                 R = R.tensor()
             J = torch.cat([j.to_sparse_coo() for j in J], dim=-1).to_sparse_csr()
+            free_mask = _free_dof_mask(pg['params'])
 
             self.last = self.loss = self.loss if hasattr(self, 'loss') else self.model.loss(input, target)
             self.reject_count = 0
 
             if self.matrix_free_normal:
+                _apply_sparse_col_mask_(J, free_mask)
                 diag = NormalMatVec._compute_diag(J).clamp(min=pg['min'], max=pg['max'])
                 A = NormalMatVec(J, damping=0.0, diag=diag)
                 rhs = -(A._get_Jt() @ R.view(-1, 1))
@@ -46,6 +128,8 @@ class LM(ppLM):
                 rhs = -J_T @ R.view(-1, 1)
                 A = self.mm(J_T, J)
                 del J_T
+                _apply_normal_mask_(A, rhs, free_mask)
+                _apply_sparse_col_mask_(J, free_mask)
                 diagonal_op_(A, op=partial(torch.clamp_, min=pg['min'], max=pg['max']))
 
             while self.last <= self.loss:
@@ -59,6 +143,8 @@ class LM(ppLM):
                 except Exception as e:
                     print(e, "\nLinear solver failed. Breaking optimization step...")
                     break
+                if free_mask is not None:
+                    D.mul_(free_mask.to(dtype=D.dtype).view(-1, 1))
                 self.update_parameter(pg['params'], D)
                 self.loss = self.model.loss(input, target)
                 print("Loss:", self.loss, "Last Loss:", self.last, "Reject Count:", self.reject_count, "Damping:", pg['damping'])
@@ -79,6 +165,12 @@ class LM(ppLM):
         for (param, d) in zip(params, steps):
             if param.requires_grad:
                 step_view = d.view(parameter_update_shape(param))
+                fixed = _fixed_dof_mask(param)
+                if fixed is not None:
+                    fixed = fixed.view(parameter_update_shape(param))
+                    step_view = torch.where(
+                        fixed, torch.zeros_like(step_view), step_view
+                    )
                 if getattr(param, 'trim_SE3_grad', False):
                     param[..., :7] = pp.SE3(param[..., :7]).add_(pp.se3(step_view[..., :6]))
                     if param.shape[-1] > 7:

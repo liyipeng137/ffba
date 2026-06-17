@@ -570,6 +570,173 @@ def _format_float_list(values):
     return "[" + ", ".join(f"{value:.6g}" for value in values) + "]"
 
 
+def _relative_translation_from_bae_poses(pose1, pose2):
+    from scipy.spatial.transform import Rotation  # noqa: PLC0415
+
+    pose1 = np.asarray(pose1, dtype=np.float64).reshape(7)
+    pose2 = np.asarray(pose2, dtype=np.float64).reshape(7)
+    rotation1 = Rotation.from_quat(pose1[3:7]).as_matrix()
+    rotation2 = Rotation.from_quat(pose2[3:7]).as_matrix()
+    translation1 = pose1[:3]
+    translation2 = pose2[:3]
+    return translation1 - rotation1 @ rotation2.T @ translation2
+
+
+def _point_gauge_label(problem, point_idx):
+    num_real = len(problem.real_point_ids)
+    if point_idx < num_real:
+        return {
+            "point_index": int(point_idx),
+            "source": "real",
+            "point3D_id": int(problem.real_point_ids[point_idx]),
+        }
+    virtual_idx = point_idx - num_real
+    return {
+        "point_index": int(point_idx),
+        "source": "virtual",
+        "point3D_id": int(problem.virtual_point_ids[virtual_idx]),
+    }
+
+
+def _select_three_gauge_points(points_3d, candidate_indices, eps=1e-9):
+    selected = []
+    for point_idx in candidate_indices:
+        candidate = selected + [point_idx]
+        candidate_points = np.asarray(points_3d[candidate], dtype=np.float64)
+        rank = np.linalg.matrix_rank(candidate_points.T, tol=eps)
+        if rank > len(selected):
+            selected.append(point_idx)
+        if len(selected) == 3:
+            break
+    return selected
+
+
+def _apply_three_points_gauge(problem, point_fixed_mask, summary, reason=None):
+    candidate_indices = np.unique(problem.point_indices)
+    selected = _select_three_gauge_points(
+        problem.points_3d, candidate_indices
+    )
+    for point_idx in selected:
+        point_fixed_mask[point_idx, :] = True
+
+    summary["applied"] = (
+        "three_points" if len(selected) == 3 else "partial_three_points"
+    )
+    summary["fallback_reason"] = reason
+    summary["fixed_points"] = [
+        _point_gauge_label(problem, point_idx) for point_idx in selected
+    ]
+    if len(selected) < 3:
+        summary["warning"] = (
+            "Failed to find three linearly independent points for BAE gauge "
+            "fix."
+        )
+
+
+def _build_bae_gauge_fix(problem, fix_gauge):
+    mode = (fix_gauge or "none").lower().replace("-", "_")
+    valid_modes = {"none", "two_cams", "two_cams_full", "three_points"}
+    if mode not in valid_modes:
+        raise ValueError(
+            f"Unknown BAE gauge fix '{fix_gauge}', expected one of "
+            f"{sorted(valid_modes)}"
+        )
+
+    pose_fixed_mask = np.zeros(
+        (problem.camera_params.shape[0], 6), dtype=bool
+    )
+    point_fixed_mask = np.zeros((problem.points_3d.shape[0], 3), dtype=bool)
+    summary = {
+        "requested": mode,
+        "applied": "none",
+        "fixed_images": [],
+        "fixed_points": [],
+        "translation_fixed_dim": None,
+        "baseline": None,
+        "fallback_reason": None,
+        "num_fixed_pose_dofs": 0,
+        "num_fixed_point_dofs": 0,
+    }
+
+    if mode == "none":
+        return pose_fixed_mask, point_fixed_mask, summary
+
+    if mode == "three_points":
+        _apply_three_points_gauge(problem, point_fixed_mask, summary)
+    else:
+        if problem.camera_params.shape[0] < 2:
+            _apply_three_points_gauge(
+                problem,
+                point_fixed_mask,
+                summary,
+                reason="fewer than two cameras",
+            )
+        else:
+            image1_idx = 0
+            image2_idx = None
+            baseline = None
+            fixed_dim = None
+            for candidate_idx in range(1, problem.camera_params.shape[0]):
+                candidate_baseline = _relative_translation_from_bae_poses(
+                    problem.camera_params[image1_idx],
+                    problem.camera_params[candidate_idx],
+                )
+                max_abs = float(np.max(np.abs(candidate_baseline)))
+                if max_abs > 1e-9:
+                    image2_idx = candidate_idx
+                    baseline = candidate_baseline
+                    fixed_dim = int(np.argmax(np.abs(candidate_baseline)))
+                    break
+
+            if image2_idx is None:
+                _apply_three_points_gauge(
+                    problem,
+                    point_fixed_mask,
+                    summary,
+                    reason="two-camera baseline is degenerate",
+                )
+            else:
+                pose_fixed_mask[image1_idx, :] = True
+                if mode == "two_cams_full":
+                    pose_fixed_mask[image2_idx, :] = True
+                    summary["applied"] = "two_cams_full"
+                else:
+                    pose_fixed_mask[image2_idx, fixed_dim] = True
+                    summary["applied"] = "two_cams"
+                summary["fixed_images"] = [
+                    {
+                        "image_id": int(problem.image_ids[image1_idx]),
+                        "camera_index": int(image1_idx),
+                        "fixed_pose_tangent_dofs": [0, 1, 2, 3, 4, 5],
+                    },
+                    {
+                        "image_id": int(problem.image_ids[image2_idx]),
+                        "camera_index": int(image2_idx),
+                        "fixed_pose_tangent_dofs": (
+                            [0, 1, 2, 3, 4, 5]
+                            if mode == "two_cams_full"
+                            else [int(fixed_dim)]
+                        ),
+                    },
+                ]
+                summary["translation_fixed_dim"] = int(fixed_dim)
+                summary["baseline"] = [
+                    float(value) for value in baseline.reshape(-1)
+                ]
+
+    summary["num_fixed_pose_dofs"] = int(pose_fixed_mask.sum())
+    summary["num_fixed_point_dofs"] = int(point_fixed_mask.sum())
+    return pose_fixed_mask, point_fixed_mask, summary
+
+
+def _attach_fixed_dof_mask(parameter, mask, device):
+    if mask is None or not bool(np.any(mask)):
+        return
+    parameter.fixed_dof_mask = torch.tensor(
+        mask, dtype=torch.bool, device=device
+    )
+
+
 def _camera_params_from_intrinsics(camera_model, intrinsics):
     intrinsics = np.asarray(intrinsics, dtype=np.float64).reshape(-1)
     if camera_model == "SIMPLE_PINHOLE":
@@ -644,6 +811,7 @@ def bundle_adjustment_bae(
     device: str = "cuda",
     optimize_intrinsics: bool = False,
     real_only: bool = False,
+    fix_gauge: str = "two_cams",
 ):
     runtime = _ensure_bae_runtime()
     problem = _build_bae_problem(
@@ -667,7 +835,8 @@ def bundle_adjustment_bae(
         f"{int(problem.is_virtual.sum())} virtual obs, "
         f"{int(problem.is_negative.sum())} negative obs, "
         f"optimize_intrinsics={optimize_intrinsics}, "
-        f"real_only={real_only}"
+        f"real_only={real_only}, "
+        f"fix_gauge={fix_gauge}"
     )
 
     torch_device = torch.device(device)
@@ -703,6 +872,25 @@ def bundle_adjustment_bae(
     )
     model = model_cls(camera_params.clone(), points_3d.clone(), intrinsics).to(
         torch_device
+    )
+    pose_fixed_mask, point_fixed_mask, gauge_summary = _build_bae_gauge_fix(
+        problem, fix_gauge
+    )
+    _attach_fixed_dof_mask(model.pose, pose_fixed_mask, torch_device)
+    _attach_fixed_dof_mask(
+        model.points_3d, point_fixed_mask, torch_device
+    )
+    logger.info(
+        "BAE gauge fix: "
+        f"requested={gauge_summary['requested']}, "
+        f"applied={gauge_summary['applied']}, "
+        f"fixed_pose_dofs={gauge_summary['num_fixed_pose_dofs']}, "
+        f"fixed_point_dofs={gauge_summary['num_fixed_point_dofs']}, "
+        f"fixed_images={gauge_summary['fixed_images']}, "
+        f"fixed_points={gauge_summary['fixed_points']}, "
+        f"translation_fixed_dim={gauge_summary['translation_fixed_dim']}, "
+        f"baseline={gauge_summary['baseline']}, "
+        f"fallback_reason={gauge_summary['fallback_reason']}"
     )
     strategy = runtime.pp.optim.strategy.TrustRegion(up=2.0, down=0.5**4)
     solver = runtime.PCG(tol=1e-4, maxiter=250)
@@ -765,7 +953,8 @@ def bundle_adjustment_bae(
         "real_only": bool(real_only),
         "intrinsics_initial": intrinsics_initial,
         "intrinsics_final": intrinsics_final,
-        "fix_gauge": False,
+        "fix_gauge": gauge_summary["applied"] not in {"none"},
+        "gauge_fix": gauge_summary,
         "loss": "plain_squared",
         "camera_model": problem.camera_model,
         "skipped": problem.skipped,

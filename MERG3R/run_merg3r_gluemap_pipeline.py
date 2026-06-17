@@ -188,6 +188,17 @@ def parse_args():
             "is kept for downstream filtering/evaluation but not added to BAE."
         ),
     )
+    parser.add_argument(
+        "--bae_fix_gauge",
+        type=str,
+        default="two_cams",
+        choices=["none", "two_cams", "three_points", "two_cams_full"],
+        help=(
+            "Gauge fixing strategy for the BAE backend. 'two_cams' mirrors "
+            "COLMAP/Ceres TWO_CAMS_FROM_WORLD semantically: fix one pose and "
+            "one translation DOF on a second pose, with three-point fallback."
+        ),
+    )
     parser.add_argument("--num_refinement_iterations", type=int, default=2)
     parser.add_argument("--augmented_ba_max_filter_iterations", type=int, default=3)
     parser.add_argument(
@@ -626,6 +637,7 @@ def main():
         bae_max_num_iterations=args.bae_max_num_iterations,
         bae_optimize_intrinsics=args.bae_optimize_intrinsics,
         bae_real_only=args.bae_real_only,
+        bae_fix_gauge=args.bae_fix_gauge,
         num_refinement_iterations=args.num_refinement_iterations,
         augmented_ba_max_filter_iterations=args.augmented_ba_max_filter_iterations,
         augmented_ba_normalized_reproj_threshold=(

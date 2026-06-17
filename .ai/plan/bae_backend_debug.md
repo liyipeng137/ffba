@@ -33,9 +33,9 @@ MERG3R/run_merg3r_gluemap_pipeline.py
 
 ## 已观察到的问题
 
-### 1. 没有 Gauge Fix，内参 f 会累计漂移
+### 1. 初期没有 Gauge Fix，内参 f 会累计漂移
 
-当前 BAE backend 第一版没有实现 gauge fixing。开启：
+BAE backend 初期没有实现 gauge fixing。开启：
 
 ```text
 --bae_optimize_intrinsics
@@ -51,26 +51,39 @@ f: 1166.07 -> 971.642 -> 952.232 -> 944.408 -> 930.904
 
 这类漂移不应被视作正常收敛。更可能的原因是：
 
-- 当前 BAE 没有 fix gauge。
+- 初期 BAE 没有 fix gauge。
 - 当前 BAE 没有 focal prior。
 - BA 问题中 pose / point depth / focal length 之间存在尺度耦合。
 - 多轮 refinement 会把上一轮漂移后的 intrinsics 继续作为下一轮初值，导致累计偏移。
 
-当前结论：
+当前已经新增 BAE gauge fix：
 
 ```text
-主实验暂时不建议启用 --bae_optimize_intrinsics。
+--bae_fix_gauge two_cams       # 默认
+--bae_fix_gauge three_points
+--bae_fix_gauge two_cams_full  # debug 强约束
+--bae_fix_gauge none           # 复现初期无 gauge fix 行为
 ```
 
-更稳妥的 baseline 是：
+`two_cams` 语义对齐 Ceres 的 `TWO_CAMS_FROM_WORLD`：
 
 ```text
---ba_backend bae --bae_real_only
+1. 固定第一个 image 的 6 维 pose tangent DOF。
+2. 第二个 image 固定 baseline 最大轴对应的 translation tangent DOF。
+3. two-cams 失败时 fallback 到 three-points。
 ```
 
-后续如果要恢复 BAE 内参优化，至少需要设计其中一种约束：
+实现位置：
 
-- 固定 gauge。
+```text
+MERG3R/bae/bae/optim/optimizer.py
+MERG3R/gluemap/gluemap/estimators/bae_solver.py
+```
+
+需要继续验证：
+
+- `--bae_optimize_intrinsics --bae_fix_gauge two_cams` 是否能压住 `f` 累计漂移。
+- 如果仍漂移，用 `--bae_fix_gauge two_cams_full` 判断问题是否主要来自 gauge。
 - 对 `f` 加 prior。
 - 对 `f` 加合理 bounds / clamp。
 - 只在特定外层 iteration 优化 `f`，避免每轮累计漂移。
@@ -275,17 +288,17 @@ new poses + old virtual xyz
 
 ### 方向 D：恢复 Intrinsics Optimization，但加约束
 
-当前 `--bae_optimize_intrinsics` 已经支持 `SIMPLE_PINHOLE` 的 `f` 参数化，且固定 `cx/cy`。但由于没有 gauge fix / focal prior，目前结果不稳定。
+当前 `--bae_optimize_intrinsics` 已经支持 `SIMPLE_PINHOLE` 的 `f` 参数化，且固定 `cx/cy`。目前已补 `--bae_fix_gauge`，但仍没有 focal prior，因此需要重新验证结果是否稳定。
 
 后续如果要继续优化内参，建议先增加：
 
 - focal prior。
 - focal bounds。
-- pose gauge fix。
+- 评估当前 pose gauge fix 是否足够。
 - 只在最后少数 BA iteration 优化 intrinsics。
 - 打印每轮 `f` drift 并设异常阈值。
 
-在这些约束完成前，`--bae_optimize_intrinsics` 应只作为 debug 功能，不作为默认实验配置。
+在完成新一轮 gauge fix 验证前，`--bae_optimize_intrinsics` 仍应先作为 debug 功能，不作为默认实验配置。
 
 ## 当前建议实验配置
 
@@ -294,17 +307,24 @@ new poses + old virtual xyz
 ```text
 --ba_backend bae
 --bae_real_only
+--bae_fix_gauge two_cams
 --bae_max_num_iterations 20
 ```
 
-短期不推荐配置：
+内参优化验证配置：
 
 ```text
 --ba_backend bae
+--bae_real_only
 --bae_optimize_intrinsics
+--bae_fix_gauge two_cams
 ```
 
-除非当前实验目标就是观测 focal drift。
+如果仍出现明显 focal drift，再对比：
+
+```text
+--bae_fix_gauge two_cams_full
+```
 
 ## 当前结论
 
@@ -317,5 +337,5 @@ new poses + old virtual xyz
 ```text
 1. BAE real-only 后，virtual reconstruction 是否每轮重建 / 重初始化。
 2. 是否深改 BAE 支持 real / virtual 不同 robust loss。
-3. 是否为 BAE intrinsics optimization 增加 gauge / prior / bounds。
+3. 当前 BAE gauge fix 是否足以稳定 intrinsics optimization；若不足，再增加 focal prior / bounds。
 ```

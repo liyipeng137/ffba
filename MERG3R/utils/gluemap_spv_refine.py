@@ -37,6 +37,7 @@ class GluemapSpvRefineConfig:
     bae_max_num_iterations: int = 20
     bae_optimize_intrinsics: bool = False
     bae_real_only: bool = False
+    bae_fix_gauge: str = "two_cams"
     num_refinement_iterations: int = 2
     augmented_ba_max_filter_iterations: int = 3
     augmented_ba_normalized_reproj_threshold: float = 1e-2
@@ -97,6 +98,7 @@ def _make_refine_args(config: GluemapSpvRefineConfig):
         bae_max_num_iterations=config.bae_max_num_iterations,
         bae_optimize_intrinsics=config.bae_optimize_intrinsics,
         bae_real_only=config.bae_real_only,
+        bae_fix_gauge=config.bae_fix_gauge,
         num_refinement_iterations=config.num_refinement_iterations,
         augmented_ba_max_filter_iterations=(config.augmented_ba_max_filter_iterations),
         augmented_ba_normalized_reproj_threshold=(
@@ -198,6 +200,7 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
         "ba_backend": config.ba_backend,
         "bae_optimize_intrinsics": config.bae_optimize_intrinsics,
         "bae_real_only": config.bae_real_only,
+        "bae_fix_gauge": config.bae_fix_gauge,
         "timing": {"save_work_images": save_work_images_seconds},
         "work_images": {
             "images_dir": str(images_dir),

@@ -102,7 +102,8 @@ MERG3R/bae/ba_colmap.py
   诊断性跳过 virtual residual/point 参数。
 - 默认不优化 intrinsics；开启 `--bae_optimize_intrinsics` 时，仅对
   `SIMPLE_PINHOLE` 优化 `f`，固定 `cx/cy`。
-- 不做 gauge fixing。
+- 新增 `--bae_fix_gauge`，默认 `two_cams`，语义对齐 Ceres 版
+  `TWO_CAMS_FROM_WORLD`；可显式传 `none` 复现无 gauge fix 行为。
 - 不实现 robust loss，先用 plain squared loss。
 - camera model 假设所有 image 共享同一个 camera。
 - 优先支持当前主线 `SIMPLE_PINHOLE`；如遇 `PINHOLE` 可显式转换支持。
@@ -426,15 +427,44 @@ virtual residual: Arctan
 
 ## Gauge fixing
 
-第一版不做 gauge fixing。
-
 当前 Ceres 版执行：
 
 ```python
 ba_config.fix_gauge(pycolmap.BundleAdjustmentGauge.TWO_CAMS_FROM_WORLD)
 ```
 
-BAE 第一版全相机自由优化，可能出现全局 Sim3 / gauge drift。由于 reprojection error 对 gauge 不敏感，loss 降低不等于世界坐标稳定。
+BAE 当前实现了一个语义对齐版本，而不是逐字节复刻 Ceres manifold：
+
+```text
+--bae_fix_gauge two_cams       # 默认
+--bae_fix_gauge three_points
+--bae_fix_gauge two_cams_full  # debug 强约束
+--bae_fix_gauge none           # 复现无 gauge fix 行为
+```
+
+`two_cams` 策略：
+
+```text
+1. 选第一个参与 BAE 的 image，固定其 6 维 pose tangent DOF。
+2. 选择第二个 baseline 非退化 image。
+3. 计算 relative baseline 的最大绝对值轴。
+4. 固定第二个 image 对应 translation tangent DOF。
+5. 若 two-cams 失败，fallback 到 three-points。
+```
+
+该实现通过 BAE optimizer 的 `fixed_dof_mask` 完成：
+
+```text
+1. normal equation 中固定 DOF 的行列置零。
+2. 固定 DOF 保留单位对角，避免线性系统奇异。
+3. 参数更新前再次清零固定 DOF 增量。
+```
+
+由于 BAE 使用 PyPose SE3 tangent update，第二个相机固定的是 translation
+tangent DOF，与 Ceres `SubsetManifold` 固定 ambient translation 分量不完全
+一致，但消除 gauge 的语义一致。
+
+无 gauge fix 时，BAE 可能出现全局 Sim3 / gauge drift。由于 reprojection error 对 gauge 不敏感，loss 降低不等于世界坐标稳定。
 
 因此 BAE summary 中需要记录基础 drift 诊断：
 
@@ -490,7 +520,14 @@ BAE summary 建议包含：
   "optimize_intrinsics": true,
   "intrinsics_initial": [1000.0, 512.0, 384.0],
   "intrinsics_final": [1002.5, 512.0, 384.0],
-  "fix_gauge": false,
+  "fix_gauge": true,
+  "gauge_fix": {
+    "requested": "two_cams",
+    "applied": "two_cams",
+    "translation_fixed_dim": 0,
+    "num_fixed_pose_dofs": 7,
+    "num_fixed_point_dofs": 0
+  },
   "loss": "plain_squared"
 }
 ```
@@ -567,12 +604,15 @@ else:
 
 ### 2. Gauge drift
 
-第一版不 fix gauge，可能出现世界坐标整体漂移或尺度变化。
+默认 `--bae_fix_gauge two_cams` 后，BAE 会固定 gauge；但由于 BAE 的
+PyPose tangent update 和 Ceres manifold 不完全一致，仍需检查世界坐标整体漂移或尺度变化。
 
 缓解：
 
 - summary 中记录 pose drift。
-- 若影响下游，增加 fixed camera 版本。
+- summary 中记录 `gauge_fix` 的实际 applied strategy。
+- 若 `two_cams` 仍不稳定，可临时使用 `--bae_fix_gauge two_cams_full`
+  验证漂移是否来自 gauge。
 
 ### 3. Invalid projection 处理差异
 
@@ -616,7 +656,7 @@ Ceres / COLMAP 对 `z <= eps` residual 置零。BAE 如果直接除以 z，可�
 -> fixed shared intrinsics by default
 -> optional SIMPLE_PINHOLE f-only intrinsics optimization with fixed cx/cy
 -> plain squared loss
--> no gauge fix
+-> default COLMAP-style two-cams gauge fix
 -> solve
 -> 写回 real + virtual reconstruction
 -> controller 通过 ba_backend 切换

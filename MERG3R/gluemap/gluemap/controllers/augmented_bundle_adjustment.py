@@ -252,6 +252,7 @@ class IterativeBAOptions:
     bae_max_iterations: int | None = None
     bae_optimize_intrinsics: bool = False
     bae_real_only: bool = False
+    bae_fix_gauge: str = "two_cams"
     last_ba_summary: dict | None = None
 
 
@@ -592,6 +593,7 @@ def iterative_bundle_adjustment(
                 device=options.bae_device,
                 optimize_intrinsics=options.bae_optimize_intrinsics,
                 real_only=options.bae_real_only,
+                fix_gauge=options.bae_fix_gauge,
             )
         else:
             raise ValueError(

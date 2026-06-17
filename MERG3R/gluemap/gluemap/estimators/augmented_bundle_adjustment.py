@@ -165,7 +165,9 @@ def _add_virtual_track_residuals(
             if pt_idx >= len(image.points2D):
                 num_skipped += 1
                 continue
-            point2D = image.points2D[pt_idx].xy
+            point2D = np.ascontiguousarray(
+                image.points2D[pt_idx].xy, dtype=np.float64
+            ).reshape(2, 1)
 
             camera_id = reference_reconstruction.images[ref_id].camera_id
 
