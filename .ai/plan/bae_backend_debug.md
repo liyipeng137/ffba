@@ -97,8 +97,12 @@ f: 1166.07 -> 971.642 -> 952.232 -> 944.408 -> 930.904
 
 ```text
 1. 固定第一个 image 的 6 维 pose tangent DOF。
-2. 第二个 image 固定 baseline 最大轴对应的 translation tangent DOF。
-3. two-cams 失败时 fallback 到 three-points。
+2. 统计候选 image 与第一个 image 共享的 real 3D points。
+3. 保留共享数 >= max(2, ceil(max_shared * 0.5)) 的高共视候选。
+4. 在高共视候选中选择 baseline norm 最大的 image。
+5. 固定该 baseline 最大轴对应的 translation tangent DOF。
+6. 无可靠共视候选时回退到首个非退化 baseline；two-cams 失败时
+   fallback 到 three-points。
 ```
 
 实现位置：

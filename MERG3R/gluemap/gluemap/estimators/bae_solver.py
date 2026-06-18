@@ -582,6 +582,124 @@ def _relative_translation_from_bae_poses(pose1, pose2):
     return translation1 - rotation1 @ rotation2.T @ translation2
 
 
+def _select_second_gauge_camera(
+    problem,
+    image1_idx,
+    baseline_eps=1e-9,
+    high_covisibility_ratio=0.5,
+    min_shared_real_points=2,
+):
+    """Select a well-constrained second camera for the scale gauge."""
+    num_cameras = problem.camera_params.shape[0]
+    num_real_points = len(problem.real_point_ids)
+    real_points_per_camera = [set() for _ in range(num_cameras)]
+    for camera_idx, point_idx in zip(
+        problem.camera_indices, problem.point_indices, strict=False
+    ):
+        camera_idx = int(camera_idx)
+        point_idx = int(point_idx)
+        if (
+            0 <= camera_idx < num_cameras
+            and 0 <= point_idx < num_real_points
+        ):
+            real_points_per_camera[camera_idx].add(point_idx)
+
+    anchor_points = real_points_per_camera[image1_idx]
+    candidates = []
+    for candidate_idx in range(num_cameras):
+        if candidate_idx == image1_idx:
+            continue
+        baseline = _relative_translation_from_bae_poses(
+            problem.camera_params[image1_idx],
+            problem.camera_params[candidate_idx],
+        )
+        max_abs = float(np.max(np.abs(baseline)))
+        if max_abs <= baseline_eps:
+            continue
+        candidates.append(
+            {
+                "camera_index": candidate_idx,
+                "baseline": baseline,
+                "baseline_norm": float(np.linalg.norm(baseline)),
+                "fixed_dim": int(np.argmax(np.abs(baseline))),
+                "shared_real_points": len(
+                    anchor_points & real_points_per_camera[candidate_idx]
+                ),
+            }
+        )
+
+    max_shared = max(
+        (candidate["shared_real_points"] for candidate in candidates),
+        default=0,
+    )
+    covisibility_threshold = max(
+        min_shared_real_points,
+        int(np.ceil(max_shared * high_covisibility_ratio)),
+    )
+    high_covisibility_candidates = [
+        candidate
+        for candidate in candidates
+        if candidate["shared_real_points"] >= covisibility_threshold
+    ]
+
+    if high_covisibility_candidates:
+        selected = max(
+            high_covisibility_candidates,
+            key=lambda candidate: (
+                candidate["baseline_norm"],
+                candidate["shared_real_points"],
+                -candidate["camera_index"],
+            ),
+        )
+        strategy = "high_covisibility_max_baseline"
+    elif candidates:
+        # Preserve the previous deterministic behavior when the anchor camera
+        # has no sufficiently reliable direct covisibility candidate.
+        selected = candidates[0]
+        strategy = "first_non_degenerate_baseline_fallback"
+    else:
+        selected = None
+        strategy = "no_non_degenerate_baseline"
+
+    selection_summary = {
+        "strategy": strategy,
+        "num_non_degenerate_candidates": int(len(candidates)),
+        "num_covisible_candidates": int(
+            sum(
+                candidate["shared_real_points"] > 0
+                for candidate in candidates
+            )
+        ),
+        "max_shared_real_points": int(max_shared),
+        "high_covisibility_ratio": float(high_covisibility_ratio),
+        "high_covisibility_threshold": int(covisibility_threshold),
+        "num_high_covisibility_candidates": int(
+            len(high_covisibility_candidates)
+        ),
+        "selected_shared_real_points": (
+            int(selected["shared_real_points"])
+            if selected is not None
+            else None
+        ),
+        "selected_camera_index": (
+            int(selected["camera_index"])
+            if selected is not None
+            else None
+        ),
+        "selected_image_id": (
+            int(problem.image_ids[selected["camera_index"]])
+            if selected is not None and hasattr(problem, "image_ids")
+            else None
+        ),
+        "selected_baseline_norm": (
+            float(selected["baseline_norm"])
+            if selected is not None
+            else None
+        ),
+    }
+    return selected, selection_summary
+
+
 def _point_gauge_label(problem, point_idx):
     num_real = len(problem.real_point_ids)
     if point_idx < num_real:
@@ -653,6 +771,7 @@ def _build_bae_gauge_fix(problem, fix_gauge):
         "fixed_points": [],
         "translation_fixed_dim": None,
         "baseline": None,
+        "second_camera_selection": None,
         "fallback_reason": None,
         "num_fixed_pose_dofs": 0,
         "num_fixed_point_dofs": 0,
@@ -673,22 +792,12 @@ def _build_bae_gauge_fix(problem, fix_gauge):
             )
         else:
             image1_idx = 0
-            image2_idx = None
-            baseline = None
-            fixed_dim = None
-            for candidate_idx in range(1, problem.camera_params.shape[0]):
-                candidate_baseline = _relative_translation_from_bae_poses(
-                    problem.camera_params[image1_idx],
-                    problem.camera_params[candidate_idx],
-                )
-                max_abs = float(np.max(np.abs(candidate_baseline)))
-                if max_abs > 1e-9:
-                    image2_idx = candidate_idx
-                    baseline = candidate_baseline
-                    fixed_dim = int(np.argmax(np.abs(candidate_baseline)))
-                    break
+            selected, selection_summary = _select_second_gauge_camera(
+                problem, image1_idx
+            )
+            summary["second_camera_selection"] = selection_summary
 
-            if image2_idx is None:
+            if selected is None:
                 _apply_three_points_gauge(
                     problem,
                     point_fixed_mask,
@@ -696,6 +805,9 @@ def _build_bae_gauge_fix(problem, fix_gauge):
                     reason="two-camera baseline is degenerate",
                 )
             else:
+                image2_idx = selected["camera_index"]
+                baseline = selected["baseline"]
+                fixed_dim = selected["fixed_dim"]
                 pose_fixed_mask[image1_idx, :] = True
                 if mode == "two_cams_full":
                     pose_fixed_mask[image2_idx, :] = True
@@ -890,6 +1002,8 @@ def bundle_adjustment_bae(
         f"fixed_points={gauge_summary['fixed_points']}, "
         f"translation_fixed_dim={gauge_summary['translation_fixed_dim']}, "
         f"baseline={gauge_summary['baseline']}, "
+        "second_camera_selection="
+        f"{gauge_summary['second_camera_selection']}, "
         f"fallback_reason={gauge_summary['fallback_reason']}"
     )
     strategy = runtime.pp.optim.strategy.TrustRegion(up=2.0, down=0.5**4)

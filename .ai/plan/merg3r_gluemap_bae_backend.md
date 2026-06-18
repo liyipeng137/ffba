@@ -463,10 +463,12 @@ BAE 当前实现了一个语义对齐版本，而不是逐字节复刻 Ceres man
 
 ```text
 1. 选第一个参与 BAE 的 image，固定其 6 维 pose tangent DOF。
-2. 选择第二个 baseline 非退化 image。
-3. 计算 relative baseline 的最大绝对值轴。
-4. 固定第二个 image 对应 translation tangent DOF。
-5. 若 two-cams 失败，fallback 到 three-points。
+2. 统计其他 image 与第一个 image 共享的 real 3D points。
+3. 高共视阈值为 max(2, ceil(max_shared * 0.5))。
+4. 在达到阈值的候选中选择 baseline norm 最大的 image。
+5. 计算 relative baseline 的最大绝对值轴，并固定对应 translation tangent DOF。
+6. 没有可靠高共视候选时，回退到首个 baseline 非退化 image。
+7. 若 two-cams 仍失败，fallback 到 three-points。
 ```
 
 该实现通过 BAE optimizer 的 `fixed_dof_mask` 完成：
@@ -542,6 +544,13 @@ BAE summary 建议包含：
     "requested": "two_cams",
     "applied": "two_cams",
     "translation_fixed_dim": 0,
+    "second_camera_selection": {
+      "strategy": "high_covisibility_max_baseline",
+      "max_shared_real_points": 120,
+      "high_covisibility_threshold": 60,
+      "selected_shared_real_points": 84,
+      "selected_baseline_norm": 1.25
+    },
     "num_fixed_pose_dofs": 7,
     "num_fixed_point_dofs": 0
   },
