@@ -569,6 +569,33 @@ def load_database_keypoint_features(database_path, image_names):
     return features
 
 
+def load_database_keypoints_per_image(database_path, image_names):
+    """Load 0-indexed image keypoints while preserving database indices."""
+    pycolmap = _lazy_import_pycolmap()
+    database = pycolmap.Database.open(str(database_path))
+    keypoints_per_image = {}
+    try:
+        for image_idx, name in enumerate(image_names):
+            image = database.read_image_with_name(str(Path(name)))
+            expected_image_id = image_idx + 1
+            if image.image_id != expected_image_id:
+                raise ValueError(
+                    "Merged database image IDs do not match reconstruction "
+                    f"indices: {name!r} has ID {image.image_id}, expected "
+                    f"{expected_image_id}"
+                )
+            keypoints = database.read_keypoints(image.image_id)
+            if keypoints is None or len(keypoints) == 0:
+                keypoints_per_image[image_idx] = np.empty((0, 2), dtype=np.float64)
+            else:
+                keypoints_per_image[image_idx] = np.ascontiguousarray(
+                    keypoints[:, :2], dtype=np.float64
+                )
+    finally:
+        database.close()
+    return keypoints_per_image
+
+
 def summarize_database_matches(database_path, image_names):
     pycolmap = _lazy_import_pycolmap()
     database = pycolmap.Database.open(str(database_path))
@@ -1918,6 +1945,7 @@ def run_merg3r_augmented_refinement_loop(
         IterativeBAOptions,
         build_negative_depth_observations,
         build_reconstruction_for_ba,
+        build_seed_reconstruction_for_ba,
         initialize_world_points,
         iterative_bundle_adjustment,
     )
@@ -1932,9 +1960,15 @@ def run_merg3r_augmented_refinement_loop(
         camera_from_intrinsics_matrix,
     )
 
-    if virtual_predictions_dict is None:
+    ba_backend = getattr(args, "ba_backend", "ceres")
+    if ba_backend not in {"ceres", "bae"}:
         raise ValueError(
-            "track_mode=SPV requires virtual predictions, but they were not " "built"
+            f"Unknown BA backend {ba_backend!r}, expected 'ceres' or 'bae'"
+        )
+    use_virtual_tracks = ba_backend == "ceres"
+    if use_virtual_tracks and virtual_predictions_dict is None:
+        raise ValueError(
+            "track_mode=SPV requires virtual predictions, but they were not built"
         )
 
     num_images = len(image_names)
@@ -1942,93 +1976,125 @@ def run_merg3r_augmented_refinement_loop(
     rotations, centers = global_pose_dicts_from_w2c(extrinsic)
     stats = {
         "enabled": True,
+        "refinement_mode": "SPV" if use_virtual_tracks else "SP",
+        "ba_backend": ba_backend,
         "num_refinement_iterations": int(args.num_refinement_iterations),
         "setup": {},
         "iterations": [],
     }
 
-    t0 = time.time()
-    track_options = TrackEstablishmentOptions(track_min_num_views_per_track=2)
-    (
-        points3D,
-        keypoints_per_image,
-        pts2d_idx_inv,
-        pts2d_idx_virtual_inv,
-        images_points2d_virtual_isnegative,
-    ) = establish_tracks_from_predictions_dict(
-        predictions_dict=virtual_predictions_dict,
-        num_images=num_images,
-        options=track_options,
-        add_tracks=False,
-        add_virtual_points=True,
-        device=args.device,
-    )
-    torch.cuda.empty_cache()
-    stats["setup"]["establish_virtual_tracks_seconds"] = time.time() - t0
-    stats["setup"]["established_virtual_tracks"] = int(len(points3D))
-
-    height, width = image_size_hw
-    cameras = [
+    if use_virtual_tracks:
+        t0 = time.time()
+        track_options = TrackEstablishmentOptions(track_min_num_views_per_track=2)
         (
-            camera_from_intrinsics_matrix(
-                intr[0],
-                camera_model,
-                width=width,
-                height=height,
-                camera_id=camera_id + 1,
+            points3D,
+            keypoints_per_image,
+            pts2d_idx_inv,
+            pts2d_idx_virtual_inv,
+            images_points2d_virtual_isnegative,
+        ) = establish_tracks_from_predictions_dict(
+            predictions_dict=virtual_predictions_dict,
+            num_images=num_images,
+            options=track_options,
+            add_tracks=False,
+            add_virtual_points=True,
+            device=args.device,
+        )
+        torch.cuda.empty_cache()
+        stats["setup"]["establish_virtual_tracks_seconds"] = time.time() - t0
+        stats["setup"]["established_virtual_tracks"] = int(len(points3D))
+
+        height, width = image_size_hw
+        cameras = [
+            (
+                camera_from_intrinsics_matrix(
+                    intr[0],
+                    camera_model,
+                    width=width,
+                    height=height,
+                    camera_id=camera_id + 1,
+                )
+                if intr is not None
+                else None
             )
-            if intr is not None
-            else None
+            for camera_id, intr in enumerate(global_intrinsics)
+        ]
+        negative_depth_observations = build_negative_depth_observations(
+            pts2d_idx_inv, images_points2d_virtual_isnegative
         )
-        for camera_id, intr in enumerate(global_intrinsics)
-    ]
-    negative_depth_observations = build_negative_depth_observations(
-        pts2d_idx_inv, images_points2d_virtual_isnegative
-    )
-    virtual_init_threshold = args.virtual_init_angular_error_threshold
-    if virtual_init_threshold is None:
-        virtual_init_threshold = (
-            args.filter_reproj_error_threshold
-            if args.filter_reproj_error_type == "angular"
-            else 0.5
+        virtual_init_threshold = args.virtual_init_angular_error_threshold
+        if virtual_init_threshold is None:
+            virtual_init_threshold = (
+                args.filter_reproj_error_threshold
+                if args.filter_reproj_error_type == "angular"
+                else 0.5
+            )
+        stats["setup"]["virtual_init_angular_error_threshold"] = float(
+            virtual_init_threshold
         )
-    stats["setup"]["virtual_init_angular_error_threshold"] = float(
-        virtual_init_threshold
-    )
 
-    t0 = time.time()
-    points3D = initialize_world_points(
-        virtual_predictions_dict,
-        rotations,
-        centers,
-        points3D,
-        pts2d_idx_inv,
-        pts2d_idx_virtual_inv,
-        keypoints_per_image=keypoints_per_image,
-        cameras=cameras,
-        intrinsics_mapping=intrinsics_mapping,
-        angular_error_threshold_deg=virtual_init_threshold,
-        negative_depth_observations=negative_depth_observations,
-    )
-    stats["setup"]["initialize_virtual_points_seconds"] = time.time() - t0
-    stats["setup"]["initialized_virtual_tracks"] = int(len(points3D))
+        t0 = time.time()
+        points3D = initialize_world_points(
+            virtual_predictions_dict,
+            rotations,
+            centers,
+            points3D,
+            pts2d_idx_inv,
+            pts2d_idx_virtual_inv,
+            keypoints_per_image=keypoints_per_image,
+            cameras=cameras,
+            intrinsics_mapping=intrinsics_mapping,
+            angular_error_threshold_deg=virtual_init_threshold,
+            negative_depth_observations=negative_depth_observations,
+        )
+        stats["setup"]["initialize_virtual_points_seconds"] = time.time() - t0
+        stats["setup"]["initialized_virtual_tracks"] = int(len(points3D))
 
-    t0 = time.time()
-    virtual_reconstruction = build_reconstruction_for_ba(
-        rotations,
-        centers,
-        global_intrinsics,
-        intrinsics_mapping,
-        points3D,
-        keypoints_per_image,
-        image_sizes=image_shapes,
-        images_list=image_names,
-        camera_model=camera_model,
-    )
-    stats["setup"]["build_virtual_reconstruction_seconds"] = time.time() - t0
-    stats["setup"]["virtual_reconstruction"] = summarize_reconstruction(
-        virtual_reconstruction
-    )
+        t0 = time.time()
+        virtual_reconstruction = build_reconstruction_for_ba(
+            rotations,
+            centers,
+            global_intrinsics,
+            intrinsics_mapping,
+            points3D,
+            keypoints_per_image,
+            image_sizes=image_shapes,
+            images_list=image_names,
+            camera_model=camera_model,
+        )
+        stats["setup"]["build_virtual_reconstruction_seconds"] = time.time() - t0
+        stats["setup"]["virtual_reconstruction"] = summarize_reconstruction(
+            virtual_reconstruction
+        )
+        seed_reconstruction = virtual_reconstruction
+    else:
+        t0 = time.time()
+        keypoints_per_image = load_database_keypoints_per_image(
+            database_path, image_names
+        )
+        seed_reconstruction = build_seed_reconstruction_for_ba(
+            rotations,
+            centers,
+            global_intrinsics,
+            intrinsics_mapping,
+            keypoints_per_image,
+            image_sizes=image_shapes,
+            images_list=image_names,
+            camera_model=camera_model,
+        )
+        virtual_reconstruction = None
+        negative_depth_observations = {}
+        stats["setup"].update(
+            {
+                "virtual_tracks_enabled": False,
+                "virtual_tracks_skip_reason": "BAE uses real tracks only",
+                "seed_reconstruction_seconds": time.time() - t0,
+                "seed_keypoints": int(
+                    sum(len(points) for points in keypoints_per_image.values())
+                ),
+                "seed_reconstruction": summarize_reconstruction(seed_reconstruction),
+            }
+        )
 
     negative_depth_observations_1indexed = {
         image_id + 1: point2d_indices
@@ -2041,13 +2107,10 @@ def run_merg3r_augmented_refinement_loop(
         normalized_reproj_threshold=(args.augmented_ba_normalized_reproj_threshold),
         min_track_length=2,
         fix_rotations_first_pass=False,
-        ba_backend=getattr(args, "ba_backend", "ceres"),
+        ba_backend=ba_backend,
         bae_device=getattr(args, "device", "cuda"),
         bae_max_iterations=getattr(args, "bae_max_num_iterations", None),
-        bae_optimize_intrinsics=getattr(
-            args, "bae_optimize_intrinsics", False
-        ),
-        bae_real_only=getattr(args, "bae_real_only", False),
+        bae_optimize_intrinsics=getattr(args, "bae_optimize_intrinsics", False),
         bae_fix_gauge=getattr(args, "bae_fix_gauge", "two_cams"),
     )
 
@@ -2059,7 +2122,7 @@ def run_merg3r_augmented_refinement_loop(
         t0 = time.time()
         reconstruction = triangulate_from_seed_reconstruction(
             pycolmap,
-            virtual_reconstruction,
+            (virtual_reconstruction if use_virtual_tracks else seed_reconstruction),
             database_path,
             output_dir / f"triangulated_aug_iter_{outer_iter + 1}",
             args,
@@ -2086,25 +2149,30 @@ def run_merg3r_augmented_refinement_loop(
                 "reason": "disabled",
             }
 
-        t0 = time.time()
-        before_virtual_select = summarize_reconstruction(virtual_reconstruction)
-        if virtual_reconstruction is not None:
+        if use_virtual_tracks:
+            t0 = time.time()
+            before_virtual_select = summarize_reconstruction(virtual_reconstruction)
             pair_count = select_virtual_tracks_from_merged(
                 virtual_reconstruction=virtual_reconstruction,
                 pair_count=pair_count,
                 min_num_support_abs=args.select_track_min_support,
             )
-        after_virtual_select = summarize_reconstruction(virtual_reconstruction)
-        iter_stats["select_virtual_tracks"] = {
-            "enabled": virtual_reconstruction is not None,
-            "seconds": time.time() - t0,
-            "before": before_virtual_select,
-            "after": after_virtual_select,
-            "removed_points3D": int(
-                before_virtual_select["points3D"] - after_virtual_select["points3D"]
-            ),
-            "pair_count_entries": int(len(pair_count)),
-        }
+            after_virtual_select = summarize_reconstruction(virtual_reconstruction)
+            iter_stats["select_virtual_tracks"] = {
+                "enabled": True,
+                "seconds": time.time() - t0,
+                "before": before_virtual_select,
+                "after": after_virtual_select,
+                "removed_points3D": int(
+                    before_virtual_select["points3D"] - after_virtual_select["points3D"]
+                ),
+                "pair_count_entries": int(len(pair_count)),
+            }
+        else:
+            iter_stats["select_virtual_tracks"] = {
+                "enabled": False,
+                "reason": "BAE uses real tracks only",
+            }
 
         if args.filter_reproj_error_type == "angular":
             t0 = time.time()
@@ -2134,13 +2202,19 @@ def run_merg3r_augmented_refinement_loop(
                 args.filter_reproj_error_threshold,
                 log_prefix="real: ",
             )
-            virtual_filter_stats = run_reprojection_filter_with_stats(
-                virtual_reconstruction,
-                args.filter_reproj_error_type,
-                args.filter_reproj_error_threshold,
-                negative_depth_observations=negative_depth_observations_1indexed,
-                log_prefix="virtual: ",
-            )
+            if use_virtual_tracks:
+                virtual_filter_stats = run_reprojection_filter_with_stats(
+                    virtual_reconstruction,
+                    args.filter_reproj_error_type,
+                    args.filter_reproj_error_threshold,
+                    negative_depth_observations=(negative_depth_observations_1indexed),
+                    log_prefix="virtual: ",
+                )
+            else:
+                virtual_filter_stats = {
+                    "enabled": False,
+                    "reason": "BAE uses real tracks only",
+                }
             iter_stats["reprojection_filter"] = {
                 "enabled": True,
                 "seconds": time.time() - t0,
@@ -2161,6 +2235,10 @@ def run_merg3r_augmented_refinement_loop(
             negative_depth_observations_1indexed,
             options=ba_options,
         )
+        if not use_virtual_tracks:
+            # The optimized real poses/intrinsics seed the next triangulation.
+            # Its points3D are discarded by clear_points=True.
+            seed_reconstruction = reconstruction
         iter_stats["bundle_adjustment"] = {
             "seconds": time.time() - t0,
             "before": before_ba,

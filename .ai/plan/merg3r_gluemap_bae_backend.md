@@ -94,12 +94,29 @@ MERG3R/bae/ba_colmap.py
 4. 如果不是 MERG3R/bae 下的模块，直接报错。
 ```
 
-## 第一版明确约束
+## 当前 Pipeline 策略（2026-06-18）
+
+当前 pipeline 按 backend 明确分流：
+
+```text
+ceres -> 保留原 SPV augmented BA
+bae   -> 固定采用 real-only SP BA，不构建 virtual reconstruction
+```
+
+BAE 首轮从 `database_merged.db` 读取 `keypoints_per_image`，构建无 points3D 的
+pose/keypoint seed，再由 `triangulate_points(clear_points=True)` 生成 real
+reconstruction。后续轮使用上一轮 BAE 优化后的 real reconstruction 传递 pose 和
+intrinsics，并重新三角化 real tracks。
+
+选择 `--ba_backend bae` 时固定使用 real-only，不提供额外的模式参数。
+full real+virtual BAE 代码仍保留在 solver 层用于实验，但不再是 pipeline 执行路径。
+
+## 第一版历史约束
 
 第一版 BAE backend 按以下约束实现：
 
-- 默认直接拼接 real + virtual observations；可通过 `--bae_real_only`
-  诊断性跳过 virtual residual/point 参数。
+- 默认直接拼接 real + virtual observations；早期实验曾提供诊断性的
+  real-only 开关以跳过 virtual residual/point 参数。
 - 默认不优化 intrinsics；开启 `--bae_optimize_intrinsics` 时，仅对
   `SIMPLE_PINHOLE` 优化 `f`，固定 `cx/cy`。
 - 新增 `--bae_fix_gauge`，默认 `two_cams`，语义对齐 Ceres 版
@@ -643,23 +660,16 @@ Ceres / COLMAP 对 `z <= eps` residual 置零。BAE 如果直接除以 z，可�
 
 ## 当前结论
 
-按当前约束，BAE backend 没有结构性 blocker。
-
-最小可行实现是：
+当前 pipeline 实现为：
 
 ```text
-新增 bae_solver.py
--> 从 real reconstruction 抽 camera/real points/real obs
--> 默认从 virtual reconstruction 抽 virtual points/virtual obs/negative mask
--> 可通过 --bae_real_only 跳过 virtual residual/point 参数
--> 拼成一个 BAE problem
--> fixed shared intrinsics by default
--> optional SIMPLE_PINHOLE f-only intrinsics optimization with fixed cx/cy
--> plain squared loss
--> default COLMAP-style two-cams gauge fix
--> solve
--> 写回 real + virtual reconstruction
--> controller 通过 ba_backend 切换
+--ba_backend bae
+-> 跳过 virtual track diagnostics/reconstruction/select/filter
+-> 从 merged database 构建无 points3D 的 pose/keypoint seed
+-> 三角化 SIFT + prior real tracks
+-> BAE real-only BA
+-> 将优化后的 real reconstruction 用作下一轮 seed
 ```
 
-这能直接验证 BAE 对当前 GlueMap SPV augmented BA 的加速收益，同时保留现有 Ceres 后端作为质量和回归基线。
+`--ba_backend ceres` 保留原 SPV augmented BA。两条路径语义不同，后续实验应分别标记
+为 BAE-SP 与 Ceres-SPV，不应直接视作相同 objective 的 solver 性能比较。

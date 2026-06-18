@@ -1,6 +1,6 @@
 # BAE Backend Debug Notes
 
-更新时间：2026-06-17
+更新时间：2026-06-18
 
 ## 背景
 
@@ -25,11 +25,39 @@ MERG3R/run_merg3r_gluemap_pipeline.py
 
 ```text
 --ba_backend bae
---bae_real_only
 --bae_optimize_intrinsics
 ```
 
+从 2026-06-18 起，pipeline 中的 `--ba_backend bae` 默认且强制采用
+real-only SP refinement，不再提供额外的 real-only 命令行开关。
+`--ba_backend ceres` 继续采用原有 SPV augmented refinement。
+
 其中 `--bae_optimize_intrinsics` 目前仅支持 `SIMPLE_PINHOLE` 的 `f` 优化，并固定 `cx/cy`。
+
+## BAE Real-only SP 路径
+
+BAE 路径现在完全跳过 virtual reconstruction：
+
+```text
+跳过 build_virtual_track_diagnostics
+-> 从 database_merged.db 读取 keypoints_per_image
+-> 构建只有 camera/image/pose/points2D 的 seed reconstruction
+-> clear_points=True 重新三角化 SIFT + prior real tracks
+-> BAE real-only BA
+-> 使用优化后的 real reconstruction 作为下一轮 seed
+```
+
+因此 BAE 路径不再执行：
+
+- `initialize_world_points()`
+- virtual `build_reconstruction_for_ba()`
+- `select_virtual_tracks_from_merged()`
+- virtual reprojection filtering
+- `new pose + old virtual xyz` 的同步和检验
+
+新增的 `build_seed_reconstruction_for_ba()` 复用原 reconstruction builder，但传入
+空 `points3D`。seed 的 points2D 直接来自 merged COLMAP database，确保 keypoint
+索引和 matches 一致。Ceres 路径不受该分流影响。
 
 ## 已观察到的问题
 
@@ -145,10 +173,10 @@ BAE 的 full real+virtual 模式还不能视作 Ceres augmented BA 的等价替�
 
 直接加入 virtual observations 后，最终 pose 质量明显差于 Ceres solver，并出现类似 pose 被分成两层的现象。
 
-而启用：
+而切换为 real-only 实验路径后：
 
 ```text
---ba_backend bae --bae_real_only
+--ba_backend bae
 ```
 
 后，pose 分层问题消失。这说明：
@@ -167,7 +195,7 @@ real-only BA 加速后端
 
 ## Real Only 下 Virtual Reconstruction 的状态
 
-在 `--bae_real_only` 模式下，BAE 优化图只包含 real reconstruction 中的 tracks 和 observations：
+在当前 BAE real-only 模式下，优化图只包含 real reconstruction 中的 tracks 和 observations：
 
 ```text
 real poses
@@ -306,7 +334,6 @@ new poses + old virtual xyz
 
 ```text
 --ba_backend bae
---bae_real_only
 --bae_fix_gauge two_cams
 --bae_max_num_iterations 20
 ```
@@ -315,7 +342,6 @@ new poses + old virtual xyz
 
 ```text
 --ba_backend bae
---bae_real_only
 --bae_optimize_intrinsics
 --bae_fix_gauge two_cams
 ```
@@ -328,14 +354,13 @@ new poses + old virtual xyz
 
 ## 当前结论
 
-从 Ceres solver 切换到 BAE 后，当前主要问题不是 BAE 速度或 basic BA 能力，而是 GlueMap augmented BA 中 virtual observations 的优化语义没有被完整迁移。
+BAE 当前被定义为独立的 real-only SP 加速路径，不再尝试在 pipeline 层等价替代
+Ceres augmented BA。Ceres 继续作为 SPV 质量基线。
 
-第一版 BAE backend 可以作为 real-only BA 加速路径继续验证，但不能直接宣称已经等价替代 Ceres augmented BA。
-
-后续最关键的设计点是：
+当前需要继续验证的重点是：
 
 ```text
-1. BAE real-only 后，virtual reconstruction 是否每轮重建 / 重初始化。
-2. 是否深改 BAE 支持 real / virtual 不同 robust loss。
-3. 当前 BAE gauge fix 是否足以稳定 intrinsics optimization；若不足，再增加 focal prior / bounds。
+1. BAE 多轮 real triangulation + BA 的 pose 质量和速度。
+2. two_cams gauge fix 下 intrinsics optimization 的稳定性。
+3. 若未来恢复 full augmented BAE，再单独设计 per-residual robust loss。
 ```

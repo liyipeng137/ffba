@@ -165,6 +165,30 @@ def build_reconstruction_for_ba(
     return reconstruction
 
 
+def build_seed_reconstruction_for_ba(
+    global_rotations: dict[int, np.ndarray],
+    global_centers: dict[int, np.ndarray],
+    global_intrinsics: list,
+    intrinsics_mapping: dict[int, int],
+    keypoints_per_image: dict[int, np.ndarray],
+    image_sizes: list[tuple[int, int]] | None = None,
+    images_list: list[str] | None = None,
+    camera_model: str = "SIMPLE_PINHOLE",
+) -> pycolmap.Reconstruction:
+    """Build a registered pose/keypoint seed without any 3D points."""
+    return build_reconstruction_for_ba(
+        global_rotations,
+        global_centers,
+        global_intrinsics,
+        intrinsics_mapping,
+        points3D={},
+        keypoints_per_image=keypoints_per_image,
+        image_sizes=image_sizes,
+        images_list=images_list,
+        camera_model=camera_model,
+    )
+
+
 def extract_results_from_reconstruction(
     reconstruction: pycolmap.Reconstruction,
 ) -> tuple[
@@ -251,7 +275,6 @@ class IterativeBAOptions:
     bae_device: str = "cuda"
     bae_max_iterations: int | None = None
     bae_optimize_intrinsics: bool = False
-    bae_real_only: bool = False
     bae_fix_gauge: str = "two_cams"
     last_ba_summary: dict | None = None
 
@@ -592,7 +615,7 @@ def iterative_bundle_adjustment(
                 max_num_iterations=bae_iterations,
                 device=options.bae_device,
                 optimize_intrinsics=options.bae_optimize_intrinsics,
-                real_only=options.bae_real_only,
+                real_only=True,
                 fix_gauge=options.bae_fix_gauge,
             )
         else:

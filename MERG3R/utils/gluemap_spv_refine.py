@@ -36,7 +36,6 @@ class GluemapSpvRefineConfig:
     ba_max_num_iterations: int = 100
     bae_max_num_iterations: int = 20
     bae_optimize_intrinsics: bool = False
-    bae_real_only: bool = False
     bae_fix_gauge: str = "two_cams"
     num_refinement_iterations: int = 2
     augmented_ba_max_filter_iterations: int = 3
@@ -62,19 +61,20 @@ class GluemapSpvRefineResult:
     intrinsics_mapping: dict[int, int]
     stats: dict
     refined_dir: Path
-    virtual_refined_dir: Path
+    virtual_refined_dir: Path | None
 
 
 def _make_refine_args(config: GluemapSpvRefineConfig):
+    use_virtual_tracks = config.ba_backend == "ceres"
     return SimpleNamespace(
         path_tracker=config.path_tracker,
-        track_mode=TRACK_MODE,
+        track_mode="SPV" if use_virtual_tracks else "SP",
         neighbors_per_center=config.neighbors_per_center,
         group_strategy=GROUP_STRATEGY,
         skip_doppelgangers=True,
         valid_dg_threshold=0.8,
         star_sequential_window=0,
-        build_virtual_tracks=True,
+        build_virtual_tracks=use_virtual_tracks,
         save_virtual_tracks_debug=config.save_virtual_tracks_debug,
         vggsfm_query_points=config.vggsfm_query_points,
         vggsfm_query_source=QUERY_SOURCE,
@@ -97,7 +97,6 @@ def _make_refine_args(config: GluemapSpvRefineConfig):
         ba_max_num_iterations=config.ba_max_num_iterations,
         bae_max_num_iterations=config.bae_max_num_iterations,
         bae_optimize_intrinsics=config.bae_optimize_intrinsics,
-        bae_real_only=config.bae_real_only,
         bae_fix_gauge=config.bae_fix_gauge,
         num_refinement_iterations=config.num_refinement_iterations,
         augmented_ba_max_filter_iterations=(config.augmented_ba_max_filter_iterations),
@@ -191,7 +190,7 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
     metadata = {"image_size_hw": image_size_hw}
 
     stats = {
-        "track_mode": TRACK_MODE,
+        "track_mode": args.track_mode,
         "camera_model": CAMERA_MODEL,
         "s_database_mode": S_DATABASE_MODE,
         "vggsfm_query_source": QUERY_SOURCE,
@@ -199,7 +198,6 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
         "group_strategy": GROUP_STRATEGY,
         "ba_backend": config.ba_backend,
         "bae_optimize_intrinsics": config.bae_optimize_intrinsics,
-        "bae_real_only": config.bae_real_only,
         "bae_fix_gauge": config.bae_fix_gauge,
         "timing": {"save_work_images": save_work_images_seconds},
         "work_images": {
@@ -362,36 +360,48 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
         f"time={stats['timing']['intrinsics_averaging']:.2f}s",
     )
 
-    _debug(args, f"Building virtual tracks: verify_mode={args.virtual_verify_mode}")
-    t0 = time.time()
-    (
-        virtual_predictions_dict,
-        stats["virtual_tracks"],
-    ) = ref.build_virtual_track_diagnostics(
-        args,
-        output_dir,
-        depth,
-        depth_conf,
-        extrinsic,
-        initial_intrinsics_low,
-        global_intrinsics,
-        intrinsics_mapping,
-        pairs,
-        image_names,
-        image_size_hw,
-        depth_image_size_hw=depth_image_size_hw,
-    )
-    stats["timing"]["virtual_tracks"] = time.time() - t0
-    vt = stats["virtual_tracks"]
-    final_vt = vt["update_virtual_tracks_global"]["virtual"]
-    _debug(
-        args,
-        "Virtual tracks done: "
-        f"verify_mode={vt['verify_mode']}, "
-        f"groups={vt['num_groups']}, "
-        f"valid_obs={final_vt['valid_observations']}, "
-        f"time={stats['timing']['virtual_tracks']:.2f}s",
-    )
+    if args.build_virtual_tracks:
+        _debug(
+            args,
+            f"Building virtual tracks: verify_mode={args.virtual_verify_mode}",
+        )
+        t0 = time.time()
+        (
+            virtual_predictions_dict,
+            stats["virtual_tracks"],
+        ) = ref.build_virtual_track_diagnostics(
+            args,
+            output_dir,
+            depth,
+            depth_conf,
+            extrinsic,
+            initial_intrinsics_low,
+            global_intrinsics,
+            intrinsics_mapping,
+            pairs,
+            image_names,
+            image_size_hw,
+            depth_image_size_hw=depth_image_size_hw,
+        )
+        stats["timing"]["virtual_tracks"] = time.time() - t0
+        vt = stats["virtual_tracks"]
+        final_vt = vt["update_virtual_tracks_global"]["virtual"]
+        _debug(
+            args,
+            "Virtual tracks done: "
+            f"verify_mode={vt['verify_mode']}, "
+            f"groups={vt['num_groups']}, "
+            f"valid_obs={final_vt['valid_observations']}, "
+            f"time={stats['timing']['virtual_tracks']:.2f}s",
+        )
+    else:
+        virtual_predictions_dict = None
+        stats["virtual_tracks"] = {
+            "enabled": False,
+            "reason": "BAE backend uses SP real tracks only",
+        }
+        stats["timing"]["virtual_tracks"] = 0.0
+        _debug(args, "Skipping virtual tracks for BAE SP refinement")
 
     if coverage_stats["dropped_indices"]:
         _debug(args, "Filtering SIFT database after frame filtering")
@@ -506,8 +516,9 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
     refined_dir = output_dir / "refined_gluemap_aba"
     refined_dir.mkdir(parents=True, exist_ok=True)
     reconstruction.write(str(refined_dir))
-    virtual_dir = output_dir / "virtual_gluemap_aba"
+    virtual_dir = None
     if virtual_reconstruction is not None:
+        virtual_dir = output_dir / "virtual_gluemap_aba"
         virtual_dir.mkdir(parents=True, exist_ok=True)
         virtual_reconstruction.write(str(virtual_dir))
 
@@ -516,7 +527,7 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
         "coarse_dir": str(coarse_dir),
         "database_merged": str(output_dir / "database_merged.db"),
         "refined_dir": str(refined_dir),
-        "virtual_refined_dir": str(virtual_dir),
+        "virtual_refined_dir": (str(virtual_dir) if virtual_dir is not None else None),
     }
     _write_json(output_dir / "refine_stats.json", stats)
 
