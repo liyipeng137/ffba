@@ -38,6 +38,8 @@ class GluemapSpvRefineConfig:
     bae_max_num_iterations: int = 20
     bae_optimize_intrinsics: bool = False
     bae_fix_gauge: str = "two_cams"
+    bae_robust_loss: str = "none"
+    bae_huber_delta: float = 1.0
     num_refinement_iterations: int = 2
     augmented_ba_max_filter_iterations: int = 3
     augmented_ba_normalized_reproj_threshold: float = 1e-2
@@ -99,6 +101,8 @@ def _make_refine_args(config: GluemapSpvRefineConfig):
         bae_max_num_iterations=config.bae_max_num_iterations,
         bae_optimize_intrinsics=config.bae_optimize_intrinsics,
         bae_fix_gauge=config.bae_fix_gauge,
+        bae_robust_loss=config.bae_robust_loss,
+        bae_huber_delta=config.bae_huber_delta,
         num_refinement_iterations=config.num_refinement_iterations,
         augmented_ba_max_filter_iterations=(config.augmented_ba_max_filter_iterations),
         augmented_ba_normalized_reproj_threshold=(
@@ -160,7 +164,9 @@ def _save_work_images(images, output_dir, num_workers=16):
 
 def _write_json(path, payload):
     with open(path, "w") as f:
-        json.dump(payload, f, indent=2)
+        # default=str keeps the stats dump from crashing after expensive compute
+        # if a value (e.g. a Path or numpy scalar) is not JSON-serializable.
+        json.dump(payload, f, indent=2, default=str)
 
 
 def run_gluemap_spv_refinement(coarse_state, output_dir, config):
@@ -200,6 +206,8 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
         "ba_backend": config.ba_backend,
         "bae_optimize_intrinsics": config.bae_optimize_intrinsics,
         "bae_fix_gauge": config.bae_fix_gauge,
+        "bae_robust_loss": config.bae_robust_loss,
+        "bae_huber_delta": config.bae_huber_delta,
         "timing": {"save_work_images": save_work_images_seconds},
         "work_images": {
             "images_dir": str(images_dir),

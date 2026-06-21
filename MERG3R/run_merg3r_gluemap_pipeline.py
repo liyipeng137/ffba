@@ -191,6 +191,23 @@ def parse_args():
             "one translation DOF on a second pose, with three-point fallback."
         ),
     )
+    parser.add_argument(
+        "--bae_robust_loss",
+        type=str,
+        default="none",
+        choices=["none", "huber"],
+        help=(
+            "Robust loss for the BAE backend's real-track residuals. 'huber' "
+            "applies IRLS Huber weighting (delta in pixels), mirroring the "
+            "Ceres real-track Huber loss. Ignored by the Ceres backend."
+        ),
+    )
+    parser.add_argument(
+        "--bae_huber_delta",
+        type=float,
+        default=1.0,
+        help="Huber delta in pixels when --bae_robust_loss=huber.",
+    )
     parser.add_argument("--num_refinement_iterations", type=int, default=2)
     parser.add_argument("--augmented_ba_max_filter_iterations", type=int, default=3)
     parser.add_argument(
@@ -629,6 +646,8 @@ def main():
         bae_max_num_iterations=args.bae_max_num_iterations,
         bae_optimize_intrinsics=args.bae_optimize_intrinsics,
         bae_fix_gauge=args.bae_fix_gauge,
+        bae_robust_loss=args.bae_robust_loss,
+        bae_huber_delta=args.bae_huber_delta,
         num_refinement_iterations=args.num_refinement_iterations,
         augmented_ba_max_filter_iterations=args.augmented_ba_max_filter_iterations,
         augmented_ba_normalized_reproj_threshold=(

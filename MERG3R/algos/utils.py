@@ -1603,7 +1603,7 @@ def export_prediction_depth_maps(predictions, image_names, output_dir, conf_thre
         "conf_threshold": conf_threshold,
         "conf_threshold_value": conf_threshold_value,
         "num_masked_by_conf": masked_pixels,
-        "output_dir": output_dir,
+        "output_dir": str(output_dir),
     }
 
 

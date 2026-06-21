@@ -1,3 +1,4 @@
+import gc
 import importlib
 import logging
 import sys
@@ -346,7 +347,9 @@ def _build_bae_problem(
     )
 
 
-def _make_bae_model(runtime, camera_model, optimize_intrinsics):
+def _make_bae_model(
+    runtime, camera_model, optimize_intrinsics, robust_loss="none", huber_delta=1.0
+):
     pp = runtime.pp
     psjac = runtime.psjac
 
@@ -412,6 +415,8 @@ def _make_bae_model(runtime, camera_model, optimize_intrinsics):
     class GluemapBaeResidual(nn.Module):
         def __init__(self, camera_params, points_3d, intrinsics):
             super().__init__()
+            self.robust_loss = robust_loss
+            self.huber_delta = float(huber_delta)
             self.pose = pp.Parameter(camera_params, sjac=True)
             self.points_3d = pp.Parameter(points_3d, sjac=True)
             self.pose.trim_SE3_grad = True
@@ -437,7 +442,7 @@ def _make_bae_model(runtime, camera_model, optimize_intrinsics):
             else:
                 self.register_buffer("shared_intr", intrinsics)
 
-        def forward(self, input_dict=None, **kwargs):
+        def _parse_input(self, input_dict, kwargs):
             if input_dict is None:
                 input_dict = kwargs
             elif isinstance(input_dict, dict):
@@ -447,6 +452,9 @@ def _make_bae_model(runtime, camera_model, optimize_intrinsics):
                     "GluemapBaeResidual.forward expects a dict input or "
                     f"keyword tensors, got {type(input_dict)!r}"
                 )
+            return input_dict
+
+        def _project(self, input_dict):
             points_2d = input_dict["points_2d"]
             camera_indices = input_dict["camera_indices"]
             point_indices = input_dict["point_indices"]
@@ -478,6 +486,74 @@ def _make_bae_model(runtime, camera_model, optimize_intrinsics):
                 points_2d,
                 point_sign,
             )
+
+        def _huber_weight_sqrt(self, base):
+            # Per-observation IRLS sqrt-weight for Huber, computed from the
+            # detached residual norm (pixels). It is a plain tensor with no
+            # optrace, so the map-edge backward (graph.py) excludes it from
+            # argnums and treats it as a constant scale. Multiplying the tracked
+            # residual by sqrt(w) therefore scales the tracked Jacobian to match,
+            # yielding A = J^T W J and rhs = -J^T W r (Huber IRLS).
+            residual_value = base.tensor().detach()
+            s = torch.linalg.norm(residual_value, dim=-1, keepdim=True)
+            delta = self.huber_delta
+            s_safe = torch.clamp(s, min=1e-12)
+            return torch.where(
+                s <= delta,
+                torch.ones_like(s),
+                torch.sqrt(delta / s_safe),
+            )
+
+        def forward(self, input_dict=None, **kwargs):
+            input_dict = self._parse_input(input_dict, kwargs)
+            base = self._project(input_dict)
+            if self.robust_loss == "huber":
+                # base * sqrt(w) -> tracked __mul__ map edge (whitelisted), so
+                # both the residual and its Jacobian carry the IRLS weight.
+                return base * self._huber_weight_sqrt(base)
+            return base
+
+        @torch.no_grad()
+        def robust_debug_stats(self, input_dict=None, **kwargs):
+            # Diagnostics only: recompute the unweighted residual once and
+            # summarise its magnitude and (when Huber) the down-weighting. This
+            # forces host syncs, so it must stay out of the hot LM inner loop.
+            input_dict = self._parse_input(input_dict, kwargs)
+            base = self._project(input_dict)
+            residual = base.tensor() if hasattr(base, "tensor") else base
+            s = torch.linalg.norm(residual, dim=-1)
+            stats = {
+                "type": self.robust_loss,
+                "num_observations": int(s.shape[0]),
+                "residual_px_mean": float(s.mean().item()),
+                "residual_px_median": float(s.median().item()),
+                "residual_px_max": float(s.max().item()),
+                "raw_mean_squared_px": float((s * s).mean().item()),
+            }
+            if self.robust_loss == "huber":
+                delta = self.huber_delta
+                s_safe = torch.clamp(s, min=1e-12)
+                weight = torch.where(
+                    s <= delta,
+                    torch.ones_like(s),
+                    delta / s_safe,
+                )
+                downweighted = s > delta
+                stats.update(
+                    {
+                        "huber_delta": float(delta),
+                        "num_downweighted": int(downweighted.sum().item()),
+                        "frac_downweighted": float(
+                            downweighted.to(torch.float64).mean().item()
+                        ),
+                        "weight_min": float(weight.min().item()),
+                        "weight_mean": float(weight.mean().item()),
+                        "weighted_mean_squared_px": float(
+                            (weight * s * s).mean().item()
+                        ),
+                    }
+                )
+            return stats
 
         def optimized_intrinsics(self):
             if camera_model == "SIMPLE_PINHOLE":
@@ -924,7 +1000,14 @@ def bundle_adjustment_bae(
     optimize_intrinsics: bool = False,
     real_only: bool = False,
     fix_gauge: str = "two_cams",
+    robust_loss: str = "none",
+    huber_delta: float = 1.0,
 ):
+    robust_loss = (robust_loss or "none").lower()
+    if robust_loss not in {"none", "huber"}:
+        raise ValueError(
+            f"Unknown bae robust_loss {robust_loss!r}, expected 'none' or 'huber'"
+        )
     runtime = _ensure_bae_runtime()
     problem = _build_bae_problem(
         reconstruction,
@@ -948,7 +1031,9 @@ def bundle_adjustment_bae(
         f"{int(problem.is_negative.sum())} negative obs, "
         f"optimize_intrinsics={optimize_intrinsics}, "
         f"real_only={real_only}, "
-        f"fix_gauge={fix_gauge}"
+        f"fix_gauge={fix_gauge}, "
+        f"robust_loss={robust_loss}, "
+        f"huber_delta={huber_delta if robust_loss == 'huber' else None}"
     )
 
     torch_device = torch.device(device)
@@ -980,7 +1065,11 @@ def bundle_adjustment_bae(
     )
 
     model_cls = _make_bae_model(
-        runtime, problem.camera_model, optimize_intrinsics
+        runtime,
+        problem.camera_model,
+        optimize_intrinsics,
+        robust_loss=robust_loss,
+        huber_delta=huber_delta,
     )
     model = model_cls(camera_params.clone(), points_3d.clone(), intrinsics).to(
         torch_device
@@ -1011,6 +1100,21 @@ def bundle_adjustment_bae(
     optimizer = runtime.LM(model, strategy=strategy, solver=solver, reject=30)
 
     initial_loss = _loss_value(model, input_dict)
+    initial_robust_stats = model.robust_debug_stats(input_dict)
+    logger.info(
+        "BAE robust config: "
+        f"robust_loss={robust_loss}, "
+        f"huber_delta={huber_delta if robust_loss == 'huber' else None}, "
+        f"initial_residual_px_mean={initial_robust_stats['residual_px_mean']:.4g}, "
+        f"initial_raw_mse_px={initial_robust_stats['raw_mean_squared_px']:.6g}"
+        + (
+            f", initial_downweighted={initial_robust_stats['num_downweighted']}/"
+            f"{initial_robust_stats['num_observations']} "
+            f"({100 * initial_robust_stats['frac_downweighted']:.1f}%)"
+            if robust_loss == "huber"
+            else ""
+        )
+    )
     t0 = time.time()
     last_loss = initial_loss
     for idx in range(int(max_num_iterations)):
@@ -1019,15 +1123,28 @@ def bundle_adjustment_bae(
             last_loss = float(last_loss_tensor.item())
         else:
             last_loss = float(last_loss_tensor)
-        logger.info(
+        iter_msg = (
             "BAE iteration "
             f"{idx + 1}/{max_num_iterations}: loss={last_loss:.6e}"
         )
+        if robust_loss == "huber":
+            rs = model.robust_debug_stats(input_dict)
+            iter_msg += (
+                f" | huber(delta={huber_delta:.3g}) "
+                f"downweighted={rs['num_downweighted']}/"
+                f"{rs['num_observations']} "
+                f"({100 * rs['frac_downweighted']:.1f}%), "
+                f"raw_mse={rs['raw_mean_squared_px']:.4g}, "
+                f"w_mse={rs['weighted_mean_squared_px']:.4g}, "
+                f"w_min={rs['weight_min']:.3g}"
+            )
+        logger.info(iter_msg)
 
     if torch_device.type == "cuda" and torch.cuda.is_available():
         torch.cuda.synchronize()
     seconds = time.time() - t0
     ending_loss = _loss_value(model, input_dict)
+    final_robust_stats = model.robust_debug_stats(input_dict)
 
     optimized_camera_params = model.pose.detach().cpu().numpy()
     optimized_points = model.points_3d.detach().cpu().numpy()
@@ -1069,7 +1186,13 @@ def bundle_adjustment_bae(
         "intrinsics_final": intrinsics_final,
         "fix_gauge": gauge_summary["applied"] not in {"none"},
         "gauge_fix": gauge_summary,
-        "loss": "plain_squared",
+        "loss": "huber" if robust_loss == "huber" else "plain_squared",
+        "robust": {
+            "type": robust_loss,
+            "huber_delta": float(huber_delta) if robust_loss == "huber" else None,
+            "initial": initial_robust_stats,
+            "final": final_robust_stats,
+        },
         "camera_model": problem.camera_model,
         "skipped": problem.skipped,
         "pose_drift": pose_drift,
@@ -1077,7 +1200,18 @@ def bundle_adjustment_bae(
     logger.info(
         "BAE bundle adjustment done: "
         f"loss {initial_loss:.6e} -> {ending_loss:.6e}, "
-        f"time={seconds:.2f}s, real_only={real_only}"
+        f"time={seconds:.2f}s, real_only={real_only}, "
+        f"robust_loss={robust_loss}"
+        + (
+            ", downweighted "
+            f"{initial_robust_stats['num_downweighted']}->"
+            f"{final_robust_stats['num_downweighted']}/"
+            f"{final_robust_stats['num_observations']}, "
+            f"raw_mse {initial_robust_stats['raw_mean_squared_px']:.4g}->"
+            f"{final_robust_stats['raw_mean_squared_px']:.4g}"
+            if robust_loss == "huber"
+            else ""
+        )
     )
     logger.info(
         "BAE intrinsics: "
@@ -1098,4 +1232,17 @@ def bundle_adjustment_bae(
         f"rotation_delta_deg_mean={pose_drift['rotation_delta_deg_mean']:.6g}, "
         f"rotation_delta_deg_max={pose_drift['rotation_delta_deg_max']:.6g}"
     )
+
+    # Release GPU memory before returning. With --num_refinement_iterations>1
+    # the BA is called once per round; each round's model / LM optimizer (which
+    # holds a CuSparse J^T J workspace) and cuda input tensors otherwise stay
+    # reserved and fragmented. A later round then OOMs on the cuSPARSE SpGEMM
+    # external-buffer allocation even when its problem is no larger than an
+    # earlier round that succeeded. del + gc breaks the optimizer<->model
+    # reference cycle so empty_cache can actually return the blocks to CUDA.
+    del optimizer, model, input_dict, camera_params, points_3d, intrinsics
+    gc.collect()
+    if torch_device.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     return reconstruction, virtual_reconstruction, summary

@@ -2154,6 +2154,12 @@ def run_merg3r_augmented_refinement_loop(
         bae_max_iterations=getattr(args, "bae_max_num_iterations", None),
         bae_optimize_intrinsics=getattr(args, "bae_optimize_intrinsics", False),
         bae_fix_gauge=getattr(args, "bae_fix_gauge", "two_cams"),
+        bae_robust_loss=getattr(args, "bae_robust_loss", "none"),
+        bae_huber_delta=getattr(args, "bae_huber_delta", 1.0),
+        # ceres keeps its virtual-driven re-BA loop; BAE filters through every
+        # scaling once but never re-runs BA (the re-BA is near-useless once
+        # huber has down-weighted the outliers).
+        allow_re_ba_after_filter=(ba_backend == "ceres"),
     )
 
     reconstruction = None
@@ -2266,6 +2272,13 @@ def run_merg3r_augmented_refinement_loop(
         else:
             iter_stats["reprojection_filter"] = {"enabled": False}
 
+        # The post-BA filter only reaches the output in the final round; in
+        # intermediate BAE rounds the next triangulation re-creates points with
+        # clear_points=True, so its pruning is wasted. ceres rounds always
+        # filter (their virtual-driven loop and per-round cleanup rely on it).
+        is_final_round = outer_iter == args.num_refinement_iterations - 1
+        ba_options.run_post_ba_filter = use_virtual_tracks or is_final_round
+
         t0 = time.time()
         before_ba = {
             "real": summarize_reconstruction(reconstruction),
@@ -2283,6 +2296,7 @@ def run_merg3r_augmented_refinement_loop(
             seed_reconstruction = reconstruction
         iter_stats["bundle_adjustment"] = {
             "seconds": time.time() - t0,
+            "post_ba_filter_ran": ba_options.run_post_ba_filter,
             "before": before_ba,
             "after": {
                 "real": summarize_reconstruction(reconstruction),

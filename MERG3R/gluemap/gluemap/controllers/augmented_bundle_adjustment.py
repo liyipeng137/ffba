@@ -266,6 +266,22 @@ class IterativeBAOptions:
     # Whether to filter virtual points same as real tracks
     filter_virtual_points: bool = True
 
+    # Whether to run the post-BA reprojection filter after BA in this call. The
+    # augmented refinement loop sets this False for non-final BAE rounds: their
+    # track pruning is discarded by the next round's clear_points
+    # re-triangulation, so filtering there is wasted compute. The final round
+    # (and every ceres round) keeps it True so the output tracks are cleaned.
+    run_post_ba_filter: bool = True
+
+    # When the post-BA filter removes >convergence_threshold of points, the
+    # original loop re-runs BA on the cleaned tracks. For ceres (virtual-driven
+    # trimming) that re-BA is the intended mechanism. For BAE+huber it is
+    # near-useless: outliers are already down-weighted to ~0, so the re-BA
+    # barely moves the solution (observed loss change <1%). The augmented loop
+    # sets this False for BAE, so the final round still filters through every
+    # scaling (3x/2x/1x) but runs BA exactly once.
+    allow_re_ba_after_filter: bool = True
+
     # Bundle adjustment backend. "ceres" preserves the original GlueMap
     # implementation; "bae" uses the independent PyTorch BAE solver.
     ba_backend: str = "ceres"
@@ -276,6 +292,10 @@ class IterativeBAOptions:
     bae_max_iterations: int | None = None
     bae_optimize_intrinsics: bool = False
     bae_fix_gauge: str = "two_cams"
+    # Robust loss for the BAE real-track residuals. "none" keeps plain squared
+    # loss; "huber" applies IRLS Huber weighting with bae_huber_delta (pixels).
+    bae_robust_loss: str = "none"
+    bae_huber_delta: float = 1.0
     last_ba_summary: dict | None = None
 
 
@@ -617,6 +637,8 @@ def iterative_bundle_adjustment(
                 optimize_intrinsics=options.bae_optimize_intrinsics,
                 real_only=True,
                 fix_gauge=options.bae_fix_gauge,
+                robust_loss=options.bae_robust_loss,
+                huber_delta=options.bae_huber_delta,
             )
         else:
             raise ValueError(
@@ -624,6 +646,16 @@ def iterative_bundle_adjustment(
                 "'ceres' or 'bae'"
             )
         options.last_ba_summary = _summary
+
+        if not options.run_post_ba_filter:
+            # Non-final BAE round: skip filtering entirely. The pruning would be
+            # discarded by the next round's clear_points re-triangulation, and
+            # only the BA-updated poses/intrinsics carry forward.
+            logger.info(
+                "Skipping post-BA reprojection filter this round "
+                "(run_post_ba_filter=False); BA ran once, no track pruning"
+            )
+            break
 
         # Inner loop: filter and tighten threshold when too few tracks filtered
         # (matches C++ IterativeBundleAdjustment pattern)
@@ -678,7 +710,8 @@ def iterative_bundle_adjustment(
                 else 0
             )
             if (
-                num_points > 0
+                options.allow_re_ba_after_filter
+                and num_points > 0
                 and total_filtered > options.convergence_threshold * num_points
             ):
                 # Enough filtered, break inner loop to run BA again
@@ -686,8 +719,9 @@ def iterative_bundle_adjustment(
                 iteration += 1
                 break
             else:
-                # Too few filtered, tighten threshold and filter again
-                # without BA
+                # Re-BA disabled (BAE), or too few filtered: tighten the
+                # threshold and keep filtering at the next scaling without
+                # re-running BA.
                 iteration += 1
                 if iteration < options.max_filter_iterations:
                     logger.debug(
