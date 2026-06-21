@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import numpy as np
 from PIL import Image
 
+from algos.utils import export_prediction_depth_maps
 from utils import gluemap_refine_core as ref
 
 CAMERA_MODEL = "SIMPLE_PINHOLE"
@@ -333,6 +334,20 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
         if coarse_state.raw_depth_conf is not None
         else None
     )
+
+    t0 = time.time()
+    depth_predictions = {"depth": depth}
+    depth_conf_threshold = None
+    if depth_conf is not None:
+        depth_predictions["depth_conf"] = depth_conf
+        depth_conf_threshold = 2.0
+    stats["depth_export"] = export_prediction_depth_maps(
+        depth_predictions,
+        image_names,
+        output_dir / "pred_depth",
+        conf_threshold=depth_conf_threshold,
+    )
+    stats["timing"]["depth_export"] = time.time() - t0
 
     t0 = time.time()
     (

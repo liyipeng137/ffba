@@ -18,6 +18,11 @@ from algos.dense_correction import apply_inverse_depth_affine_correction
 from algos.lingbot_depth_refine import run_lingbot_depth_refinement
 from algos.infinidepth_refine import DEFAULT_INFINIDEPTH_MODEL_PATH, run_infinidepth_refinement
 from bae_pipe import run_bae_refinement
+from utils.image_pyramid import (
+    build_two_resolution_image_pyramid,
+    load_matching_high_images,
+    scale_intrinsics_low_to_high,
+)
 
 
 import gc
@@ -84,8 +89,33 @@ def parse_args():
     parser.add_argument("--alignment_type", type=str, default="weighted_iterative")
     parser.add_argument("--global_ba", action="store_true", default=True)
     parser.add_argument("--dataset", type=str)
-    parser.add_argument("--high-dataset", dest="high_dataset", type=str, default=None)
     parser.add_argument("--output_dir", type=str, required=True)
+    parser.add_argument(
+        "--image_pyramid",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Build low/high resolution image sets from --dataset. The low set is "
+            "used by MERG3R and the high set is used by downstream refinement."
+        ),
+    )
+    parser.add_argument("--stage1_downscale_n", type=int, default=4)
+    parser.add_argument("--stage1_multiple", type=int, default=14)
+    parser.add_argument(
+        "--image_pyramid_workers",
+        type=int,
+        default=16,
+        help="Number of concurrent workers for image pyramid preprocessing.",
+    )
+    parser.add_argument(
+        "--stage2_scale_factor",
+        type=int,
+        default=0,
+        help=(
+            "High-res scale relative to stage1 after crop. 0 uses "
+            "stage1_downscale_n, making the high set approximately original size."
+        ),
+    )
     parser.add_argument("--sequence_type", type=str, default="shortest_path")
     parser.add_argument("--lr", type=float, default=3e-3)  # 3e-4
     parser.add_argument("--epoch", type=int, default=300)
@@ -305,7 +335,31 @@ def main():
     with open(os.path.join(args.output_dir, "config.json"), "w") as f:
         json.dump(args_dict, f, indent=2)
 
-    images, image_names = process_images(args.dataset, subsample, device, args.num_images, args.multi_dirs, args.model)
+    image_pyramid_result = None
+    dataset_for_coarse = args.dataset
+    if args.image_pyramid:
+        stage2_scale_factor = (
+            None if args.stage2_scale_factor == 0 else args.stage2_scale_factor
+        )
+        image_pyramid_result = build_two_resolution_image_pyramid(
+            args.dataset,
+            os.path.join(args.output_dir, "image_pyramid"),
+            stage1_downscale_n=args.stage1_downscale_n,
+            multiple=args.stage1_multiple,
+            stage2_scale_factor=stage2_scale_factor,
+            recursive=args.multi_dirs,
+            num_workers=args.image_pyramid_workers,
+        )
+        dataset_for_coarse = str(image_pyramid_result.low_dir)
+
+    images, image_names = process_images(
+        dataset_for_coarse,
+        subsample,
+        device,
+        args.num_images,
+        args.multi_dirs,
+        args.model,
+    )
     # if args.model == "vggt_omega":
     #     image_names = save_tensor_images(
     #         images,
@@ -530,17 +584,20 @@ def main():
     high_output_images = None
     high_output_image_names = None
     high_output_intrinsic = None
-    high_output_enabled = args.high_dataset is not None
+    high_output_enabled = image_pyramid_result is not None
     if high_output_enabled:
-        high_output_images, high_output_image_names = load_images_matching_names(
-            args.high_dataset,
+        high_output_images, high_output_image_names = load_matching_high_images(
+            image_pyramid_result.high_dir,
             sequence.image_names,
+            image_pyramid_result.low_dir,
             device=sequence.images.device,
+            num_workers=args.image_pyramid_workers,
         )
-        high_output_intrinsic = scale_intrinsics_between_image_sets(
+        high_output_intrinsic = scale_intrinsics_low_to_high(
             low_intrinsic,
-            sequence.images,
-            high_output_images,
+            sequence.image_names,
+            image_pyramid_result.low_dir,
+            image_pyramid_result.records,
         )
         print(
             "[MAIN] High-resolution output enabled: "
@@ -761,7 +818,9 @@ def main():
         #     f.write(f"Dense Depth Nonzero Pixels: {dense_depth_stats['num_nonzero_depth_pixels']}\n")
         #     f.write(f"Dense Depth Output Dir: {dense_depth_stats['output_dir']}\n")
         if high_output_enabled:
-            f.write(f"High Dataset: {args.high_dataset}\n")
+            f.write(f"Image Pyramid Manifest: {image_pyramid_result.manifest_path}\n")
+            f.write(f"Low Image Directory: {image_pyramid_result.low_dir}\n")
+            f.write(f"High Image Directory: {image_pyramid_result.high_dir}\n")
             f.write(f"High Output Image Shape: {tuple(high_output_images.shape[-2:])}\n")
         if lingbot_stats is not None:
             f.write(f"LingBot Depth Model: {lingbot_stats['model']}\n")

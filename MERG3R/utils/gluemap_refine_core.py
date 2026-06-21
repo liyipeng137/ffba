@@ -1858,6 +1858,48 @@ def summarize_reconstruction(reconstruction):
     }
 
 
+def summarize_ba_solver_result(summary):
+    """Convert a backend-specific BA summary into JSON-compatible stats."""
+    if summary is None or isinstance(summary, dict):
+        return summary
+
+    result = {"type": type(summary).__name__}
+    scalar_attributes = (
+        "initial_cost",
+        "final_cost",
+        "fixed_cost",
+        "num_successful_steps",
+        "num_unsuccessful_steps",
+        "num_inner_iteration_steps",
+        "preprocessor_time_in_seconds",
+        "minimizer_time_in_seconds",
+        "postprocessor_time_in_seconds",
+        "total_time_in_seconds",
+        "message",
+    )
+    for name in scalar_attributes:
+        if not hasattr(summary, name):
+            continue
+        value = getattr(summary, name)
+        if isinstance(value, np.generic):
+            value = value.item()
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            result[name] = value
+
+    if hasattr(summary, "termination_type"):
+        result["termination_type"] = str(summary.termination_type)
+
+    for output_name, method_name in (
+        ("brief_report", "BriefReport"),
+        ("full_report", "FullReport"),
+    ):
+        method = getattr(summary, method_name, None)
+        if callable(method):
+            result[output_name] = str(method())
+
+    return result
+
+
 def run_reprojection_filter_with_stats(
     reconstruction,
     error_type,
@@ -2247,7 +2289,7 @@ def run_merg3r_augmented_refinement_loop(
                 "virtual": summarize_reconstruction(virtual_reconstruction),
             },
             "backend": ba_options.ba_backend,
-            "summary": ba_options.last_ba_summary,
+            "summary": summarize_ba_solver_result(ba_options.last_ba_summary),
         }
         iter_stats["seconds"] = time.time() - t_iter
         stats["iterations"].append(iter_stats)
