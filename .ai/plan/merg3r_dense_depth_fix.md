@@ -1,6 +1,52 @@
 # MERG3R Dense Point Correction Plan
 
-更新时间：2026-05-12
+更新时间：2026-06-21（实测进展见下；原始设计 2026-05-12 见第 1 节起）
+
+---
+
+## 实测进展（2026-06-21）：GlueMap+BAE pipeline 上的诊断与 per-frame 尺度矫正
+
+> 这是对本计划"诊断阶段 + 方案 A"的**实际执行与结论**。关联：[`merg3r_gluemap_bae_optimizations.md`](merg3r_gluemap_bae_optimizations.md)、[`lingbot_bae_depth_pipeline_plan.md`](lingbot_bae_depth_pipeline_plan.md)。
+>
+> **上下文差异**：本次工具走的是 **GlueMap+BAE pipeline 的落盘产物**（`refined_gluemap_aba/`、`pred_depth/`、`coarse/`），不是本计划原文里 main.py 的 in-memory `final_predictions` / `local_points`。问题本质相同（sparse BA anchors vs dense FF depth 的逐帧尺度），结论可迁移。
+
+### 工具（已落地）
+
+- `scripts/diagnose_depth_pose_consistency.py`：读 refined COLMAP + `pred_depth` + 可选 coarse，自包含解析 COLMAP（.bin/.txt，不依赖 pycolmap）。对每个 BA 点观测算 `r = z_ba / d_ff`，输出逐帧 ratio 统计、帧内 CV、空间平面 R²、错层 world spread、Sim3(coarse→refined) 形变，并给出 `global_scalar / per_frame_scalar / per_frame_smooth_field / model_based` 建议。
+- `scripts/apply_per_frame_scale.py`：`--mode {scalar,affine,inv_affine}`。每帧从锚点鲁棒拟合（scalar=median(z/d)；affine=z~a·d+b；inv_affine=1/z~a·(1/d)+b），带 clamp / 少锚点回退 / affine 病态（深度跨度不足）回退 scalar / 正性保护；打印 affine-vs-scalar 残差对比；输出三格式 depth（对齐 `MERG3R/algos/utils.py::export_prediction_depth_maps`：`depth_npy/ depth_u16/ depth_vis/`）。
+
+### 诊断结果（原始 pred_depth；390 帧，refined = bae huber δ=1.0/gate=1.0）
+
+| 指标 | 值 | 含义 |
+|---|---|---|
+| global median ratio | 1.044 | FF depth 需 ×1.044 对上 refined |
+| frame-median ratio CV | 2.43% | 帧间尺度变异（>2% → 非纯全局） |
+| median in-frame CV | 2.87% | 帧内尺度很紧 → 单标量够 |
+| median plane R² | 0.025 | 无空间结构场 |
+| 错层 spread (rel depth) | median 2.3% / p90 7.0% | 实测分层量级 |
+| Sim3 scale / 形变残差 | 1.0487 / median 3.2%、p90 7.5% | 全局尺度 + 非刚性形变 |
+
+交叉校验：global median ratio 1.044 ≈ Sim3 scale 1.0487 → 诊断自洽。推荐 **per_frame_scalar**。
+
+### 实验与结论
+
+1. **per-frame scalar：成功，保留。** 对 scaled depth 重跑 diagnose：错层 median **2.3% → 1.28%（−44%）**，frame-median ratio CV **2.43% → ~0**，in-frame CV 不变（2.87%，scalar 本就不动帧内），p90 7.0% → 6.7%（几乎不变）。
+2. **affine：无效。** anchor 残差 rel CV `2.87% → 2.77%`（仅 9% 帧 >20% 改善）→ 帧内残差**不是随深度变化的 affine 偏置**，是结构化不了的噪声。
+3. **inv_affine：报告里的 17% 是脚本 residual bug**（`pred` 用了 `1/(a+b·d)`，应为 `d/(a+b·d)`，已修；`apply_model` 一直是对的，所以**生成的 depth 有效**，实际 ≈ scalar）。
+
+### 修订原计划的结论
+
+- **per-frame scalar 是正确且充分的"尺度"修法。** 本计划"方案 A：per-frame inverse-depth affine"经实测**不需要 affine/shift**——锚点处无深度结构，affine/inv-affine 都不优于纯 scalar。尺度这条线**收口**。
+- **残余错层（median 1.28% / p90 6.7%）= 帧内逐像素深度误差地板**（无结构噪声）。且诊断指标基于**稀疏锚点**，所以 TSDF 里"部分视角更糟"几乎都在**无纹理 / 无锚点区**：per-frame 尺度由纹理区锚点定标，被外推到锚点覆盖不到的深度时会更偏。
+- **剩下是 depth 质量问题，不是 pose/尺度问题。** 因此原计划"方案 B：sparse residual field""方案 C：cross-view"优先级下降——问题不在"传播 sparse residual"，而在锚点**根本覆盖不到**的区域。真正的下一杠杆是**提升无锚点区的 depth 质量**：用 RGB + 现已逐帧尺度对齐的 dense depth 作为 lingbot 的 `depth_in` 做精化（见 `lingbot_bae_depth_pipeline_plan.md`）。
+
+### 下一步（三选一）
+
+1. **接受现状**：median 错层 1.28%（2m 处 ~2.6cm）对多数用途够好。
+2. **定位坏帧（便宜）**：把变糟视角对上 `per_frame_scale.csv` 的 `status / n_anchors`；疑点是 `fallback_clamp`（frame_000038/043）、低锚点帧、及诊断 `worst_frames`（38/34/33/7/31…）。若是少数帧 → 单独修（如 38/43 不一刀切回全局，用平滑后的邻居尺度）。
+3. **治本（治尾巴）= lingbot 稠密精化**：把尺度对齐后的 dense depth 喂 lingbot，用 RGB 修无纹理区逐像素误差——这才是能动 p90 / worse-view 的杠杆。
+
+---
 
 ## 1. 背景与目标
 

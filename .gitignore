@@ -213,3 +213,4 @@ LoGeR/
 logs/
 .todelete/
 tapnet/
+*log

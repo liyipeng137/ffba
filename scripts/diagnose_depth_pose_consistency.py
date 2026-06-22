@@ -337,6 +337,7 @@ def main():
     for img_id, im in images.items():
         cam = cameras[im["camera_id"]]
         stem = Path(im["name"]).stem
+        print(f"[DIAG] Loading depth for {stem}")
         depth = load_ff_depth(args.depth, stem)
         if depth is None:
             missing_depth.append(stem)
