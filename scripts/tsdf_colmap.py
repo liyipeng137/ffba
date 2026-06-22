@@ -1,10 +1,10 @@
 
 #!/usr/bin/env python3
 """
-TSDF Fusion from COLMAP text model
+TSDF Fusion from COLMAP model (text or binary)
 
 Input:
-  - colmap/         : cameras.txt (PINHOLE intrinsics) + images.txt (OpenCV w2c poses)
+  - colmap/         : cameras.{txt,bin} + images.{txt,bin} (auto-detected, prefers .bin)
   - depth/*.png     : uint16 PNG, depth = pixel_value / depth_scale (meters)
   - image/*.jpg     : RGB color images
 
@@ -14,16 +14,64 @@ Output:
 """
 
 import argparse
+import collections
+import struct
 import numpy as np
 import open3d as o3d
 from pathlib import Path
 from PIL import Image
 from tqdm import tqdm
 
+CameraModel = collections.namedtuple("CameraModel", ["model_id", "model_name", "num_params"])
+CAMERA_MODELS = {
+    CameraModel(model_id=0, model_name="SIMPLE_PINHOLE", num_params=3),
+    CameraModel(model_id=1, model_name="PINHOLE", num_params=4),
+    CameraModel(model_id=2, model_name="SIMPLE_RADIAL", num_params=4),
+    CameraModel(model_id=3, model_name="RADIAL", num_params=5),
+    CameraModel(model_id=4, model_name="OPENCV", num_params=8),
+    CameraModel(model_id=5, model_name="OPENCV_FISHEYE", num_params=8),
+    CameraModel(model_id=6, model_name="FULL_OPENCV", num_params=12),
+    CameraModel(model_id=7, model_name="FOV", num_params=5),
+    CameraModel(model_id=8, model_name="SIMPLE_RADIAL_FISHEYE", num_params=4),
+    CameraModel(model_id=9, model_name="RADIAL_FISHEYE", num_params=5),
+    CameraModel(model_id=10, model_name="THIN_PRISM_FISHEYE", num_params=12),
+}
+CAMERA_MODEL_IDS = {m.model_id: m for m in CAMERA_MODELS}
+
 
 # --------------------------------------------------------------------------- #
 # COLMAP I/O
 # --------------------------------------------------------------------------- #
+
+def _read_next_bytes(fid, num_bytes, format_char_sequence, endian_character="<"):
+    data = fid.read(num_bytes)
+    return struct.unpack(endian_character + format_char_sequence, data)
+
+
+def _camera_params_from_model(model: str, params) -> tuple:
+    if model == "PINHOLE":
+        fx, fy, cx, cy = map(float, params[:4])
+    elif model == "SIMPLE_PINHOLE":
+        fx = fy = float(params[0])
+        cx, cy = float(params[1]), float(params[2])
+    else:
+        raise ValueError(f"Unsupported camera model: {model}")
+    return fx, fy, cx, cy
+
+
+def resolve_colmap_model(colmap_dir: Path) -> tuple:
+    """Return (cameras_path, images_path, fmt) where fmt is 'bin' or 'txt'. Prefers .bin."""
+    bin_files = (colmap_dir / "cameras.bin", colmap_dir / "images.bin")
+    txt_files = (colmap_dir / "cameras.txt", colmap_dir / "images.txt")
+    if all(p.exists() for p in bin_files):
+        return bin_files[0], bin_files[1], "bin"
+    if all(p.exists() for p in txt_files):
+        return txt_files[0], txt_files[1], "txt"
+    raise FileNotFoundError(
+        f"Could not find cameras/images in {colmap_dir}. "
+        "Expected either cameras.bin+images.bin or cameras.txt+images.txt."
+    )
+
 
 def qvec2rotmat(qvec: np.ndarray) -> np.ndarray:
     """COLMAP quaternion [qw, qx, qy, qz] -> 3x3 rotation matrix."""
@@ -46,6 +94,13 @@ def qvec2rotmat(qvec: np.ndarray) -> np.ndarray:
     ])
 
 
+def _image_to_frame(name: str, camera_id: int, qvec: np.ndarray, tvec: np.ndarray) -> dict:
+    w2c = np.eye(4, dtype=np.float64)
+    w2c[:3, :3] = qvec2rotmat(qvec)
+    w2c[:3, 3] = tvec
+    return dict(name=name, camera_id=camera_id, w2c=w2c)
+
+
 def parse_colmap_cameras(cameras_path: Path) -> dict:
     """Parse cameras.txt -> {camera_id: {w,h,fx,fy,cx,cy}}."""
     cameras = {}
@@ -58,13 +113,24 @@ def parse_colmap_cameras(cameras_path: Path) -> dict:
             camera_id = int(els[0])
             model = els[1]
             w, h = int(els[2]), int(els[3])
-            if model == "PINHOLE":
-                fx, fy, cx, cy = map(float, els[4:8])
-            elif model == "SIMPLE_PINHOLE":
-                fx = fy = float(els[4])
-                cx, cy = float(els[5]), float(els[6])
-            else:
-                raise ValueError(f"Unsupported camera model: {model}")
+            fx, fy, cx, cy = _camera_params_from_model(model, els[4:])
+            cameras[camera_id] = dict(w=w, h=h, fx=fx, fy=fy, cx=cx, cy=cy)
+    if not cameras:
+        raise ValueError(f"No cameras found in {cameras_path}")
+    return cameras
+
+
+def parse_colmap_cameras_binary(cameras_path: Path) -> dict:
+    """Parse cameras.bin -> {camera_id: {w,h,fx,fy,cx,cy}}."""
+    cameras = {}
+    with open(cameras_path, "rb") as fid:
+        num_cameras = _read_next_bytes(fid, 8, "Q")[0]
+        for _ in range(num_cameras):
+            camera_id, model_id, w, h = _read_next_bytes(fid, 24, "iiQQ")
+            model_name = CAMERA_MODEL_IDS[model_id].model_name
+            num_params = CAMERA_MODEL_IDS[model_id].num_params
+            params = _read_next_bytes(fid, 8 * num_params, "d" * num_params)
+            fx, fy, cx, cy = _camera_params_from_model(model_name, params)
             cameras[camera_id] = dict(w=w, h=h, fx=fx, fy=fy, cx=cx, cy=cy)
     if not cameras:
         raise ValueError(f"No cameras found in {cameras_path}")
@@ -91,14 +157,45 @@ def parse_colmap_images(images_path: Path) -> list:
             camera_id = int(elems[8])
             name = elems[9] if len(elems) == 10 else "_".join(elems[9:])
             f.readline()  # skip POINTS2D line
-
-            w2c = np.eye(4, dtype=np.float64)
-            w2c[:3, :3] = qvec2rotmat(qvec)
-            w2c[:3, 3] = tvec
-            frames.append(dict(name=name, camera_id=camera_id, w2c=w2c))
+            frames.append(_image_to_frame(name, camera_id, qvec, tvec))
     if not frames:
         raise ValueError(f"No images found in {images_path}")
     return frames
+
+
+def parse_colmap_images_binary(images_path: Path) -> list:
+    """Parse images.bin -> list of {name, camera_id, w2c}."""
+    frames = []
+    with open(images_path, "rb") as fid:
+        num_reg_images = _read_next_bytes(fid, 8, "Q")[0]
+        for _ in range(num_reg_images):
+            props = _read_next_bytes(fid, 64, "idddddddi")
+            qvec = np.array(props[1:5])
+            tvec = np.array(props[5:8])
+            camera_id = props[8]
+            name = ""
+            current_char = _read_next_bytes(fid, 1, "c")[0]
+            while current_char != b"\x00":
+                name += current_char.decode("utf-8")
+                current_char = _read_next_bytes(fid, 1, "c")[0]
+            num_points2d = _read_next_bytes(fid, 8, "Q")[0]
+            fid.read(24 * num_points2d)  # skip POINTS2D
+            frames.append(_image_to_frame(name, camera_id, qvec, tvec))
+    if not frames:
+        raise ValueError(f"No images found in {images_path}")
+    return frames
+
+
+def load_colmap_model(colmap_dir: Path) -> tuple:
+    """Load cameras and frames from COLMAP dir (auto-detect .bin / .txt)."""
+    cameras_path, images_path, fmt = resolve_colmap_model(colmap_dir)
+    if fmt == "bin":
+        cameras = parse_colmap_cameras_binary(cameras_path)
+        frames = parse_colmap_images_binary(images_path)
+    else:
+        cameras = parse_colmap_cameras(cameras_path)
+        frames = parse_colmap_images(images_path)
+    return cameras, frames, fmt
 
 
 # --------------------------------------------------------------------------- #
@@ -144,8 +241,8 @@ class TSDFVolume:
 # --------------------------------------------------------------------------- #
 
 def main():
-    parser = argparse.ArgumentParser(description="TSDF fusion from COLMAP text model")
-    parser.add_argument("--colmap", required=True, help="COLMAP directory (cameras.txt + images.txt)")
+    parser = argparse.ArgumentParser(description="TSDF fusion from COLMAP model (.txt or .bin)")
+    parser.add_argument("--colmap", required=True, help="COLMAP directory (cameras/images in .txt or .bin)")
     parser.add_argument("--depth", required=True, help="Path to depth directory")
     parser.add_argument("--image", required=True, help="Path to image directory")
     parser.add_argument("--output",    default="mesh.ply",   help="Output mesh path")
@@ -163,8 +260,8 @@ def main():
     args = parser.parse_args()
 
     colmap_dir = Path(args.colmap)
-    cameras = parse_colmap_cameras(colmap_dir / "cameras.txt")
-    frames = parse_colmap_images(colmap_dir / "images.txt")
+    cameras, frames, colmap_fmt = load_colmap_model(colmap_dir)
+    print(f"Loaded COLMAP model ({colmap_fmt}): {len(cameras)} cameras, {len(frames)} frames")
     if args.max_frames > 0:
         frames = frames[: args.max_frames]
 
