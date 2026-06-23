@@ -19,6 +19,9 @@ the selection is no longer a fixed `--top_k`. Instead:
     that are the outlier on a *meaningful* fraction of points (avoids over-
     flagging borderline frames -> avoids over-skipping / holes).
   * Safety cap: never remove more than `--max_frac` of all frames.
+  * Per-round cap: `--per_round_cap` limits flags per round, spreading removal
+    over more rounds (fewer in round 1) so the consensus re-cleans between
+    removals (can reduce false positives).
 
 Limitations (unchanged): anchor-based, so it sees layering on textured regions
 only. The mesh skip-and-check / leave-one-out render remains the ground truth and
@@ -26,13 +29,14 @@ the way to catch non-anchor cases and decide whole-frame-skip vs per-pixel mask.
 
 Run on the CORRECTED depth (e.g. pred_depth_scaled).
 
+The detection core (`build_detector_cache`, `build_point_obs`, `iterative_detect`)
+is importable so `correct_and_flag_depth.py` can reuse it on in-memory depth.
+
 Outputs (under --output):
   per_frame_outliers.csv   stem, image_id, flagged_round, observed,
                            outlier_count, outlier_fraction
   layering_frames.txt      all flagged stems (feed tsdf --exclude_frames)
   summary.json             per-round diagnostics + stop reason
-
-Reuses the COLMAP / depth IO from diagnose_depth_pose_consistency.py.
 """
 
 import argparse
@@ -55,12 +59,64 @@ from diagnose_depth_pose_consistency import (  # noqa: E402
 )
 
 
-def _score_round(point_obs, active_flag, min_obs, outlier_rel, sep_ratio):
-    """One scoring pass over all points using only currently-active frames.
+# --------------------------------------------------------------------------- #
+# Detection core (importable)
+# --------------------------------------------------------------------------- #
 
-    Returns (observed, outlier, n_points_used) where observed/outlier are
-    dict[image_id] -> count.
+def build_detector_cache(cameras, images, depth_for_stem):
+    """Per-image cache for the detector.
+
+    depth_for_stem(stem) -> np.ndarray | None. Lets the caller supply depth from
+    disk (find_layering) or from memory (correct_and_flag).
     """
+    cache = {}
+    for img_id, im in images.items():
+        cam = cameras[im["camera_id"]]
+        stem = Path(im["name"]).stem
+        depth = depth_for_stem(stem)
+        if depth is None:
+            continue
+        Hd, Wd = depth.shape[:2]
+        cache[img_id] = dict(
+            stem=stem, Kinv=np.linalg.inv(intrinsics_matrix(cam)),
+            R=qvec2rotmat(im["qvec"]), t=im["tvec"],
+            depth=depth, Hd=Hd, Wd=Wd,
+            sx=Wd / cam["width"], sy=Hd / cam["height"],
+        )
+    return cache
+
+
+def build_point_obs(cache, images, points, min_obs, depth_min, depth_max):
+    """Precompute per-point world unprojections once; rounds just re-filter."""
+    point_obs = []
+    for p in points.values():
+        ids, world, depths = [], [], []
+        for img_id, p2d in zip(p["track_image_ids"].tolist(),
+                               p["track_p2d_idx"].tolist(), strict=False):
+            c = cache.get(int(img_id))
+            if c is None:
+                continue
+            xy = images[int(img_id)]["xys"][int(p2d)]
+            u = int(round(float(xy[0]) * c["sx"]))
+            v = int(round(float(xy[1]) * c["sy"]))
+            if not (0 <= u < c["Wd"] and 0 <= v < c["Hd"]):
+                continue
+            d = float(c["depth"][v, u])
+            if not (depth_min < d < depth_max):
+                continue
+            ray = c["Kinv"] @ np.array([float(xy[0]), float(xy[1]), 1.0])
+            ids.append(int(img_id))
+            world.append(c["R"].T @ (d * ray - c["t"]))
+            depths.append(d)
+        if len(ids) >= min_obs:
+            point_obs.append((np.asarray(ids, dtype=np.int64),
+                              np.asarray(world, dtype=np.float64),
+                              np.asarray(depths, dtype=np.float64)))
+    return point_obs
+
+
+def _score_round(point_obs, active_flag, min_obs, outlier_rel, sep_ratio):
+    """One scoring pass over all points using only currently-active frames."""
     observed = defaultdict(int)
     outlier = defaultdict(int)
     n_points_used = 0
@@ -88,111 +144,30 @@ def _score_round(point_obs, active_flag, min_obs, outlier_rel, sep_ratio):
     return observed, outlier, n_points_used
 
 
-def main():
-    ap = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
-    )
-    ap.add_argument("--refined", required=True, help="Post-BA COLMAP model dir")
-    ap.add_argument("--depth", required=True,
-                    help="Corrected depth dir to test (e.g. pred_depth_scaled)")
-    ap.add_argument("--output", default="layering_frames_v2", help="Output dir")
-    ap.add_argument("--depth_min", type=float, default=0.05)
-    ap.add_argument("--depth_max", type=float, default=50.0)
-    # per-point outlier sensitivity
-    ap.add_argument("--min_obs", type=int, default=3,
-                    help="Min observing (active) frames to attribute an outlier")
-    ap.add_argument("--outlier_rel", type=float, default=0.03,
-                    help="Outlier if its world offset / depth exceeds this")
-    ap.add_argument("--sep_ratio", type=float, default=2.0,
-                    help="Outlier must be this much farther than the 2nd-worst frame")
-    ap.add_argument("--min_observed", type=int, default=50,
-                    help="Min consensus-points for a frame to be scored/ranked")
-    # adaptive per-frame flagging
-    ap.add_argument("--k_sigma", type=float, default=3.0,
-                    help="Flag if outlier_fraction > median + k_sigma*robust_sigma")
-    ap.add_argument("--abs_floor", type=float, default=0.05,
-                    help="AND outlier_fraction must exceed this absolute floor")
-    ap.add_argument("--max_frac", type=float, default=0.15,
-                    help="Safety cap: never flag more than this fraction of frames")
-    ap.add_argument("--per_round_cap", type=int, default=0,
-                    help="Max frames to flag per round (0 = unlimited). Small "
-                         "values spread removal over more rounds (fewer in round "
-                         "1) and let the consensus re-clean between removals, "
-                         "which can also reduce false positives.")
-    ap.add_argument("--max_rounds", type=int, default=20)
-    args = ap.parse_args()
+def iterative_detect(point_obs, cache, n_frames, *, min_obs, outlier_rel,
+                     sep_ratio, min_observed, k_sigma, abs_floor, max_frac,
+                     per_round_cap, max_rounds, log_prefix="[LAYERv2]"):
+    """Iterative adaptive-threshold outlier-frame flagging.
 
-    out = Path(args.output)
-    out.mkdir(parents=True, exist_ok=True)
-
-    cameras, images, points = read_colmap_model(args.refined)
-    if not points:
-        raise RuntimeError("Refined model has no points3D.")
-
-    # Per-image cache.
-    cache = {}
-    for img_id, im in images.items():
-        cam = cameras[im["camera_id"]]
-        stem = Path(im["name"]).stem
-        depth = load_ff_depth(args.depth, stem)
-        if depth is None:
-            continue
-        Hd, Wd = depth.shape[:2]
-        cache[img_id] = dict(
-            stem=stem, Kinv=np.linalg.inv(intrinsics_matrix(cam)),
-            R=qvec2rotmat(im["qvec"]), t=im["tvec"],
-            depth=depth, Hd=Hd, Wd=Wd,
-            sx=Wd / cam["width"], sy=Hd / cam["height"],
-        )
-    n_frames = len(cache)
-    print(f"[LAYERv2] images with depth={n_frames}, points3D={len(points)}")
-
-    # Precompute per-point world unprojections ONCE; rounds just re-filter.
-    point_obs = []
-    for p in points.values():
-        ids, world, depths = [], [], []
-        for img_id, p2d in zip(p["track_image_ids"].tolist(),
-                               p["track_p2d_idx"].tolist(), strict=False):
-            c = cache.get(int(img_id))
-            if c is None:
-                continue
-            xy = images[int(img_id)]["xys"][int(p2d)]
-            u = int(round(float(xy[0]) * c["sx"]))
-            v = int(round(float(xy[1]) * c["sy"]))
-            if not (0 <= u < c["Wd"] and 0 <= v < c["Hd"]):
-                continue
-            d = float(c["depth"][v, u])
-            if not (args.depth_min < d < args.depth_max):
-                continue
-            ray = c["Kinv"] @ np.array([float(xy[0]), float(xy[1]), 1.0])
-            ids.append(int(img_id))
-            world.append(c["R"].T @ (d * ray - c["t"]))
-            depths.append(d)
-        if len(ids) >= args.min_obs:
-            point_obs.append((np.asarray(ids, dtype=np.int64),
-                              np.asarray(world, dtype=np.float64),
-                              np.asarray(depths, dtype=np.float64)))
-    print(f"[LAYERv2] points with >= {args.min_obs} obs = {len(point_obs)}")
-
+    Returns (flagged:set, record:dict, rounds_info:list, stop_reason:str, cap:int).
+    """
     max_id = max(cache) if cache else 0
-    flagged = set()                 # image_ids
-    record = {}                     # image_id -> dict(stem, flagged_round, observed, outlier_count, frac)
-    for iid, c in cache.items():
-        record[iid] = dict(stem=c["stem"], flagged_round="", observed=0,
-                           outlier_count=0, outlier_fraction=0.0)
-
+    flagged = set()
+    record = {iid: dict(stem=c["stem"], flagged_round="", observed=0,
+                        outlier_count=0, outlier_fraction=0.0)
+              for iid, c in cache.items()}
     rounds_info = []
     stop_reason = "max_rounds"
-    cap = int(args.max_frac * n_frames)
+    cap = int(max_frac * n_frames)
 
-    for r in range(1, args.max_rounds + 1):
+    for r in range(1, max_rounds + 1):
         active_flag = np.zeros(max_id + 1, dtype=bool)
         for iid in cache:
             if iid not in flagged:
                 active_flag[iid] = True
 
         observed, outlier, n_pts = _score_round(
-            point_obs, active_flag, args.min_obs, args.outlier_rel, args.sep_ratio
+            point_obs, active_flag, min_obs, outlier_rel, sep_ratio
         )
 
         fracs = {}
@@ -204,7 +179,7 @@ def main():
             frac = (oc / obs) if obs > 0 else 0.0
             record[iid].update(observed=obs, outlier_count=oc,
                                outlier_fraction=round(frac, 5))
-            if obs >= args.min_observed:
+            if obs >= min_observed:
                 fracs[iid] = frac
 
         if not fracs:
@@ -219,13 +194,13 @@ def main():
         mad = float(np.median(np.abs(vals - med)))
         robust_sigma = 1.4826 * mad
         # Too few frames -> distribution stats unreliable; rely on abs_floor.
-        thr = (args.abs_floor if vals.size < 8
-               else max(med + args.k_sigma * robust_sigma, args.abs_floor))
+        thr = (abs_floor if vals.size < 8
+               else max(med + k_sigma * robust_sigma, abs_floor))
 
         newly = sorted((iid for iid, f in fracs.items() if f > thr),
                        key=lambda i: fracs[i], reverse=True)
-        if args.per_round_cap > 0:
-            newly = newly[: args.per_round_cap]
+        if per_round_cap > 0:
+            newly = newly[:per_round_cap]
 
         rounds_info.append(dict(
             round=r, points_used=n_pts, scored_frames=int(vals.size),
@@ -235,7 +210,7 @@ def main():
                         outlier_count=record[i]["outlier_count"],
                         observed=record[i]["observed"]) for i in newly],
         ))
-        print(f"[LAYERv2] round {r}: points={n_pts}, scored={vals.size}, "
+        print(f"{log_prefix} round {r}: points={n_pts}, scored={vals.size}, "
               f"median={med:.4f}, sigma={robust_sigma:.4f}, thr={thr:.4f}, "
               f"newly={len(newly)}")
 
@@ -257,8 +232,14 @@ def main():
             record[iid]["flagged_round"] = r
             flagged.add(iid)
 
-    # ---- outputs ---- #
-    rows = sorted(record.values(), key=lambda x: x["stem"])
+    return flagged, record, rounds_info, stop_reason, cap
+
+
+def write_detection_outputs(out, cache, flagged, record, rounds_info,
+                            stop_reason, cap, params):
+    """Write per_frame_outliers.csv, layering_frames.txt, summary.json."""
+    out = Path(out)
+    out.mkdir(parents=True, exist_ok=True)
     with open(out / "per_frame_outliers.csv", "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=["stem", "image_id", "flagged_round",
                                           "observed", "outlier_count",
@@ -278,13 +259,8 @@ def main():
         f.write("\n".join(flagged_stems) + ("\n" if flagged_stems else ""))
 
     summary = dict(
-        inputs={"refined": args.refined, "depth": args.depth},
-        params={k: getattr(args, k) for k in
-                ["min_obs", "outlier_rel", "sep_ratio", "min_observed",
-                 "k_sigma", "abs_floor", "max_frac", "max_rounds"]},
-        n_frames=n_frames, points_used=len(point_obs),
-        num_flagged=len(flagged), max_allowed=cap,
-        stop_reason=stop_reason,
+        params=params, n_frames=len(cache),
+        num_flagged=len(flagged), max_allowed=cap, stop_reason=stop_reason,
         flagged_frames=[dict(stem=cache[i]["stem"],
                              flagged_round=record[i]["flagged_round"],
                              outlier_fraction=record[i]["outlier_fraction"],
@@ -293,6 +269,79 @@ def main():
                         for i in flagged_sorted],
         rounds=rounds_info,
     )
+    return summary, flagged_sorted, flagged_stems
+
+
+# --------------------------------------------------------------------------- #
+# CLI
+# --------------------------------------------------------------------------- #
+
+def add_detector_args(ap):
+    ap.add_argument("--depth_min", type=float, default=0.05)
+    ap.add_argument("--depth_max", type=float, default=50.0)
+    ap.add_argument("--min_obs", type=int, default=3,
+                    help="Min observing (active) frames to attribute an outlier")
+    ap.add_argument("--outlier_rel", type=float, default=0.03,
+                    help="Outlier if its world offset / depth exceeds this")
+    ap.add_argument("--sep_ratio", type=float, default=2.0,
+                    help="Outlier must be this much farther than the 2nd-worst frame")
+    ap.add_argument("--min_observed", type=int, default=50,
+                    help="Min consensus-points for a frame to be scored/ranked")
+    ap.add_argument("--k_sigma", type=float, default=3.0,
+                    help="Flag if outlier_fraction > median + k_sigma*robust_sigma")
+    ap.add_argument("--abs_floor", type=float, default=0.07,
+                    help="AND outlier_fraction must exceed this absolute floor")
+    ap.add_argument("--max_frac", type=float, default=0.15,
+                    help="Safety cap: never flag more than this fraction of frames")
+    ap.add_argument("--per_round_cap", type=int, default=10,
+                    help="Max frames to flag per round (0 = unlimited)")
+    ap.add_argument("--max_rounds", type=int, default=20)
+
+
+def detector_params(args):
+    return {k: getattr(args, k) for k in
+            ["min_obs", "outlier_rel", "sep_ratio", "min_observed", "k_sigma",
+             "abs_floor", "max_frac", "per_round_cap", "max_rounds"]}
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    ap.add_argument("--refined", required=True, help="Post-BA COLMAP model dir")
+    ap.add_argument("--depth", required=True,
+                    help="Corrected depth dir to test (e.g. pred_depth_scaled)")
+    ap.add_argument("--output", default="layering_frames_v2", help="Output dir")
+    add_detector_args(ap)
+    args = ap.parse_args()
+
+    out = Path(args.output)
+    out.mkdir(parents=True, exist_ok=True)
+
+    cameras, images, points = read_colmap_model(args.refined)
+    if not points:
+        raise RuntimeError("Refined model has no points3D.")
+
+    cache = build_detector_cache(
+        cameras, images, lambda stem: load_ff_depth(args.depth, stem)
+    )
+    n_frames = len(cache)
+    print(f"[LAYERv2] images with depth={n_frames}, points3D={len(points)}")
+
+    point_obs = build_point_obs(cache, images, points, args.min_obs,
+                                args.depth_min, args.depth_max)
+    print(f"[LAYERv2] points with >= {args.min_obs} obs = {len(point_obs)}")
+
+    flagged, record, rounds_info, stop_reason, cap = iterative_detect(
+        point_obs, cache, n_frames, **detector_params(args)
+    )
+
+    summary, flagged_sorted, flagged_stems = write_detection_outputs(
+        out, cache, flagged, record, rounds_info, stop_reason, cap,
+        detector_params(args),
+    )
+    summary["inputs"] = {"refined": args.refined, "depth": args.depth}
+    summary["points_used"] = len(point_obs)
     with open(out / "summary.json", "w") as f:
         json.dump(summary, f, indent=2, default=str)
 
