@@ -257,6 +257,10 @@ def main():
     parser.add_argument("--depth_min",  type=float, default=0.1,   help="Min depth in meters")
     parser.add_argument("--depth_max",  type=float, default=5.0,   help="Max depth in meters")
     parser.add_argument("--max_frames", type=int,   default=0,     help="Process only first N frames (0=all)")
+    parser.add_argument("--exclude_frames", default="",
+                        help="Frames to skip during integration: a path to a text file "
+                             "(one stem per line) or a comma-separated list of stems. "
+                             "Used to validate layering-frame candidates.")
     args = parser.parse_args()
 
     colmap_dir = Path(args.colmap)
@@ -264,6 +268,15 @@ def main():
     print(f"Loaded COLMAP model ({colmap_fmt}): {len(cameras)} cameras, {len(frames)} frames")
     if args.max_frames > 0:
         frames = frames[: args.max_frames]
+
+    exclude = set()
+    if args.exclude_frames:
+        p = Path(args.exclude_frames)
+        raw = p.read_text().split() if p.exists() else args.exclude_frames.split(",")
+        # Accept stems with or without extension.
+        exclude = {Path(s.strip()).stem for s in raw if s.strip()}
+        print(f"Excluding {len(exclude)} frames from integration: "
+              f"{sorted(exclude)[:10]}{' ...' if len(exclude) > 10 else ''}")
 
     tsdf = TSDFVolume(args.voxel_size, sdf_trunc=args.voxel_size * 3)
 
@@ -278,6 +291,9 @@ def main():
         color_name = Path(frame["name"]).name
         color_path = Path(args.image) / color_name
         stem = Path(color_name).stem
+        if stem in exclude:
+            skipped += 1
+            continue
         depth_path = Path(args.depth) / f"{stem}.png"
         if not depth_path.exists():
             depth_path = Path(args.depth) / color_name
