@@ -13,8 +13,8 @@ dependencies = [
     # Versions pinned to the known-good gluemap micromamba env.
     "numpy==2.4.3",
     "scipy==1.17.1",
-    "torch==2.4.1",
-    "torchvision==0.19.1",
+    #"torch==2.4.1",
+    #"torchvision==0.19.1",
     "pycolmap-cuda12==4.0.4",
     "pyceres==2.6",
     "h5py==3.16.0",

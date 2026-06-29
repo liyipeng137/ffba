@@ -1,0 +1,33 @@
+
+name: gluemap-merg3r
+channels:
+  - defaults
+  - conda-forge
+dependencies:
+  - python=3.11
+  - eigen=3.4.0
+  - libstdcxx-ng=15.2.0
+  - boost=1.85.0
+  - torchaudio=2.8.0
+  - pytorch-gpu=2.8.0
+  - metis=5.1.0
+  - compilers
+  - ceres-solver=2.2.0
+  - cuda-version=12.8
+  - transformers=5.0.0
+  - pybind11
+  - libcusparse-dev
+  - libcublas-dev
+  - libcusolver-dev
+pip:
+  - trimesh
+  - numba
+  - xformers==v0.0.32.post1
+  - git+https://github.com/pypose/pypose.git
+
+prefix: /root/miniconda3/envs/gluemap-merg3r
+
+
+# CMAKE_PREFIX_PATH=$CONDA_PREFIX   python -m pip install -e .
+# USE_CUDSS=0 python -m pip install --no-build-isolation -v -e .
+# export PYTORCH_CUDA_ALLOC_CONF='max_split_size_mb:1024'

@@ -3,17 +3,18 @@ import sys
 
 HERE_PATH = path.normpath(path.dirname(__file__))
 
+# we don't use these submodules
 SUBMODULES = {
-    "pi3": path.join("pi3", "pi3", "models"),
-    "doppelgangers-plusplus": path.join("doppelgangers-plusplus", "mast3r"),
-    path.join("doppelgangers-plusplus", "dust3r"): path.join(
-        "doppelgangers-plusplus", "dust3r", "dust3r"
-    ),
-    path.join("doppelgangers-plusplus", "dust3r", "croco"): path.join(
-        "doppelgangers-plusplus", "dust3r", "croco", "models"
-    ),
-    "vggt": path.join("vggt", "vggt", "models"),
-    "mapanything": path.join("mapanything", "mapanything", "models"),
+    # "pi3": path.join("pi3", "pi3", "models"),
+    # "doppelgangers-plusplus": path.join("doppelgangers-plusplus", "mast3r"),
+    # path.join("doppelgangers-plusplus", "dust3r"): path.join(
+    #     "doppelgangers-plusplus", "dust3r", "dust3r"
+    # ),
+    # path.join("doppelgangers-plusplus", "dust3r", "croco"): path.join(
+    #     "doppelgangers-plusplus", "dust3r", "croco", "models"
+    # ),
+    # "vggt": path.join("vggt", "vggt", "models"),
+    # "mapanything": path.join("mapanything", "mapanything", "models"),
 }
 
 # vggsfm lives directly under thirdparty/ (not a git submodule) and uses

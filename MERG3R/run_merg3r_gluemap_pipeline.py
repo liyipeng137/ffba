@@ -157,7 +157,7 @@ def parse_args():
     parser.add_argument(
         "--ba_backend",
         type=str,
-        default="ceres",
+        default="bae",
         choices=["ceres", "bae"],
         help=(
             "Bundle adjustment backend for GlueMap augmented BA. 'ceres' keeps "
@@ -174,6 +174,7 @@ def parse_args():
     )
     parser.add_argument(
         "--bae_optimize_intrinsics",
+        default=True,
         action="store_true",
         help=(
             "Let the BAE backend optimize SIMPLE_PINHOLE f while fixing cx/cy. "
@@ -194,7 +195,7 @@ def parse_args():
     parser.add_argument(
         "--bae_robust_loss",
         type=str,
-        default="none",
+        default="huber",
         choices=["none", "huber"],
         help=(
             "Robust loss for the BAE backend's real-track residuals. 'huber' "
@@ -208,7 +209,7 @@ def parse_args():
         default=1.0,
         help="Huber delta in pixels when --bae_robust_loss=huber.",
     )
-    parser.add_argument("--num_refinement_iterations", type=int, default=2)
+    parser.add_argument("--num_refinement_iterations", type=int, default=3)
     parser.add_argument("--augmented_ba_max_filter_iterations", type=int, default=3)
     parser.add_argument(
         "--augmented_ba_normalized_reproj_threshold",
