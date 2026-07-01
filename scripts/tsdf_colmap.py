@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 """
 TSDF Fusion from COLMAP model (text or binary)
@@ -22,7 +21,9 @@ from pathlib import Path
 from PIL import Image
 from tqdm import tqdm
 
-CameraModel = collections.namedtuple("CameraModel", ["model_id", "model_name", "num_params"])
+CameraModel = collections.namedtuple(
+    "CameraModel", ["model_id", "model_name", "num_params"]
+)
 CAMERA_MODELS = {
     CameraModel(model_id=0, model_name="SIMPLE_PINHOLE", num_params=3),
     CameraModel(model_id=1, model_name="PINHOLE", num_params=4),
@@ -42,6 +43,7 @@ CAMERA_MODEL_IDS = {m.model_id: m for m in CAMERA_MODELS}
 # --------------------------------------------------------------------------- #
 # COLMAP I/O
 # --------------------------------------------------------------------------- #
+
 
 def _read_next_bytes(fid, num_bytes, format_char_sequence, endian_character="<"):
     data = fid.read(num_bytes)
@@ -75,26 +77,30 @@ def resolve_colmap_model(colmap_dir: Path) -> tuple:
 
 def qvec2rotmat(qvec: np.ndarray) -> np.ndarray:
     """COLMAP quaternion [qw, qx, qy, qz] -> 3x3 rotation matrix."""
-    return np.array([
+    return np.array(
         [
-            1 - 2 * qvec[2] ** 2 - 2 * qvec[3] ** 2,
-            2 * qvec[1] * qvec[2] - 2 * qvec[0] * qvec[3],
-            2 * qvec[3] * qvec[1] + 2 * qvec[0] * qvec[2],
-        ],
-        [
-            2 * qvec[1] * qvec[2] + 2 * qvec[0] * qvec[3],
-            1 - 2 * qvec[1] ** 2 - 2 * qvec[3] ** 2,
-            2 * qvec[2] * qvec[3] - 2 * qvec[0] * qvec[1],
-        ],
-        [
-            2 * qvec[3] * qvec[1] - 2 * qvec[0] * qvec[2],
-            2 * qvec[2] * qvec[3] + 2 * qvec[0] * qvec[1],
-            1 - 2 * qvec[1] ** 2 - 2 * qvec[2] ** 2,
-        ],
-    ])
+            [
+                1 - 2 * qvec[2] ** 2 - 2 * qvec[3] ** 2,
+                2 * qvec[1] * qvec[2] - 2 * qvec[0] * qvec[3],
+                2 * qvec[3] * qvec[1] + 2 * qvec[0] * qvec[2],
+            ],
+            [
+                2 * qvec[1] * qvec[2] + 2 * qvec[0] * qvec[3],
+                1 - 2 * qvec[1] ** 2 - 2 * qvec[3] ** 2,
+                2 * qvec[2] * qvec[3] - 2 * qvec[0] * qvec[1],
+            ],
+            [
+                2 * qvec[3] * qvec[1] - 2 * qvec[0] * qvec[2],
+                2 * qvec[2] * qvec[3] + 2 * qvec[0] * qvec[1],
+                1 - 2 * qvec[1] ** 2 - 2 * qvec[2] ** 2,
+            ],
+        ]
+    )
 
 
-def _image_to_frame(name: str, camera_id: int, qvec: np.ndarray, tvec: np.ndarray) -> dict:
+def _image_to_frame(
+    name: str, camera_id: int, qvec: np.ndarray, tvec: np.ndarray
+) -> dict:
     w2c = np.eye(4, dtype=np.float64)
     w2c[:3, :3] = qvec2rotmat(qvec)
     w2c[:3, 3] = tvec
@@ -202,6 +208,7 @@ def load_colmap_model(colmap_dir: Path) -> tuple:
 # TSDF wrapper
 # --------------------------------------------------------------------------- #
 
+
 class TSDFVolume:
     def __init__(self, voxel_size: float, sdf_trunc: float):
         self.volume = o3d.pipelines.integration.ScalableTSDFVolume(
@@ -212,8 +219,8 @@ class TSDFVolume:
 
     def integrate(
         self,
-        color: np.ndarray,      # H×W×3 uint8
-        depth: np.ndarray,      # H×W float32, meters (0 = invalid)
+        color: np.ndarray,  # H×W×3 uint8
+        depth: np.ndarray,  # H×W float32, meters (0 = invalid)
         intrinsic: o3d.camera.PinholeCameraIntrinsic,
         extrinsic: np.ndarray,  # 4×4 OpenCV w2c
         depth_trunc: float = 10.0,
@@ -221,8 +228,10 @@ class TSDFVolume:
         color_o3d = o3d.geometry.Image(np.ascontiguousarray(color.astype(np.uint8)))
         depth_o3d = o3d.geometry.Image(np.ascontiguousarray(depth.astype(np.float32)))
         rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
-            color_o3d, depth_o3d,
-            depth_scale=1.0, depth_trunc=depth_trunc,
+            color_o3d,
+            depth_o3d,
+            depth_scale=1.0,
+            depth_trunc=depth_trunc,
             convert_rgb_to_intensity=False,
         )
         self.volume.integrate(rgbd, intrinsic, extrinsic)
@@ -240,32 +249,65 @@ class TSDFVolume:
 # Main
 # --------------------------------------------------------------------------- #
 
+
 def main():
-    parser = argparse.ArgumentParser(description="TSDF fusion from COLMAP model (.txt or .bin)")
-    parser.add_argument("--colmap", required=True, help="COLMAP directory (cameras/images in .txt or .bin)")
+    parser = argparse.ArgumentParser(
+        description="TSDF fusion from COLMAP model (.txt or .bin)"
+    )
+    parser.add_argument(
+        "--colmap",
+        required=True,
+        help="COLMAP directory (cameras/images in .txt or .bin)",
+    )
     parser.add_argument("--depth", required=True, help="Path to depth directory")
     parser.add_argument("--image", required=True, help="Path to image directory")
-    parser.add_argument("--output",    default="mesh.ply",   help="Output mesh path")
-    parser.add_argument("--pcd_output", default="",          help="Output full point cloud (optional)")
-    parser.add_argument("--sampled_pcd_output", default="",
-                        help="Output sampled point cloud (default: <output_stem>_points.ply)")
-    parser.add_argument("--num_points", type=int, default=200_000,
-                        help="Total points to sample across frames (0=disable)")
-    parser.add_argument("--voxel_size", type=float, default=0.01,  help="Voxel size in meters")
-    parser.add_argument("--depth_scale", type=float, default=1000.0,
-                        help="Divide depth pixel value by this to get meters (default 1000)")
-    parser.add_argument("--depth_min",  type=float, default=0.1,   help="Min depth in meters")
-    parser.add_argument("--depth_max",  type=float, default=5.0,   help="Max depth in meters")
-    parser.add_argument("--max_frames", type=int,   default=0,     help="Process only first N frames (0=all)")
-    parser.add_argument("--exclude_frames", default="",
-                        help="Frames to skip during integration: a path to a text file "
-                             "(one stem per line) or a comma-separated list of stems. "
-                             "Used to validate layering-frame candidates.")
+    parser.add_argument("--output", default="mesh.ply", help="Output mesh path")
+    parser.add_argument(
+        "--pcd_output", default="", help="Output full point cloud (optional)"
+    )
+    parser.add_argument(
+        "--sampled_pcd_output",
+        default="",
+        help="Output sampled point cloud (default: <output_stem>_points.ply)",
+    )
+    parser.add_argument(
+        "--num_points",
+        type=int,
+        default=200_000,
+        help="Total points to sample across frames (0=disable)",
+    )
+    parser.add_argument(
+        "--voxel_size", type=float, default=0.01, help="Voxel size in meters"
+    )
+    parser.add_argument(
+        "--depth_scale",
+        type=float,
+        default=1000.0,
+        help="Divide depth pixel value by this to get meters (default 1000)",
+    )
+    parser.add_argument(
+        "--depth_min", type=float, default=0.1, help="Min depth in meters"
+    )
+    parser.add_argument(
+        "--depth_max", type=float, default=5.0, help="Max depth in meters"
+    )
+    parser.add_argument(
+        "--max_frames", type=int, default=0, help="Process only first N frames (0=all)"
+    )
+    parser.add_argument(
+        "--exclude_frames",
+        default="",
+        help="Frames to skip during integration: a path to a text file "
+        "(one stem per line) or a comma-separated list of stems. "
+        "Used to validate layering-frame candidates.",
+    )
     args = parser.parse_args()
 
     colmap_dir = Path(args.colmap)
     cameras, frames, colmap_fmt = load_colmap_model(colmap_dir)
-    print(f"Loaded COLMAP model ({colmap_fmt}): {len(cameras)} cameras, {len(frames)} frames")
+    print(
+        f"Loaded COLMAP model ({colmap_fmt}): {len(cameras)} cameras, {len(frames)} frames"
+    )
     if args.max_frames > 0:
         frames = frames[: args.max_frames]
 
@@ -275,17 +317,16 @@ def main():
         raw = p.read_text().split() if p.exists() else args.exclude_frames.split(",")
         # Accept stems with or without extension.
         exclude = {Path(s.strip()).stem for s in raw if s.strip()}
-        print(f"Excluding {len(exclude)} frames from integration: "
-              f"{sorted(exclude)[:10]}{' ...' if len(exclude) > 10 else ''}")
+        print(
+            f"Excluding {len(exclude)} frames from integration: "
+            f"{sorted(exclude)[:10]}{' ...' if len(exclude) > 10 else ''}"
+        )
 
     tsdf = TSDFVolume(args.voxel_size, sdf_trunc=args.voxel_size * 3)
 
     integrated = 0
     skipped = 0
     sample_points = args.num_points > 0
-    samples_per_frame = max((args.num_points + len(frames) - 1) // len(frames), 1) if sample_points else 0
-    points_list = []
-    colors_list = []
 
     for frame in tqdm(frames, desc="Integrating"):
         color_name = Path(frame["name"]).name
@@ -331,16 +372,10 @@ def main():
             skipped += 1
             continue
 
-        tsdf.integrate(color, depth_filtered, intrinsic, extrinsic, depth_trunc=args.depth_max)
+        tsdf.integrate(
+            color, depth_filtered, intrinsic, extrinsic, depth_trunc=args.depth_max
+        )
         integrated += 1
-
-        if sample_points:
-            pcd = tsdf.extract_pcd()
-            if len(pcd.points) > 0:
-                pick_num = min(samples_per_frame, len(pcd.points))
-                idx = np.random.choice(len(pcd.points), size=pick_num, replace=False)
-                points_list.append(np.asarray(pcd.points)[idx])
-                colors_list.append(np.asarray(pcd.colors)[idx])
 
     print(f"Integrated {integrated} frames, skipped {skipped}")
 
@@ -352,19 +387,33 @@ def main():
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     o3d.io.write_triangle_mesh(str(output_path), mesh)
-    print(f"Mesh saved: {output_path}  ({len(mesh.vertices):,} verts, {len(mesh.triangles):,} faces)")
+    print(
+        f"Mesh saved: {output_path}  ({len(mesh.vertices):,} verts, {len(mesh.triangles):,} faces)"
+    )
 
-    if sample_points and points_list:
-        sampled_pcd = o3d.geometry.PointCloud()
-        sampled_pcd.points = o3d.utility.Vector3dVector(np.concatenate(points_list, axis=0))
-        sampled_pcd.colors = o3d.utility.Vector3dVector(np.concatenate(colors_list, axis=0))
-        sampled_path = Path(args.sampled_pcd_output) if args.sampled_pcd_output else output_path.with_name(f"{output_path.stem}_points.ply")
+    final_pcd = None
+    if sample_points:
+        final_pcd = tsdf.extract_pcd()
+        if len(final_pcd.points) > 0:
+            pick_num = min(args.num_points, len(final_pcd.points))
+            idx = np.random.choice(len(final_pcd.points), size=pick_num, replace=False)
+            sampled_pcd = final_pcd.select_by_index(idx.tolist())
+        else:
+            sampled_pcd = final_pcd
+        sampled_path = (
+            Path(args.sampled_pcd_output)
+            if args.sampled_pcd_output
+            else output_path.with_name(f"{output_path.stem}_points.ply")
+        )
         sampled_path.parent.mkdir(parents=True, exist_ok=True)
         o3d.io.write_point_cloud(str(sampled_path), sampled_pcd)
-        print(f"Sampled point cloud saved: {sampled_path}  ({len(sampled_pcd.points):,} pts)")
+        print(
+            f"Sampled final point cloud saved: {sampled_path}  "
+            f"({len(sampled_pcd.points):,}/{len(final_pcd.points):,} pts)"
+        )
 
     if args.pcd_output:
-        pcd = tsdf.extract_pcd()
+        pcd = final_pcd if final_pcd is not None else tsdf.extract_pcd()
         o3d.io.write_point_cloud(args.pcd_output, pcd)
         print(f"Point cloud saved: {args.pcd_output}  ({len(pcd.points):,} pts)")
 
