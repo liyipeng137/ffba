@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Reproject trusted TSDF geometry to flagged frames, then run LingBot-Depth.
+Reproject trusted TSDF geometry to selected frames, then run LingBot-Depth.
 
 Intended flow:
 
@@ -9,14 +9,15 @@ Intended flow:
        - layering_frames.txt
   2. Run tsdf_colmap.py on depth_scaled/ with --exclude_frames layering_frames.txt
      to get a trusted mesh and/or sampled point cloud.
-  3. This script projects that trusted geometry back to the flagged frames and
-     uses the projected depth as LingBot-Depth input.
+  3. This script projects that trusted geometry back to the selected frames and
+     uses the projected depth as LingBot-Depth input. If --frames is omitted,
+     all refined COLMAP images are selected.
 
 Inputs
 ------
 --mesh            TSDF mesh .ply from tsdf_colmap.py
 --pcd             sampled/full point cloud .ply from tsdf_colmap.py
---frames          layering_frames.txt, one bad-frame stem per line
+--frames          optional layering_frames.txt, one frame stem per line
 --image_dir       original RGB image directory
 --refined_colmap  post-BA COLMAP model directory
 --source          pcd | mesh
@@ -336,7 +337,12 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--mesh", default="", help="TSDF mesh .ply from tsdf_colmap.py")
     ap.add_argument("--pcd", default="", help="TSDF sampled/full point cloud .ply")
     ap.add_argument("--source", choices=["pcd", "mesh"], default="pcd")
-    ap.add_argument("--frames", required=True, help="layering_frames.txt")
+    ap.add_argument(
+        "--frames",
+        default="",
+        help="Optional frame-stem list, e.g. layering_frames.txt. "
+        "If omitted, all refined COLMAP images are processed.",
+    )
     ap.add_argument("--image_dir", required=True, help="Original RGB image directory")
     ap.add_argument("--refined_colmap", required=True, help="Post-BA COLMAP model dir")
     ap.add_argument("--output", required=True, help="Output directory")
@@ -389,26 +395,33 @@ def main() -> None:
 
     cameras, images, colmap_fmt = read_colmap_cameras_images(Path(args.refined_colmap))
     frames = [image_to_frame(iid, image) for iid, image in sorted(images.items())]
-    frame_by_stem = {Path(f["name"]).stem: f for f in frames}
-    requested_stems = read_frame_stems(Path(args.frames))
-    selected = []
     missing = []
-    for stem in requested_stems:
-        frame = frame_by_stem.get(stem)
-        if frame is None:
-            missing.append(stem)
-        else:
-            selected.append(frame)
+    if args.frames:
+        frame_by_stem = {Path(f["name"]).stem: f for f in frames}
+        requested_stems = read_frame_stems(Path(args.frames))
+        selected = []
+        for stem in requested_stems:
+            frame = frame_by_stem.get(stem)
+            if frame is None:
+                missing.append(stem)
+            else:
+                selected.append(frame)
+        frame_selection = "file"
+        requested_count = len(requested_stems)
+    else:
+        selected = frames
+        frame_selection = "all"
+        requested_count = len(frames)
 
     if not selected:
-        raise RuntimeError("No requested frames were found in refined COLMAP images.")
+        raise RuntimeError("No frames selected from refined COLMAP images.")
     if missing:
         print(
             f"[REPROJECT] Warning: {len(missing)} frame stems not found in COLMAP: {missing[:10]}"
         )
     print(
         f"[REPROJECT] COLMAP={colmap_fmt}, source={args.source}, "
-        f"bad_frames={len(selected)}/{len(requested_stems)}"
+        f"frame_selection={frame_selection}, frames={len(selected)}/{requested_count}"
     )
 
     if args.source == "pcd":
@@ -512,7 +525,8 @@ def main() -> None:
             "mesh": args.mesh or None,
             "pcd": args.pcd or None,
             "source": args.source,
-            "frames": args.frames,
+            "frames": args.frames or None,
+            "frame_selection": frame_selection,
             "image_dir": args.image_dir,
             "refined_colmap": args.refined_colmap,
         },
