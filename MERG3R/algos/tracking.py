@@ -7,11 +7,54 @@ from algos.feedforward_paths import ensure_feedforward_on_path
 
 ensure_feedforward_on_path()
 
-from vggt.dependency.vggsfm_utils import initialize_feature_extractors, extract_keypoints
 from algos.geometry import project_3d_points_to_image_numpy
 from algos.tracking_metrics import filter_tracks_by_reprojection, print_tracking_metrics
 from algos.utils import get_sim_matrix, rbd
-from lightglue import LightGlue, SuperPoint
+from lightglue import ALIKED, SIFT, LightGlue, SuperPoint
+
+
+def initialize_feature_extractors(max_query_num, det_thres=0.005, extractor_method="aliked", device="cuda"):
+    extractors = {}
+    methods = extractor_method.lower().split("+")
+
+    for method in methods:
+        method = method.strip()
+        if method == "aliked":
+            extractor = ALIKED(max_num_keypoints=max_query_num, detection_threshold=det_thres)
+            extractors["aliked"] = extractor.to(device).eval()
+        elif method == "sp":
+            extractor = SuperPoint(max_num_keypoints=max_query_num, detection_threshold=det_thres)
+            extractors["sp"] = extractor.to(device).eval()
+        elif method == "sift":
+            extractor = SIFT(max_num_keypoints=max_query_num)
+            extractors["sift"] = extractor.to(device).eval()
+        else:
+            print(f"Warning: Unknown feature extractor '{method}', ignoring.")
+
+    if not extractors:
+        print(f"Warning: No valid extractors found in '{extractor_method}'. Using ALIKED by default.")
+        extractor = ALIKED(max_num_keypoints=max_query_num, detection_threshold=det_thres)
+        extractors["aliked"] = extractor.to(device).eval()
+
+    return extractors
+
+
+def extract_keypoints(query_image, extractors, round_keypoints=True):
+    query_points = None
+
+    with torch.no_grad():
+        for extractor in extractors.values():
+            query_points_data = extractor.extract(query_image, invalid_mask=None)
+            extractor_points = query_points_data["keypoints"]
+            if round_keypoints:
+                extractor_points = extractor_points.round()
+
+            if query_points is not None:
+                query_points = torch.cat([query_points, extractor_points], dim=1)
+            else:
+                query_points = extractor_points
+
+    return query_points
 
 
 def select_query_points_all_images(images, extractor_method="aliked+sp", max_query_points=1024, det_threshold=0.005):

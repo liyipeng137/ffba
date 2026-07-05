@@ -21,13 +21,8 @@ from algos.feedforward_paths import ensure_feedforward_on_path
 
 ensure_feedforward_on_path()
 
-from vggt.models.vggt import VGGT
-from vggt.utils.load_fn import load_and_preprocess_images
-from vggt.utils.pose_enc import pose_encoding_to_extri_intri
-from vggt.utils.geometry import unproject_depth_map_to_point_map
 from vggt_omega.models import VGGTOmega
 from vggt_omega.utils.pose_enc import encoding_to_camera as vggt_omega_encoding_to_camera
-from pi3.models.pi3 import Pi3
 from pi3x_model.models.pi3x import Pi3X
 from pi3x_model.utils.transforms_utils import recover_intrinsics_from_output
 
@@ -45,7 +40,7 @@ def extrinsic_to_colmap_format(extrinsics):
     translations = []
 
     for i in range(num_cameras):
-        # VGGT's extrinsic is camera-to-world (R|t) format
+        # Extrinsic is camera-to-world (R|t) format.
         R = extrinsics[i, :3, :3]
         t = extrinsics[i, :3, 3]
 
@@ -59,6 +54,75 @@ def extrinsic_to_colmap_format(extrinsics):
         translations.append(t)
 
     return np.array(quaternions), np.array(translations)
+
+
+def _to_homogeneous_extrinsic(extrinsic):
+    extrinsic = np.asarray(extrinsic)
+    if extrinsic.shape == (4, 4):
+        return extrinsic.astype(np.float64)
+    if extrinsic.shape != (3, 4):
+        raise ValueError(f"Expected extrinsic shape (3, 4) or (4, 4), got {extrinsic.shape}")
+    out = np.eye(4, dtype=np.float64)
+    out[:3, :4] = extrinsic
+    return out
+
+
+def depth_to_cam_coords_points(depth_map, intrinsic):
+    height, width = depth_map.shape
+    intrinsic = np.asarray(intrinsic)
+    fu, fv = intrinsic[0, 0], intrinsic[1, 1]
+    cu, cv = intrinsic[0, 2], intrinsic[1, 2]
+
+    u, v = np.meshgrid(np.arange(width), np.arange(height))
+    x_cam = (u - cu) * depth_map / fu
+    y_cam = (v - cv) * depth_map / fv
+    z_cam = depth_map
+    return np.stack((x_cam, y_cam, z_cam), axis=-1).astype(np.float32)
+
+
+def depth_to_world_coords_points(depth_map, extrinsic, intrinsic, eps=1e-8):
+    depth_map = np.asarray(depth_map).squeeze()
+    point_mask = depth_map > eps
+    cam_coords_points = depth_to_cam_coords_points(depth_map, intrinsic)
+    cam_to_world = np.linalg.inv(_to_homogeneous_extrinsic(extrinsic))
+    world_coords_points = (
+        np.dot(cam_coords_points, cam_to_world[:3, :3].T) + cam_to_world[:3, 3]
+    ).astype(np.float32)
+    return world_coords_points, cam_coords_points, point_mask
+
+
+def unproject_depth_map_to_point_map(depth_map, extrinsics_cam, intrinsics_cam):
+    """Unproject z-depth maps to world-coordinate point maps."""
+    if isinstance(depth_map, torch.Tensor):
+        depth_map = depth_map.detach().cpu().numpy()
+    if isinstance(extrinsics_cam, torch.Tensor):
+        extrinsics_cam = extrinsics_cam.detach().cpu().numpy()
+    if isinstance(intrinsics_cam, torch.Tensor):
+        intrinsics_cam = intrinsics_cam.detach().cpu().numpy()
+
+    depth_map = np.asarray(depth_map)
+    extrinsics_cam = np.asarray(extrinsics_cam)
+    intrinsics_cam = np.asarray(intrinsics_cam)
+    if depth_map.ndim == 5 and depth_map.shape[0] == 1:
+        depth_map = depth_map[0]
+    if depth_map.ndim == 2:
+        depth_map = depth_map[None]
+    if depth_map.ndim == 4 and depth_map.shape[-1] == 1:
+        depth_map = depth_map[..., 0]
+    if extrinsics_cam.ndim == 2:
+        extrinsics_cam = extrinsics_cam[None]
+    if intrinsics_cam.ndim == 2:
+        intrinsics_cam = intrinsics_cam[None]
+
+    world_points = []
+    for frame_idx in range(depth_map.shape[0]):
+        world, _, _ = depth_to_world_coords_points(
+            depth_map[frame_idx],
+            extrinsics_cam[frame_idx],
+            intrinsics_cam[frame_idx],
+        )
+        world_points.append(world)
+    return np.stack(world_points, axis=0)
 
 
 def _download_file_from_url(url, filename):
@@ -146,7 +210,7 @@ def filter_and_prepare_points(
 ):
     """
     Filter points based on confidence and prepare for COLMAP format.
-    Implementation matches the conventions in the original VGGT code.
+    Implementation matches the original depth/intrinsics geometry convention.
     """
     if "Pointmap" in prediction_mode:
         print("Using Pointmap Branch")
@@ -529,17 +593,13 @@ def write_colmap_points3D_txt(file_path, points3D):
 
 
 
-def load_model(model_name="vggt", device=None):
+def load_model(model_name="pi3x", device=None):
     """Load and initialize a supported geometric foundation model."""
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
     
-    if model_name == 'vggt':
-        model = VGGT.from_pretrained("facebook/VGGT-1B")
-    elif model_name == 'pi3':
-        model = Pi3.from_pretrained("yyfz233/Pi3")
-    elif model_name == 'pi3x':
+    if model_name == 'pi3x':
         model = Pi3X.from_pretrained("yyfz233/Pi3X")
         # else:
         #     model = Pi3X()
@@ -587,52 +647,7 @@ def run_inference_step_by_step(model, batches, size_hw, device, need_features=Fa
     predictions = []
     start = time.time()
 
-    if isinstance(model, VGGT):
-        for i, images in enumerate(batches):
-            prediction = dict()
-
-            with torch.no_grad():
-                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    images = images[None].to(device)  # add batch dimension
-                    aggregated_tokens_list, ps_idx, patch_tokens = model.aggregator(images)
-            
-                    pose_enc = model.camera_head(aggregated_tokens_list)[-1]
-                    # Predict depth maps
-                    depth_map, depth_conf = model.depth_head(aggregated_tokens_list, images, ps_idx)
-                    # No need to predict point maps here
-                    # Predict feature maps for tracking
-                    if need_features:
-                        feature_maps = model.track_head.feature_extractor(aggregated_tokens_list, images, ps_idx)
-
-            prediction['depth'] = depth_map.to(dtype=torch.float32, device='cpu')
-            prediction['depth_conf'] = depth_conf.to(dtype=torch.float32, device='cpu')
-            prediction['pose_enc'] = pose_enc.to(dtype=torch.float32, device='cpu')
-
-            extri, intri = pose_encoding_to_extri_intri(prediction["pose_enc"], size_hw)
-            prediction['extrinsic'] = extri.squeeze(0)
-            prediction['intrinsic'] = intri.squeeze(0)
-            prediction['local_points'] = depth_intrinsics_to_local_points(
-                prediction['depth'],
-                prediction['intrinsic'],
-            )
-            prediction['world_points'] = unproject_depth_map_to_point_map(prediction['depth'].squeeze(0), extri.squeeze(0), intri.squeeze(0))
-
-            if need_features:
-                prediction['features'] = feature_maps.to(dtype=torch.float32, device='cpu')
-                
-            for key in patch_tokens.keys():
-                if isinstance(patch_tokens[key], torch.Tensor):
-                    val = patch_tokens[key].to(dtype=torch.float32, device='cpu')
-                    patch_tokens[key] = val
-            # prediction['dino_features'] = patch_tokens.to("cpu")
-
-            del aggregated_tokens_list, ps_idx, patch_tokens, pose_enc, depth_map, depth_conf, images
-
-            predictions.append(prediction)
-            torch.cuda.empty_cache()
-            gc.collect()
-        
-    elif isinstance(model, VGGTOmega):
+    if isinstance(model, VGGTOmega):
         for i, images in enumerate(batches):
             prediction = dict()
             if images.shape[-2] % 16 != 0 or images.shape[-1] % 16 != 0:
@@ -668,32 +683,6 @@ def run_inference_step_by_step(model, batches, size_hw, device, need_features=Fa
             predictions.append(prediction)
 
             del res, images, extri, intri
-            gc.collect()
-            torch.cuda.empty_cache()
-
-    elif isinstance(model, Pi3):
-        for i, images in enumerate(batches):
-            prediction = dict()
-            with torch.no_grad():
-                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                        images = images[None].to(device)  # add batch dimension
-                        res = model(images)
-            
-            prediction['extrinsic'] = remove_homogeneous_row(torch.linalg.inv(res['camera_poses'].squeeze(0))).to(dtype=torch.float32, device='cpu')
-            prediction['world_points'] = res['points'].to(dtype=torch.float32, device='cpu').squeeze(0)
-            prediction['depth_conf'] = res['conf'].to(dtype=torch.float32, device='cpu').squeeze(-1)
-            prediction['depth_conf'] = torch.sigmoid(prediction['depth_conf'])
-            prediction['local_points'] = res['local_points'].to(dtype=torch.float32, device='cpu').squeeze(0)
-            # prediction['dino_features'] = res['dino_features']
-
-            intrinsic, depth = estimate_intrinsics_and_depth(res['local_points'].squeeze(0))
-            prediction['intrinsic'] = intrinsic.to(dtype=torch.float32, device='cpu').squeeze(0)
-            prediction['depth'] = compute_depth(prediction['world_points'], prediction['extrinsic']).to(dtype=torch.float32, device='cpu').unsqueeze(0).unsqueeze(-1)
-
-            predictions.append(prediction)
-
-            del res, images
-            
             gc.collect()
             torch.cuda.empty_cache()
 
@@ -738,6 +727,8 @@ def run_inference_step_by_step(model, batches, size_hw, device, need_features=Fa
             gc.collect()
             torch.cuda.empty_cache()
             
+    else:
+        raise TypeError(f"Unsupported model type: {type(model).__name__}")
 
     end = time.time()
 
@@ -1843,10 +1834,10 @@ def output_to_colmap(predictions, img_names, output_dir, image_points2D, points3
 def write_recon_to_colmap(output_dir, predictions, images, names, stride=100, conf_threshold=50.0, format="txt", shared_camera=False):
     size_hw = images.shape[-2:]
     if "extrinsic" not in predictions.keys():
-        extrinsic, intrinsic = pose_encoding_to_extri_intri(predictions["pose_enc"], size_hw)
+        extrinsic, intrinsic = vggt_omega_encoding_to_camera(predictions["pose_enc"], size_hw)
         predictions["extrinsic"] = extrinsic
     if "intrinsic" not in predictions.keys():
-        extrinsic, intrinsic = pose_encoding_to_extri_intri(predictions["pose_enc"], size_hw)
+        extrinsic, intrinsic = vggt_omega_encoding_to_camera(predictions["pose_enc"], size_hw)
         predictions["intrinsic"] = intrinsic
     
     for key in predictions.keys():
@@ -2086,7 +2077,7 @@ def extract_frames_from_video(video_path, subsample=1, num_images=-1, output_dir
 
 
 def process_images(image_dir, subsample, device, num_images, multi_dirs=False, model="pi3x"):
-    """Process images with VGGT and return predictions. Also supports video files."""
+    """Load images for the feed-forward pipeline. Also supports video files."""
     
     # Check if input is a video file
     video_extensions = ('.mp4', '.avi', '.mov', '.mkv', '.webm', '.MP4', '.AVI', '.MOV', '.MKV', '.WEBM')
@@ -2115,14 +2106,22 @@ def process_images(image_dir, subsample, device, num_images, multi_dirs=False, m
         img = Image.open(img_path).convert('RGB')
         original_images.append(np.array(img))
     
-    if model == "vggt_omega":
-        # from vggt_omega.utils.load_fn import load_and_preprocess_images as vggt_omega_load_and_preprocess_images
-        # images = vggt_omega_load_and_preprocess_images(image_names, image_resolution=512).to(device)
-        from vggt.utils.load_fn import load_and_preprocess_images as vggt_load_and_preprocess_images
-        images = vggt_load_and_preprocess_images(image_names, mode="raw").to(device)
-    else:
-        from vggt.utils.load_fn import load_and_preprocess_images as vggt_load_and_preprocess_images
-        images = vggt_load_and_preprocess_images(image_names, mode="raw").to(device)
+    tensors = []
+    image_shape = None
+    for img_path in image_names:
+        with Image.open(img_path) as raw_img:
+            img = raw_img.convert("RGB")
+            array = np.asarray(img, dtype=np.float32) / 255.0
+        if image_shape is None:
+            image_shape = array.shape[:2]
+        elif array.shape[:2] != image_shape:
+            raise ValueError(
+                "All MERG3R input images must have the same shape after preprocessing. "
+                f"Found {array.shape[:2]} for {img_path}, expected {image_shape}. "
+                "Use --image_pyramid to normalize inputs."
+            )
+        tensors.append(torch.from_numpy(array).permute(2, 0, 1))
+    images = torch.stack(tensors, dim=0).to(device)
 
     print(f"[UTILS] Preprocessed images shape: {images.shape}")
     

@@ -25,7 +25,7 @@ export MERG3R_DINOV3_WEIGHTS_URL=https://...
 python main.py \
   --dataset "${DATASET}" \
   --output_dir "${OUTPUT_DIR}" \
-  --model pi3 \
+  --model pi3x \
   --sequence_type shortest_path \
   --alignment_type weighted_iterative \
   --subset_size 100 \

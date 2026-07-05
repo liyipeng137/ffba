@@ -6,7 +6,6 @@ import argparse
 import json
 
 from algos.utils import *
-from vggt.utils.geometry import unproject_depth_map_to_point_map
 from algos.sequence import create_sequence
 from algos.bundle_adjustment import global_bundle_adjustment
 from algos.alignment import align_extrinsics
@@ -16,7 +15,6 @@ from algos.hloc_tracking import graph_extract_matches_hloc
 from algos.dense_debug import export_dense_debug_outputs
 from algos.dense_correction import apply_inverse_depth_affine_correction
 from algos.lingbot_depth_refine import run_lingbot_depth_refinement
-from algos.infinidepth_refine import DEFAULT_INFINIDEPTH_MODEL_PATH, run_infinidepth_refinement
 from bae_pipe import run_bae_refinement
 from utils.image_pyramid import (
     build_two_resolution_image_pyramid,
@@ -78,7 +76,7 @@ def drop_untracked_frames(sequence, final_predictions, images, track, points_id,
 
 
 def parse_args():
-    parser = argparse.ArgumentParser("Test parallel inference on VGGT. ")
+    parser = argparse.ArgumentParser("Run MERG3R feed-forward SfM pipeline. ")
     ################ MERG3R ################
     parser.add_argument("--subset_size", type=int, default=100)
     parser.add_argument("--num_images", type=int, default=-1)
@@ -121,7 +119,7 @@ def parse_args():
     parser.add_argument("--epoch", type=int, default=300)
     parser.add_argument("--max_reproj", type=float, default=8.0)
     parser.add_argument("--stride", type=int, default=10, help="stride of save colmap points")
-    parser.add_argument("--model", type=str, default="pi3x", choices=['vggt', 'pi3', 'pi3x', 'vggt_omega'])
+    parser.add_argument("--model", type=str, default="pi3x", choices=['pi3x', 'vggt_omega'])
     parser.add_argument("--pi3x_intrinsics_method", type=str, default="moge", choices=["lstsq", "moge"])
     parser.add_argument("--multi_dirs", action="store_true")
     parser.add_argument("--point_vis_threshold", type=float, default=20.0)
@@ -213,38 +211,6 @@ def parse_args():
     )
     ################ LINGBOT ################ 
 
-    # ################ INFINIDEPTH ################
-    # parser.add_argument(
-    #     "--infinidepth_refine",
-    #     action="store_true",
-    #     help="Run InfiniDepth depth-sensor refinement using single-frame depth as sparse sensor depth.",
-    # )
-    # parser.add_argument(
-    #     "--infinidepth_output_dir",
-    #     type=str,
-    #     default=None,
-    #     help="Directory for InfiniDepth refined outputs. Defaults to <output_dir>/infinidepth_depth.",
-    # )
-    # parser.add_argument(
-    #     "--infinidepth_model_path",
-    #     type=str,
-    #     default=DEFAULT_INFINIDEPTH_MODEL_PATH,
-    #     help="Path to infinidepth_depthsensor.ckpt.",
-    # )
-    # parser.add_argument(
-    #     "--infinidepth_input_height",
-    #     type=int,
-    #     default=768,
-    #     help="InfiniDepth internal input height. Output depth is still saved at original RGB resolution.",
-    # )
-    # parser.add_argument(
-    #     "--infinidepth_input_width",
-    #     type=int,
-    #     default=1024,
-    #     help="InfiniDepth internal input width. Output depth is still saved at original RGB resolution.",
-    # )
-    # ################ INFINIDEPTH ################
-
     # ################ DENSE DEBUG ################
     # parser.add_argument(
     #     "--dense_debug",
@@ -318,8 +284,6 @@ def main():
     #     raise ValueError("--dense_depth_chunk_size must be positive, or -1 for no chunking")
     # if args.dense_depth_camera_batch_size < 1:
     #     raise ValueError("--dense_depth_camera_batch_size must be >= 1")
-    # if args.infinidepth_input_height <= 0 or args.infinidepth_input_width <= 0:
-    #     raise ValueError("--infinidepth_input_height and --infinidepth_input_width must be positive")
     # if args.lingbot_refine and not args.save_dense_depth:
     #     raise ValueError("--lingbot_refine requires projected dense depth export; remove --no_save_dense_depth")
     
@@ -751,30 +715,6 @@ def main():
         #     )
         #     lingbot_refined_ply_end = time.time()
 
-
-    elif args.infinidepth_refine:
-        infinidepth_start = 0
-        infinidepth_end = 0
-        infinidepth_stats = None
-        infinidepth_start = time.time()
-        infinidepth_output_dir = args.infinidepth_output_dir or os.path.join(args.output_dir, "infinidepth_depth")
-        infinidepth_images = high_output_images if high_output_enabled else sequence.images
-        infinidepth_image_names = high_output_image_names if high_output_enabled else sequence.image_names
-        infinidepth_intrinsic = high_output_intrinsic if high_output_enabled else low_intrinsic
-        infinidepth_stats = run_infinidepth_refinement(
-            infinidepth_images,
-            infinidepth_image_names,
-            os.path.join(args.output_dir, "single_frame_depth", "depth_npy"),
-            infinidepth_output_dir,
-            infinidepth_intrinsic,
-            model_path=args.infinidepth_model_path,
-            device=device,
-            depth_image_names=sequence.image_names,
-            confidence_dir=os.path.join(args.output_dir, "single_frame_depth", "confidence"),
-            input_size=(args.infinidepth_input_height, args.infinidepth_input_width),
-        )
-        infinidepth_end = time.time()
-
     if torch.cuda.is_available():
         torch.cuda.synchronize()
         peak_mem = max(peak_mem, torch.cuda.max_memory_allocated() / (1024**2))
@@ -827,13 +767,6 @@ def main():
             f.write(f"LingBot Depth Processed: {lingbot_stats['num_processed']}\n")
             f.write(f"LingBot Depth Skipped: {lingbot_stats['num_skipped']}\n")
             f.write(f"LingBot Depth Output Dir: {lingbot_stats['output_dir']}\n")
-        # if infinidepth_stats is not None:
-        #     f.write(f"InfiniDepth Model: {infinidepth_stats['model']}\n")
-        #     f.write(f"InfiniDepth Processed: {infinidepth_stats['num_processed']}\n")
-        #     f.write(f"InfiniDepth Skipped: {infinidepth_stats['num_skipped']}\n")
-        #     f.write(f"InfiniDepth Input Size: {infinidepth_stats['input_size']}\n")
-        #     f.write(f"InfiniDepth Output Resolution Mode: {infinidepth_stats['output_resolution_mode']}\n")
-        #     f.write(f"InfiniDepth Output Dir: {infinidepth_stats['output_dir']}\n")
         if lingbot_refined_ply_stats is not None:
             f.write(f"LingBot Refined PLY Points: {lingbot_refined_ply_stats['num_points']}\n")
             f.write(f"LingBot Refined PLY Valid Before Cap: {lingbot_refined_ply_stats['num_valid_points_before_cap']}\n")
@@ -845,7 +778,6 @@ def main():
         f.write(f"Dense Depth Time: {dense_depth_end - dense_depth_start} seconds\n")
         f.write(f"LingBot Depth Time: {lingbot_end - lingbot_start} seconds\n")
         f.write(f"LingBot Refined PLY Time: {lingbot_refined_ply_end - lingbot_refined_ply_start} seconds\n")
-        # f.write(f"InfiniDepth Time: {infinidepth_end - infinidepth_start} seconds\n")
         f.write(f"Peak GPU memory: {peak_mem:.2f} MiB\n")
 
     write_recon_to_colmap(
