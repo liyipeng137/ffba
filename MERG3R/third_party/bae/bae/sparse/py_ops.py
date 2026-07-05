@@ -172,7 +172,12 @@ def inv_op(input):
     bsr_values = input.values() # 1 + 2 dimensional
     inv_values = torch.linalg.inv(bsr_values)
 
-    return torch.sparse_bsc_tensor(crow_indices, col_indices, inv_values)
+    return torch.sparse_bsr_tensor(
+        crow_indices=crow_indices, 
+        col_indices=col_indices, 
+        values=inv_values,
+        size=input.shape, 
+        dtype=input.dtype, )
 
 def to_cooh(input):
     crow_indices = input.crow_indices() # b + 1 dimensional
@@ -231,4 +236,3 @@ with warnings.catch_warnings():
     sparse_lib = Library('aten', 'IMPL')
     sparse_lib.impl('diagonal', diagonal_op_, 'SparseCsrCPU')
     sparse_lib.impl('diagonal', diagonal_op_, 'SparseCsrCUDA')
-

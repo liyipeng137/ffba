@@ -9,7 +9,7 @@ wp.init()
 
 def torchbsr2wp(tbsr):
     assert tbsr.layout == torch.sparse_bsr
-    block_type = wp.mat(shape=tbsr.values().shape[-2:], dtype=wp.dtype_from_torch(tbsr.dtype))
+    block_type = wp.types.matrix(shape=tuple(tbsr.values().shape[-2:]), dtype=wp.dtype_from_torch(tbsr.dtype))
     bsr = wps.bsr_matrix_t(block_type)()
     bsr.nrow = int(tbsr.shape[0] // block_type._shape_[0])
     bsr.ncol = int(tbsr.shape[1] // block_type._shape_[1])
@@ -57,7 +57,7 @@ def wp2torchbsr(bsr):
 
 def format_vec_for_bsr(tvec, block_shape):
     y_vec_len = block_shape[1]
-    y_dtype = wp.vec(length=y_vec_len, dtype=wp.dtype_from_torch(tvec.dtype))
+    y_dtype = wp.types.vector(length=y_vec_len, dtype=wp.dtype_from_torch(tvec.dtype))
     if tvec.ndim == 1 and tvec.shape[-1] != y_vec_len:
         tvec = tvec.reshape(-1, y_vec_len)
     vwp = wp.from_torch(tvec, dtype=y_dtype)

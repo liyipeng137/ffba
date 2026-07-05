@@ -1,9 +1,0 @@
-__pycache__/
-.vscode
-.venv
-*.pt
-wandb/
-data/
-.WxBS
-results/
-demo/

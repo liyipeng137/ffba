@@ -1,4 +1,0 @@
-__object__:
-  path: torchmetrics.image
-  name: PeakSignalNoiseRatio
-  args: as_params

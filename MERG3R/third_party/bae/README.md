@@ -14,7 +14,7 @@
   <a href="https://pypose.org/bae/">🌐 Project Page</a> | <a href="https://arxiv.org/abs/2409.12190">📄 PDF</a>
 </p>
 
-> **⚠️ User Notice**: `bae` has been integrated with [PyPose](https://github.com/pypose/pypose) and is available from [v0.9.5](https://pypi.org/project/pypose/) or higher. Please refer to [this example](https://github.com/pypose/pypose/tree/main/examples/module/ba) and docs of [psjac](https://pypose.org/docs/main/generated/pypose.autograd.function.parallel_for_sparse_jacobian/#pypose.autograd.function.parallel_for_sparse_jacobian) and [LM](https://pypose.org/docs/main/generated/pypose.optim.LevenbergMarquardt/#pypose.optim.LevenbergMarquardt).
+> **⚠️ User Notice**: `bae` has been supported by [LM](https://pypose.org/docs/main/generated/pypose.optim.LevenbergMarquardt/#pypose.optim.LevenbergMarquardt) in [PyPose](https://github.com/pypose/pypose) as a sparse backend and is available from [v0.9.5](https://pypi.org/project/pypose/) or higher. Please refer to [this example](https://github.com/pypose/pypose/tree/main/examples/module/ba) and docs of [psjac](https://pypose.org/docs/main/generated/pypose.autograd.function.parallel_for_sparse_jacobian/#pypose.autograd.function.parallel_for_sparse_jacobian), a shared API for both libraries.
 
 `bae` is a PyTorch-based library supporting **exact** 2nd-order optimization techniques. The library provides efficient implementations for sparse optimization problems in robotics, particularly Bundle Adjustment (BA) and Pose Graph Optimization (PGO).
 
@@ -24,17 +24,17 @@
   <tr>
     <td align="center" width="33%">
       <p align="center" width="100%">
-        <img src="https://github.com/sair-lab/bae/blob/gh-page/docs/assets/garden_half.gif?raw=true" alt="Garden bundle adjustment example" width="100%" />
+        <img src="https://github.com/sair-lab/bae/blob/product-page/docs/assets/garden_half.gif?raw=true" alt="Garden bundle adjustment example" width="100%" />
       </p>
     </td>
     <td align="center" width="33%">
       <p align="center" width="100%">
-        <img src="https://github.com/sair-lab/bae/blob/gh-page/docs/assets/counter_half.gif?raw=true" alt="Counter bundle adjustment example" width="100%" />
+        <img src="https://github.com/sair-lab/bae/blob/product-page/docs/assets/counter_half.gif?raw=true" alt="Counter bundle adjustment example" width="100%" />
       </p>
     </td>
     <td align="center" width="33%">
       <p align="center" width="100%">
-        <img src="https://github.com/sair-lab/bae/blob/gh-page/docs/assets/kitchen_half.gif?raw=true" alt="Kitchen bundle adjustment example" width="100%" />
+        <img src="https://github.com/sair-lab/bae/blob/product-page/docs/assets/kitchen_half.gif?raw=true" alt="Kitchen bundle adjustment example" width="100%" />
       </p>
     </td>
   </tr>
@@ -52,13 +52,13 @@
 <table>
   <tr>
     <td align="center" width="33%">
-      <img src="https://github.com/sair-lab/bae/blob/gh-page/docs/assets/sphere_bignoise_vertex3.gif?raw=true" alt="Sphere big-noise optimization" width="100%" />
+      <img src="https://github.com/sair-lab/bae/blob/product-page/docs/assets/sphere_bignoise_vertex3.gif?raw=true" alt="Sphere big-noise optimization" width="100%" />
     </td>
     <td align="center" width="33%">
-      <img src="https://github.com/sair-lab/bae/blob/gh-page/docs/assets/grid3D.gif?raw=true" alt="3D grid optimization" width="100%" />
+      <img src="https://github.com/sair-lab/bae/blob/product-page/docs/assets/grid3D.gif?raw=true" alt="3D grid optimization" width="100%" />
     </td>
     <td align="center" width="33%">
-      <img src="https://github.com/sair-lab/bae/blob/gh-page/docs/assets/sphere_g2o.gif?raw=true" alt="Sphere g2o optimization" width="100%" />
+      <img src="https://github.com/sair-lab/bae/blob/product-page/docs/assets/sphere_g2o.gif?raw=true" alt="Sphere g2o optimization" width="100%" />
     </td>
   </tr>
   <tr>
@@ -84,10 +84,10 @@
 
 ### Future Plan
 - [ ] Add Apple Silicon GPU support, [PyTorch PR WIP](https://github.com/pytorch/pytorch/pull/177757)
-- [ ] Schur complement
 - [ ] Reduce runtime overhead using CUDA graph
-- [ ] Distributed Tensor (DTensor) support
+- [ ] Distributed Tensor (DTensor) and FSDP support for multi-GPU and distributed optimization
 - [ ] An new backend for [distributed solver](https://github.com/NVIDIA/AMGX)
+- [x] Schur complement (added in [PR #35](https://github.com/pypose/bae/pull/35))
 
 ## Installation
 
@@ -97,43 +97,42 @@
 - PyTorch (2.0+)
 - (Optional) [CUDSS](https://developer.nvidia.com/cudss) (CUDA Sparse Solver library)
 
-### Setup Instructions
+### User Setup Instructions
+```
+python -m pip install git+https://github.com/pypose/bae.git
+```
 
-1. (Optional) Install CUDSS (recommended through package manager)
-   - For CUDA 12 (0.6.0)
+### Developer Setup Instructions
+
+1. (Optional) Install CUDSS with pip package manager.
+   - For CUDA 12.x, install `nvidia-cudss-cu12`. We verified `nvidia-cudss-cu12==0.6.0.5` and `nvidia-cudss-cu12==0.7.1.6` work with `bae`:
    ```bash
-   sudo apt install cudss=0.6.0-1 cudss0=0.6.0-1 cudss-cuda-12=0.6.0.5-1 \
-   libcudss0-cuda-12=0.6.0.5-1 libcudss0-dev-cuda-12=0.6.0.5-1 libcudss0-static-cuda-12=0.6.0.5-1  
+   pip install "nvidia-cudss-cu12<=0.7.1.6"
    ```
-   - For CUDA 13
+   - For CUDA 13.x, install `nvidia-cudss-cu13<=0.7.1.6`:
    ```bash
-   sudo apt install cudss-cuda-13
+   pip install "nvidia-cudss-cu13<=0.7.1.6"
    ```
-3. Install PyPose:
+
+2. Install PyPose:
    ```bash
    pip install git+https://github.com/pypose/pypose.git
    ```
-4. Clone this repository:
+3. Clone this repository:
    ```bash
    git clone https://github.com/zitongzhan/bae.git
    cd bae
    ```
 
-5. Install dependencies:
+4. Install dependencies:
    ```bash
    pip install -r requirements.txt
    ```
 
-6. Install the package in development mode:
+5. Install the package in development mode:
    ```bash
    python -m pip install --no-build-isolation -v -e .  # following https://github.com/pytorch/pytorch
    ```
-
-### Build with CUDSS Tarball (unstable)
-If you are unable to install cudss with the system package manager, you can control the build process with these environment variables:
-
-- `USE_CUDSS`: Set to "1" (default) to enable CUDSS support, "0" to disable
-- `CUDSS_DIR`: Optional path to CUDSS installation directory if not in standard locations
 
 ## Agent Skills
 

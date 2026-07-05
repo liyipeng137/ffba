@@ -23,6 +23,8 @@ def trim_parameter_jacobian_values(
     if param.ndim == 0 or values.shape[-1] != param.shape[-1]:
         return values
     if getattr(param, 'trim_SE3_grad', False):
+        if not pypose_ambient_grad_enabled():
+            return torch.cat([values[..., :6], values[..., 7:]], dim=-1)
         pose = param[..., :7].detach()
         if block_indices is not None:
             pose = pose[block_indices.to(torch.long)]

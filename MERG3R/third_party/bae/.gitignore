@@ -2,8 +2,7 @@ build/*
 bae.egg-info/*
 *.so
 *.pyc
-bal_data/*
-datapipes/bal_data/*
+**/bal_data/
 .ipynb_checkpoints/*
 .idea/*
 dump_Ab/*
@@ -18,3 +17,5 @@ examples/module/pgo/save/*
 pypose_clone/
 .devcontainer/devcontainer-lock.json
 .claude/settings.local.json
+princeton365
+scannetpp

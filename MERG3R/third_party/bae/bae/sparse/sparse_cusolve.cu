@@ -20,6 +20,24 @@ static void HandlecusolverError(cusolverStatus_t err, int line) {
     }
 }
 
+static void HandlecudssError(cudssStatus_t err, const char* call, int line) {
+    TORCH_CHECK(
+        err == CUDSS_STATUS_SUCCESS,
+        "cuDSS error in ", call, " at ", __FILE__, ":", line,
+        " (error-code ", static_cast<int>(err), ")");
+}
+
+static void WarncudssError(cudssStatus_t err, const char* call, int line) {
+    if (err != CUDSS_STATUS_SUCCESS) {
+        std::cerr << "cuDSS error in " << call << " at " << __FILE__ << ":"
+                  << line << " (error-code " << static_cast<int>(err) << ")"
+                  << std::endl;
+    }
+}
+
+#define HANDLE_CUDSS_ERROR(call) HandlecudssError((call), #call, __LINE__)
+#define WARN_CUDSS_ERROR(call) WarncudssError((call), #call, __LINE__)
+
 
 // template <typename index_t, typename value_t>
 torch::Tensor cusolvesp_impl(torch::Tensor A, torch::Tensor b) {
@@ -81,21 +99,25 @@ class CuDirectSparseSolver {
         int called_count = 0;
     public:
         CuDirectSparseSolver() {
-            cudssCreate(&handle);
+            HANDLE_CUDSS_ERROR(cudssCreate(&handle));
             auto stream = c10::cuda::getCurrentCUDAStream();
-            cudssSetStream(handle, stream);
-            cudssDataCreate(handle, &cudss_data);
+            HANDLE_CUDSS_ERROR(cudssSetStream(handle, stream));
+            HANDLE_CUDSS_ERROR(cudssDataCreate(handle, &cudss_data));
         }
 
         ~CuDirectSparseSolver() {
-            cudssDataDestroy(handle, cudss_data);
-            cudssDestroy(handle);
+            WARN_CUDSS_ERROR(cudssDataDestroy(handle, cudss_data));
+            WARN_CUDSS_ERROR(cudssDestroy(handle));
         }
 
         torch::Tensor operator()(torch::Tensor A, torch::Tensor b) {
             // std::cout << "cudss called_count: " << called_count << std::endl;
             TORCH_CHECK(A.is_sparse_csr(), "A must be a CSR matrix");
-            // TORCH_CHECK(b.dim() == 1, "b must be a 1D tensor");
+            TORCH_CHECK(
+                b.dim() == 1 || (b.dim() == 2 && b.size(1) == 1),
+                "b must be a 1D tensor or a 2D column tensor");
+
+            const std::vector<int64_t> rhs_shape = b.sizes().vec();
             if (b.dim() == 2) {
                 b = b.squeeze(1);
             }
@@ -122,49 +144,45 @@ class CuDirectSparseSolver {
             cudssMatrix_t             x_mt;
         
         
-            cudssConfigCreate(&config);
+            HANDLE_CUDSS_ERROR(cudssConfigCreate(&config));
             // cudssAlgType_t reorder_alg = CUDSS_ALG_3;
             // cudssConfigSet(config, CUDSS_CONFIG_REORDERING_ALG, &reorder_alg, sizeof(cudssAlgType_t));
-
+            
             if (values.type().scalarType() == torch::ScalarType::Double) {
                 double* values_ptr = values.data<double>();
                 double* b_ptr = b.data<double>();
                 double* x_ptr = x.data<double>();
-                cudssMatrixCreateDn(&b_mt, b.size(0), 1, b.size(0), b_ptr, CUDA_R_64F, CUDSS_LAYOUT_COL_MAJOR);
-                cudssMatrixCreateDn(&x_mt, x.size(0), 1, x.size(0), x_ptr, CUDA_R_64F, CUDSS_LAYOUT_COL_MAJOR);
-                cudssMatrixCreateCsr(&A_mt, A.size(0), A.size(1),  A._nnz(), rowOffsets, rowOffsets + crow.size(0), colIndices, values_ptr, CUDA_R_32I, CUDA_R_64F, CUDSS_MTYPE_SPD, CUDSS_MVIEW_FULL, CUDSS_BASE_ZERO);
+                HANDLE_CUDSS_ERROR(cudssMatrixCreateDn(&b_mt, b.size(0), 1, b.size(0), b_ptr, CUDA_R_64F, CUDSS_LAYOUT_COL_MAJOR));
+                HANDLE_CUDSS_ERROR(cudssMatrixCreateDn(&x_mt, x.size(0), 1, x.size(0), x_ptr, CUDA_R_64F, CUDSS_LAYOUT_COL_MAJOR));
+                HANDLE_CUDSS_ERROR(cudssMatrixCreateCsr(&A_mt, A.size(0), A.size(1),  A._nnz(), rowOffsets, NULL, colIndices, values_ptr, CUDA_R_32I, CUDA_R_64F, CUDSS_MTYPE_SPD, CUDSS_MVIEW_FULL, CUDSS_BASE_ZERO));
             } else if (values.type().scalarType() == torch::ScalarType::Float) {
                 float* values_ptr = values.data<float>();
                 float* b_ptr = b.data<float>();
                 float* x_ptr = x.data<float>();
-                cudssMatrixCreateDn(&b_mt, b.size(0), 1, b.size(0), b_ptr, CUDA_R_32F, CUDSS_LAYOUT_COL_MAJOR);
-                cudssMatrixCreateDn(&x_mt, x.size(0), 1, x.size(0), x_ptr, CUDA_R_32F, CUDSS_LAYOUT_COL_MAJOR);
-                cudssMatrixCreateCsr(&A_mt, A.size(0), A.size(1),  A._nnz(), rowOffsets, rowOffsets + crow.size(0), colIndices, values_ptr, CUDA_R_32I, CUDA_R_32F, CUDSS_MTYPE_SPD, CUDSS_MVIEW_FULL, CUDSS_BASE_ZERO);
+                HANDLE_CUDSS_ERROR(cudssMatrixCreateDn(&b_mt, b.size(0), 1, b.size(0), b_ptr, CUDA_R_32F, CUDSS_LAYOUT_COL_MAJOR));
+                HANDLE_CUDSS_ERROR(cudssMatrixCreateDn(&x_mt, x.size(0), 1, x.size(0), x_ptr, CUDA_R_32F, CUDSS_LAYOUT_COL_MAJOR));
+                HANDLE_CUDSS_ERROR(cudssMatrixCreateCsr(&A_mt, A.size(0), A.size(1),  A._nnz(), rowOffsets, NULL, colIndices, values_ptr, CUDA_R_32I, CUDA_R_32F, CUDSS_MTYPE_SPD, CUDSS_MVIEW_FULL, CUDSS_BASE_ZERO));
+                // https://docs.nvidia.com/cuda/archive/12.9.0/cudss/functions.html#:~:text=the%20dense%20matrix-,NULL%20is%20the%20only%20supported%20value%20as%204%2Darray%20CSR%20is%20not%20supported%20currently,-colIndices
             }
             //---------------------------------------------------------------------------------
             if (called_count == 0) {
                 // Reordering & symbolic factorization
                 torch::profiler::impl::cudaStubs()->rangePush("Reordering & symbolic factorization");
-                cudssExecute(handle, CUDSS_PHASE_ANALYSIS, config, cudss_data, A_mt, x_mt, b_mt);
+                HANDLE_CUDSS_ERROR(cudssExecute(handle, CUDSS_PHASE_ANALYSIS, config, cudss_data, A_mt, x_mt, b_mt));
                 // https://docs.nvidia.com/cuda/cudss/types.html?highlight=cudss_data_perm_row
                 torch::profiler::impl::cudaStubs()->rangePop();
             }
             //---------------------------------------------------------------------------------
             // Numerical factorization
             torch::profiler::impl::cudaStubs()->rangePush("Numerical factorization");
-            cudssExecute(handle, CUDSS_PHASE_FACTORIZATION, config, cudss_data, A_mt, x_mt, b_mt);
+            HANDLE_CUDSS_ERROR(cudssExecute(handle, CUDSS_PHASE_FACTORIZATION, config, cudss_data, A_mt, x_mt, b_mt));
         
             // Retrieve nnz for L matrix
         
             size_t L_nnz = 0;
             size_t sizeWritten = 0;
-            cudssStatus_t status;
         
-            status = cudssDataGet(handle, cudss_data, CUDSS_DATA_LU_NNZ, &L_nnz, sizeof(L_nnz), &sizeWritten);
-            if (status != CUDSS_STATUS_SUCCESS) {
-                std::cerr << "Error retrieving L matrix nnz: " << status << std::endl;
-                // Handle error appropriately
-            }
+            HANDLE_CUDSS_ERROR(cudssDataGet(handle, cudss_data, CUDSS_DATA_LU_NNZ, &L_nnz, sizeof(L_nnz), &sizeWritten));
         
             int64_t A_nrows = 0, A_ncols = 0;
             int64_t A_nnz = 0;
@@ -174,17 +192,10 @@ class CuDirectSparseSolver {
             cudssMatrixViewType_t A_mview;
             cudssIndexBase_t A_indexBase;
         
-            status = cudssMatrixGetCsr(A_mt, &A_nrows, &A_ncols, &A_nnz, &A_rowStart, &A_rowEnd, &A_colIndices, &A_values, 
-                                    &A_indexType, &A_valueType, &A_mtype, &A_mview, &A_indexBase);
-            if (status != CUDSS_STATUS_SUCCESS) {
-                std::cerr << "Error retrieving A matrix CSR info: " << status << std::endl;
-                // Handle error appropriately
-            }
+            HANDLE_CUDSS_ERROR(cudssMatrixGetCsr(A_mt, &A_nrows, &A_ncols, &A_nnz, &A_rowStart, &A_rowEnd, &A_colIndices, &A_values, 
+                                    &A_indexType, &A_valueType, &A_mtype, &A_mview, &A_indexBase));
         
-            if (A_nnz <= 0) {
-                std::cerr << "Original matrix A has zero or negative nnz." << std::endl;
-                // Handle error appropriately
-            }
+            TORCH_CHECK(A_nnz > 0, "Original matrix A has zero or negative nnz.");
         
             double fill_in_factor = static_cast<double>(L_nnz) / static_cast<double>(A_nnz);
             std::cout << "Fill-in factor: " << fill_in_factor << std::endl;
@@ -195,7 +206,7 @@ class CuDirectSparseSolver {
             //---------------------------------------------------------------------------------
             // Solving the system
             torch::profiler::impl::cudaStubs()->rangePush("Solving the system");
-            cudssExecute(handle, CUDSS_PHASE_SOLVE, config, cudss_data, A_mt, x_mt, b_mt);
+            HANDLE_CUDSS_ERROR(cudssExecute(handle, CUDSS_PHASE_SOLVE, config, cudss_data, A_mt, x_mt, b_mt));
             torch::profiler::impl::cudaStubs()->rangePop();
         
             //---------------------------------------------------------------------------------
@@ -204,15 +215,15 @@ class CuDirectSparseSolver {
         
             //---------------------------------------------------------------------------------
             // Destroy the opaque objects
-            cudssConfigDestroy(config);
+            HANDLE_CUDSS_ERROR(cudssConfigDestroy(config));
             // cudssDataDestroy(handle, cudss_data);
-            cudssMatrixDestroy(A_mt);
-            cudssMatrixDestroy(x_mt);
-            cudssMatrixDestroy(b_mt);
+            HANDLE_CUDSS_ERROR(cudssMatrixDestroy(A_mt));
+            HANDLE_CUDSS_ERROR(cudssMatrixDestroy(x_mt));
+            HANDLE_CUDSS_ERROR(cudssMatrixDestroy(b_mt));
             // cudssDestroy(handle);
         
             called_count++;
-            return x;
+            return x.view(rhs_shape);
         }
 };
     
@@ -224,4 +235,3 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("__call__", &CuDirectSparseSolver::operator(), "Solve Ax = b using cuDSS");
     m.def("cusolvesp", &cusolvesp_impl, "Solve Ax = b using cuSolverSP");
 }
-
