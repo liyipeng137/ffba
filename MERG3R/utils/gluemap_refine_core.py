@@ -26,7 +26,9 @@ def _lazy_import_pycolmap():
 
 
 def _ensure_gluemap_imports():
-    repo_root = Path(__file__).resolve().parents[1] / "gluemap"
+    repo_root = Path(__file__).resolve().parents[1] / "third_party" / "gluemap"
+    if not (repo_root / "gluemap").is_dir():
+        raise FileNotFoundError(f"GlueMap directory not found: {repo_root}")
     if str(repo_root) not in sys.path:
         sys.path.insert(0, str(repo_root))
     import thirdparty.path_to_thirdparty  # noqa: F401, PLC0415

@@ -43,10 +43,12 @@ def _is_relative_to(path: Path, root: Path) -> bool:
 
 
 def _ensure_bae_runtime():
-    merg3r_root = Path(__file__).resolve().parents[3]
-    bae_root = merg3r_root / "bae"
+    third_party_root = Path(__file__).resolve().parents[3]
+    bae_root = third_party_root / "bae"
     if not (bae_root / "ba_colmap.py").is_file():
-        raise FileNotFoundError(f"Could not find MERG3R BAE at {bae_root}")
+        raise FileNotFoundError(
+            f"Could not find MERG3R/third_party BAE at {bae_root}"
+        )
 
     bae_root_str = str(bae_root)
     if not sys.path or sys.path[0] != bae_root_str:

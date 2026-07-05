@@ -161,8 +161,8 @@ def parse_args():
         choices=["ceres", "bae"],
         help=(
             "Bundle adjustment backend for GlueMap augmented BA. 'ceres' keeps "
-            "the original solver; 'bae' uses MERG3R/bae as an independent "
-            "PyTorch backend."
+            "the original solver; 'bae' uses MERG3R/third_party/bae as an "
+            "independent PyTorch backend."
         ),
     )
     parser.add_argument("--ba_max_num_iterations", type=int, default=100)

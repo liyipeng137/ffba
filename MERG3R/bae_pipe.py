@@ -1,34 +1,48 @@
-import os
 import sys
+from pathlib import Path
 from time import perf_counter
 
 import numpy as np
 import torch
 from scipy.spatial.transform import Rotation
 
+_LOCAL_BAE_ROOT = Path(__file__).resolve().parent / "third_party" / "bae"
+_LOCAL_BAE_PKG_ROOT = _LOCAL_BAE_ROOT / "bae"
 
-_LOCAL_BAE_ROOT = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "third_party",
-    "bae",
-)
+
+def _is_relative_to(path, root):
+    try:
+        Path(path).resolve().relative_to(Path(root).resolve())
+    except ValueError:
+        return False
+    return True
 
 
 def _ensure_local_bae_on_path():
-    if not os.path.isdir(_LOCAL_BAE_ROOT):
+    if not (_LOCAL_BAE_ROOT / "ba_colmap.py").is_file():
         raise FileNotFoundError(f"BAE directory not found: {_LOCAL_BAE_ROOT}")
-    if _LOCAL_BAE_ROOT not in sys.path:
-        sys.path.insert(0, _LOCAL_BAE_ROOT)
+    bae_root_str = str(_LOCAL_BAE_ROOT)
+    if not sys.path or sys.path[0] != bae_root_str:
+        sys.path.insert(0, bae_root_str)
 
 
-# _ensure_local_bae_on_path()
+_ensure_local_bae_on_path()
 
-import pypose as pp
-import torch.nn as nn
-from pypose.autograd.function import psjac
+import pypose as pp  # noqa: E402
+import torch.nn as nn  # noqa: E402
+from pypose.autograd.function import psjac  # noqa: E402
 
-from bae.optim import LM
-from bae.utils.pysolvers import PCG
+import bae  # noqa: E402
+
+if not _is_relative_to(Path(bae.__file__), _LOCAL_BAE_PKG_ROOT):
+    raise ImportError(
+        "Imported the wrong BAE package: "
+        f"{Path(bae.__file__).resolve()}. Expected it under {_LOCAL_BAE_PKG_ROOT}."
+    )
+
+from bae.optim import LM  # noqa: E402
+from bae.utils.pysolvers import PCG  # noqa: E402
+
 
 @psjac
 def project_colmap(points, camera_params, intrinsics):
@@ -43,6 +57,7 @@ def project_colmap(points, camera_params, intrinsics):
     u = fx * points_proj[..., 0].unsqueeze(-1) + cx
     v = fy * points_proj[..., 1].unsqueeze(-1) + cy
     return torch.cat([u, v], dim=-1)
+
 
 class ColmapResidual(nn.Module):
     def __init__(self, camera_params, points_3d, intrinsics, optimize_intrinsics=True):
@@ -79,10 +94,13 @@ class ColmapResidual(nn.Module):
         )
         return points_proj - points_2d
 
+
 def _normalize_extrinsics(extrinsic):
     extrinsic = np.asarray(extrinsic, dtype=np.float64)
     if extrinsic.ndim != 3 or extrinsic.shape[-2:] not in ((3, 4), (4, 4)):
-        raise ValueError(f"Expected extrinsic shape (N, 3, 4) or (N, 4, 4), got {extrinsic.shape}")
+        raise ValueError(
+            f"Expected extrinsic shape (N, 3, 4) or (N, 4, 4), got {extrinsic.shape}"
+        )
 
     if extrinsic.shape[-2:] == (4, 4):
         return extrinsic[:, :3, :4]
@@ -147,7 +165,7 @@ def _frame_valid_mask(valid_track_mask, frame_idx, count):
 
     if frame_mask.size < count:
         padded = np.zeros(count, dtype=bool)
-        padded[:frame_mask.size] = frame_mask.astype(bool)
+        padded[: frame_mask.size] = frame_mask.astype(bool)
         return padded
     return frame_mask[:count].astype(bool)
 
@@ -180,7 +198,9 @@ def _build_bae_observations(track, points_id, points_3d, valid_track_mask=None):
             point_2d = track_i[obs_idx]
             if point_id < 0 or point_id >= len(points_3d):
                 continue
-            if not (np.isfinite(point_2d).all() and np.isfinite(points_3d[point_id]).all()):
+            if not (
+                np.isfinite(point_2d).all() and np.isfinite(points_3d[point_id]).all()
+            ):
                 continue
 
             compact_camera_id = camera_id_to_compact.get(camera_idx)
@@ -212,9 +232,6 @@ def _build_bae_observations(track, points_id, points_3d, valid_track_mask=None):
     }
 
 
-
-
-
 def run_bae_refinement(
     predictions,
     track,
@@ -235,7 +252,9 @@ def run_bae_refinement(
 
     all_camera_params = _extrinsics_to_camera_params(predictions["extrinsic"])
     used_camera_ids = observations["used_camera_ids"]
-    dropped_camera_ids = np.setdiff1d(np.arange(all_camera_params.shape[0]), used_camera_ids)
+    dropped_camera_ids = np.setdiff1d(
+        np.arange(all_camera_params.shape[0]), used_camera_ids
+    )
     if len(dropped_camera_ids) > 0:
         print(
             "[BAE] Warning: dropping "
@@ -248,16 +267,24 @@ def run_bae_refinement(
         dtype=torch.float64,
         device=device,
     )
-    points_3d = torch.tensor(observations["points_3d"], dtype=torch.float64, device=device)
+    points_3d = torch.tensor(
+        observations["points_3d"], dtype=torch.float64, device=device
+    )
     intrinsics = torch.tensor(
         _mean_pinhole_intrinsics(predictions["intrinsic"]),
         dtype=torch.float64,
         device=device,
     )
     input_dict = {
-        "points_2d": torch.tensor(observations["points_2d"], dtype=torch.float64, device=device),
-        "camera_indices": torch.tensor(observations["camera_indices"], dtype=torch.int64, device=device),
-        "point_indices": torch.tensor(observations["point_indices"], dtype=torch.int64, device=device),
+        "points_2d": torch.tensor(
+            observations["points_2d"], dtype=torch.float64, device=device
+        ),
+        "camera_indices": torch.tensor(
+            observations["camera_indices"], dtype=torch.int64, device=device
+        ),
+        "point_indices": torch.tensor(
+            observations["point_indices"], dtype=torch.int64, device=device
+        ),
     }
 
     model = ColmapResidual(
@@ -306,7 +333,9 @@ def run_bae_refinement(
         original_extrinsics[used_camera_ids] = optimized_extrinsics[:, :3, :4]
         predictions["extrinsic"] = original_extrinsics
     predictions["points"] = full_points
-    predictions["intrinsic"] = np.repeat(shared_K[None], predictions["extrinsic"].shape[0], axis=0)
+    predictions["intrinsic"] = np.repeat(
+        shared_K[None], predictions["extrinsic"].shape[0], axis=0
+    )
 
     return {
         "initial_loss": initial_loss,
