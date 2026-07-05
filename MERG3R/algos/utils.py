@@ -2,7 +2,6 @@ import copy
 import gc
 import os
 import glob
-from pyexpat import model
 import shutil
 import tempfile
 import time
@@ -17,19 +16,22 @@ import requests
 from PIL import Image
 from scipy.spatial.transform import Rotation
 
-from algos.feedforward_paths import ensure_feedforward_on_path
-
-ensure_feedforward_on_path()
-
-from vggt_omega.models import VGGTOmega
-from vggt_omega.utils.pose_enc import encoding_to_camera as vggt_omega_encoding_to_camera
-from pi3x_model.models.pi3x import Pi3X
-from pi3x_model.utils.transforms_utils import recover_intrinsics_from_output
-
-VGGT_OMEGA_CKPT = os.path.join(
-    os.path.dirname(os.path.dirname(__file__)),
-    "checkpoints",
-    "vggt_omega_1b_512.pt",
+from utils.feedforward import (
+    VGGT_OMEGA_CKPT,
+    decode_vggt_omega_pose,
+    load_model,
+    run_inference_step_by_step,
+)
+from utils.geometry import (
+    _to_homogeneous_extrinsic,
+    compute_depth,
+    convert_to_homogeneous_matrix,
+    depth_intrinsics_to_local_points,
+    depth_to_cam_coords_points,
+    depth_to_world_coords_points,
+    estimate_intrinsics_and_depth,
+    remove_homogeneous_row,
+    unproject_depth_map_to_point_map,
 )
 
 
@@ -54,75 +56,6 @@ def extrinsic_to_colmap_format(extrinsics):
         translations.append(t)
 
     return np.array(quaternions), np.array(translations)
-
-
-def _to_homogeneous_extrinsic(extrinsic):
-    extrinsic = np.asarray(extrinsic)
-    if extrinsic.shape == (4, 4):
-        return extrinsic.astype(np.float64)
-    if extrinsic.shape != (3, 4):
-        raise ValueError(f"Expected extrinsic shape (3, 4) or (4, 4), got {extrinsic.shape}")
-    out = np.eye(4, dtype=np.float64)
-    out[:3, :4] = extrinsic
-    return out
-
-
-def depth_to_cam_coords_points(depth_map, intrinsic):
-    height, width = depth_map.shape
-    intrinsic = np.asarray(intrinsic)
-    fu, fv = intrinsic[0, 0], intrinsic[1, 1]
-    cu, cv = intrinsic[0, 2], intrinsic[1, 2]
-
-    u, v = np.meshgrid(np.arange(width), np.arange(height))
-    x_cam = (u - cu) * depth_map / fu
-    y_cam = (v - cv) * depth_map / fv
-    z_cam = depth_map
-    return np.stack((x_cam, y_cam, z_cam), axis=-1).astype(np.float32)
-
-
-def depth_to_world_coords_points(depth_map, extrinsic, intrinsic, eps=1e-8):
-    depth_map = np.asarray(depth_map).squeeze()
-    point_mask = depth_map > eps
-    cam_coords_points = depth_to_cam_coords_points(depth_map, intrinsic)
-    cam_to_world = np.linalg.inv(_to_homogeneous_extrinsic(extrinsic))
-    world_coords_points = (
-        np.dot(cam_coords_points, cam_to_world[:3, :3].T) + cam_to_world[:3, 3]
-    ).astype(np.float32)
-    return world_coords_points, cam_coords_points, point_mask
-
-
-def unproject_depth_map_to_point_map(depth_map, extrinsics_cam, intrinsics_cam):
-    """Unproject z-depth maps to world-coordinate point maps."""
-    if isinstance(depth_map, torch.Tensor):
-        depth_map = depth_map.detach().cpu().numpy()
-    if isinstance(extrinsics_cam, torch.Tensor):
-        extrinsics_cam = extrinsics_cam.detach().cpu().numpy()
-    if isinstance(intrinsics_cam, torch.Tensor):
-        intrinsics_cam = intrinsics_cam.detach().cpu().numpy()
-
-    depth_map = np.asarray(depth_map)
-    extrinsics_cam = np.asarray(extrinsics_cam)
-    intrinsics_cam = np.asarray(intrinsics_cam)
-    if depth_map.ndim == 5 and depth_map.shape[0] == 1:
-        depth_map = depth_map[0]
-    if depth_map.ndim == 2:
-        depth_map = depth_map[None]
-    if depth_map.ndim == 4 and depth_map.shape[-1] == 1:
-        depth_map = depth_map[..., 0]
-    if extrinsics_cam.ndim == 2:
-        extrinsics_cam = extrinsics_cam[None]
-    if intrinsics_cam.ndim == 2:
-        intrinsics_cam = intrinsics_cam[None]
-
-    world_points = []
-    for frame_idx in range(depth_map.shape[0]):
-        world, _, _ = depth_to_world_coords_points(
-            depth_map[frame_idx],
-            extrinsics_cam[frame_idx],
-            intrinsics_cam[frame_idx],
-        )
-        world_points.append(world)
-    return np.stack(world_points, axis=0)
 
 
 def _download_file_from_url(url, filename):
@@ -591,226 +524,6 @@ def write_colmap_points3D_txt(file_path, points3D):
                 f"{point_id} {x} {y} {z} {int(r)} {int(g)} {int(b)} {error} {track}\n"
             )
 
-
-
-def load_model(model_name="pi3x", device=None):
-    """Load and initialize a supported geometric foundation model."""
-    if device is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Using device: {device}")
-    
-    if model_name == 'pi3x':
-        model = Pi3X.from_pretrained("yyfz233/Pi3X")
-        # else:
-        #     model = Pi3X()
-        #     if pi3x_ckpt.endswith(".safetensors"):
-        #         from safetensors.torch import load_file
-        #         state_dict = load_file(pi3x_ckpt)
-        #     else:
-        #         state_dict = torch.load(pi3x_ckpt, map_location="cpu", weights_only=False)
-        #         if isinstance(state_dict, dict) and "model" in state_dict:
-        #             state_dict = state_dict["model"]
-        #     model.load_state_dict(state_dict, strict=False)
-    elif model_name == 'vggt_omega':
-        if not os.path.isfile(VGGT_OMEGA_CKPT):
-            raise FileNotFoundError(
-                f"VGGT-Omega checkpoint not found: {VGGT_OMEGA_CKPT}. "
-                "Update VGGT_OMEGA_CKPT in algos/utils.py to point to your local weights."
-            )
-        print(f"Loading VGGT-Omega checkpoint: {VGGT_OMEGA_CKPT}")
-        model = VGGTOmega()
-        state_dict = torch.load(VGGT_OMEGA_CKPT, map_location="cpu")
-        if isinstance(state_dict, dict) and "model" in state_dict:
-            state_dict = state_dict["model"]
-        elif isinstance(state_dict, dict) and "state_dict" in state_dict:
-            state_dict = state_dict["state_dict"]
-        model.load_state_dict(state_dict)
-    else:
-        raise NotImplementedError("Other model backbones are not implemented!")
-
-    
-    model.eval()
-    model = model.to(device)
-    return model, device
-
-
-
-def run_inference_step_by_step(model, batches, size_hw, device, need_features=False, pi3x_intrinsics_method="lstsq"):
-    """
-    Output:
-     - extrinsic: (N, 3, 4)
-     - intrinsic: (N, 3, 3)
-     - depth: (N, H, W, 1)
-     - depth_conf: (N, H, W)
-    """
-    # Construct a customized prediction
-    predictions = []
-    start = time.time()
-
-    if isinstance(model, VGGTOmega):
-        for i, images in enumerate(batches):
-            prediction = dict()
-            if images.shape[-2] % 16 != 0 or images.shape[-1] % 16 != 0:
-                raise ValueError(
-                    "VGGT-Omega requires image height and width to be multiples of 16. "
-                    f"Got {tuple(images.shape[-2:])} for subset {i}."
-                )
-
-            with torch.no_grad():
-                images = images.to(device)
-                res = model(images)
-
-            extri, intri = vggt_omega_encoding_to_camera(
-                res["pose_enc"],
-                res["images"].shape[-2:],
-            )
-
-            prediction['depth'] = res['depth'].to(dtype=torch.float32, device='cpu')
-            prediction['depth_conf'] = res['depth_conf'].to(dtype=torch.float32, device='cpu')
-            prediction['pose_enc'] = res['pose_enc'].to(dtype=torch.float32, device='cpu')
-            prediction['extrinsic'] = extri.to(dtype=torch.float32, device='cpu').squeeze(0)
-            prediction['intrinsic'] = intri.to(dtype=torch.float32, device='cpu').squeeze(0)
-            prediction['local_points'] = depth_intrinsics_to_local_points(
-                prediction['depth'],
-                prediction['intrinsic'],
-            )
-            prediction['world_points'] = unproject_depth_map_to_point_map(
-                prediction['depth'].squeeze(0),
-                prediction['extrinsic'],
-                prediction['intrinsic'],
-            )
-
-            predictions.append(prediction)
-
-            del res, images, extri, intri
-            gc.collect()
-            torch.cuda.empty_cache()
-
-    elif isinstance(model, Pi3X):
-        if pi3x_intrinsics_method not in ("lstsq", "moge"):
-            raise ValueError(f"Unsupported pi3x_intrinsics_method: {pi3x_intrinsics_method}")
-
-        for i, images in enumerate(batches):
-            prediction = dict()
-            if images.shape[-2] % 14 != 0 or images.shape[-1] % 14 != 0:
-                raise ValueError(
-                    "Pi3X requires image height and width to be multiples of 14. "
-                    f"Got {tuple(images.shape[-2:])} for subset {i}."
-                )
-
-            with torch.no_grad():
-                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    images = images[None].to(device)  # add batch dimension
-                    res = model(imgs=images)
-
-            c2w = res['camera_poses'].squeeze(0)
-            prediction['extrinsic'] = remove_homogeneous_row(torch.linalg.inv(c2w)).to(dtype=torch.float32, device='cpu')
-            prediction['world_points'] = res['points'].to(dtype=torch.float32, device='cpu').squeeze(0)
-            prediction['depth_conf'] = res['conf'].to(dtype=torch.float32, device='cpu').squeeze(0).squeeze(-1)
-            prediction['depth_conf'] = torch.sigmoid(prediction['depth_conf'])
-            prediction['local_points'] = res['local_points'].to(dtype=torch.float32, device='cpu').squeeze(0)
-
-            if pi3x_intrinsics_method == "moge":
-                intrinsic = recover_intrinsics_from_output(res)
-                prediction['intrinsic'] = torch.from_numpy(intrinsic).to(dtype=torch.float32, device='cpu')
-                depth = res['local_points'].squeeze(0)[..., 2]
-            else:
-                intrinsic, depth = estimate_intrinsics_and_depth(res['local_points'].squeeze(0))
-                prediction['intrinsic'] = intrinsic.to(dtype=torch.float32, device='cpu')
-
-            prediction['depth'] = depth.to(dtype=torch.float32, device='cpu').unsqueeze(0).unsqueeze(-1)
-
-            predictions.append(prediction)
-
-            del res, images, c2w
-            
-            gc.collect()
-            torch.cuda.empty_cache()
-            
-    else:
-        raise TypeError(f"Unsupported model type: {type(model).__name__}")
-
-    end = time.time()
-
-    print(f"[INFERENCE] Time used: {end - start}s. ")
-    
-    return predictions
-
-
-def depth_intrinsics_to_local_points(depth, intrinsic):
-    """
-    Back-project z-depth into camera-local XYZ coordinates using pinhole intrinsics.
-
-    depth: (1, N, H, W, 1), (N, H, W, 1), or (N, H, W)
-    intrinsic: (N, 3, 3)
-    returns: (N, H, W, 3)
-    """
-    if not isinstance(depth, torch.Tensor):
-        depth = torch.as_tensor(depth)
-    if not isinstance(intrinsic, torch.Tensor):
-        intrinsic = torch.as_tensor(intrinsic, dtype=depth.dtype, device=depth.device)
-    else:
-        intrinsic = intrinsic.to(device=depth.device, dtype=depth.dtype)
-
-    if depth.ndim == 5:
-        if depth.shape[0] != 1:
-            raise ValueError(f"Expected batch size 1 for depth, got shape {tuple(depth.shape)}")
-        depth = depth.squeeze(0)
-    if depth.ndim == 4:
-        if depth.shape[-1] != 1:
-            raise ValueError(f"Expected depth last dimension 1, got shape {tuple(depth.shape)}")
-        depth = depth[..., 0]
-    if depth.ndim != 3:
-        raise ValueError(f"Expected depth shape (N, H, W), got {tuple(depth.shape)}")
-
-    if intrinsic.ndim == 4:
-        if intrinsic.shape[0] != 1:
-            raise ValueError(f"Expected batch size 1 for intrinsic, got shape {tuple(intrinsic.shape)}")
-        intrinsic = intrinsic.squeeze(0)
-
-    num_frames, height, width = depth.shape
-    if intrinsic.shape != (num_frames, 3, 3):
-        raise ValueError(f"Expected intrinsic shape ({num_frames}, 3, 3), got {tuple(intrinsic.shape)}")
-
-    y, x = torch.meshgrid(
-        torch.arange(height, dtype=depth.dtype, device=depth.device),
-        torch.arange(width, dtype=depth.dtype, device=depth.device),
-        indexing="ij",
-    )
-
-    fx = intrinsic[:, 0, 0].view(num_frames, 1, 1)
-    fy = intrinsic[:, 1, 1].view(num_frames, 1, 1)
-    cx = intrinsic[:, 0, 2].view(num_frames, 1, 1)
-    cy = intrinsic[:, 1, 2].view(num_frames, 1, 1)
-
-    x = (x.unsqueeze(0) - cx) / fx * depth
-    y = (y.unsqueeze(0) - cy) / fy * depth
-    return torch.stack([x, y, depth], dim=-1).to(dtype=torch.float32, device='cpu')
-
-
-def compute_depth(points, extrin):
-    """
-    points: (N, H, W, 3) in world coordinates
-    extrin: (N, 3, 4) camera extrinsics (world -> camera)
-    intrin: (N, 3, 3) camera intrinsics (unused for depth directly)
-    
-    Returns:
-        depth: (N, H, W)
-    """
-    N, H, W, _ = points.shape
-
-    # Convert to homogeneous coords: (N, H, W, 4)
-    ones = torch.ones((N, H, W, 1), dtype=points.dtype, device=points.device)
-    homog_points = torch.cat([points, ones], dim=-1)
-
-    # Transform world -> camera: (N, H, W, 3)
-    # First expand extrin to match dimensions
-    cam_points = torch.einsum('nij,nhwj->nhwi', extrin, homog_points)
-
-    # Depth is the z-coordinate in camera space
-    depth = cam_points[..., 2]
-
-    return depth
 
 
 def _world_points_from_local_frame(local_points_frame, extrinsic_frame):
@@ -1704,102 +1417,6 @@ def export_dense_projected_depth_maps(
         "output_dir": output_dir,
     }
 
-
-@torch.no_grad()
-def estimate_intrinsics_and_depth(points: torch.Tensor):
-    """
-    Estimate intrinsics K (fx, fy, cx, cy, zero skew) from points in camera coords,
-    and also return per-pixel depths.
-
-    Args:
-        points: (B, H, W, 3)  3D points expressed in the CAMERA frame
-                              (i = row = y, j = col = x).
-                              Last dimension = (X, Y, Z).
-
-    Returns:
-        K:      (B, 3, 3) intrinsics matrix for each camera
-        depth:  (B, H, W) depth = Z coordinate (positive forward)
-    """
-    B, H, W, _ = points.shape
-    device = points.device
-    # Pixel grids: u = x (cols), v = y (rows)
-    u_grid = torch.arange(W, device=device, dtype=torch.float).view(1, 1, W).expand(B, H, W)
-    v_grid = torch.arange(H, device=device, dtype=torch.float).view(1, H, 1).expand(B, H, W)
-
-    X = points[..., 0]
-    Y = points[..., 1]
-    Z = points[..., 2]   # depth map
-
-    # Valid mask
-    valid = torch.isfinite(Z) & (Z > 1e-6)
-
-    # Prepare outputs
-    K = torch.zeros((B, 3, 3), dtype=points.dtype, device=device)
-    K[:, 2, 2] = 1.0
-
-    for b in range(B):
-        m = valid[b]
-        if m.sum().item() < 4:
-            K[b] = torch.full((3, 3), float("nan"), dtype=points.dtype, device=device)
-            K[b, 2, 2] = 1.0
-            continue
-
-        # Build linear systems: u = fx * (X/Z) + cx ; v = fy * (Y/Z) + cy
-        a_u = (X[b][m] / Z[b][m]).unsqueeze(1)
-        a_v = (Y[b][m] / Z[b][m]).unsqueeze(1)
-        A_u = torch.cat([a_u, torch.ones_like(a_u)], dim=1)
-        A_v = torch.cat([a_v, torch.ones_like(a_v)], dim=1)
-
-        u = u_grid[b][m].unsqueeze(1)
-        v = v_grid[b][m].unsqueeze(1)
-
-        sol_u = torch.linalg.lstsq(A_u, u).solution.squeeze(1)
-        sol_v = torch.linalg.lstsq(A_v, v).solution.squeeze(1)
-
-        fx, cx = sol_u[0], sol_u[1]
-        fy, cy = sol_v[0], sol_v[1]
-
-        K[b, 0, 0] = fx
-        K[b, 1, 1] = fy
-        K[b, 0, 2] = cx
-        K[b, 1, 2] = cy
-
-    return K, Z   # Z is the depth map
-
-
-
-def convert_to_homogeneous_matrix(input: torch.Tensor):
-    if len(input.shape) == 2:
-        # No batch dimension
-        return torch.cat([input, torch.tensor([0, 0, 0, 1]).reshape(1, 4).to(input.device)])
-
-    elif len(input.shape) == 3:
-        # With batch dimension
-        bs = input.shape[0]
-        homo_part = torch.stack([torch.tensor([0, 0, 0, 1]).reshape(1, 4) for _ in range(bs)]).to(input.device)
-        return torch.cat([input, homo_part], dim=1)
-
-    else:
-        raise ValueError("Input shape incorrect for homogeneous matrix. ")
-
-
-def remove_homogeneous_row(matrix: torch.Tensor) -> torch.Tensor:
-    if len(matrix.shape) == 2:
-        # No batch dimension, shape should be (4, 4)
-        if matrix.shape != (4, 4):
-            raise ValueError("Expected shape (4, 4) for single matrix.")
-        return matrix[:3]
-
-    elif len(matrix.shape) == 3:
-        # With batch dimension, shape should be (B, 4, 4)
-        if matrix.shape[1:] != (4, 4):
-            raise ValueError("Expected shape (B, 4, 4) for batched matrix.")
-        return matrix[:, :3]
-
-    else:
-        raise ValueError("Invalid input shape.")
-    
-
 def output_to_colmap(predictions, img_names, output_dir, image_points2D, points3D, idx=None, format="txt", shared_camera=False):
     name = "colmap" if idx is None else f"colmap_{idx}"
     quaternions, translations = extrinsic_to_colmap_format(predictions['extrinsic'])
@@ -1834,10 +1451,10 @@ def output_to_colmap(predictions, img_names, output_dir, image_points2D, points3
 def write_recon_to_colmap(output_dir, predictions, images, names, stride=100, conf_threshold=50.0, format="txt", shared_camera=False):
     size_hw = images.shape[-2:]
     if "extrinsic" not in predictions.keys():
-        extrinsic, intrinsic = vggt_omega_encoding_to_camera(predictions["pose_enc"], size_hw)
+        extrinsic, intrinsic = decode_vggt_omega_pose(predictions["pose_enc"], size_hw)
         predictions["extrinsic"] = extrinsic
     if "intrinsic" not in predictions.keys():
-        extrinsic, intrinsic = vggt_omega_encoding_to_camera(predictions["pose_enc"], size_hw)
+        extrinsic, intrinsic = decode_vggt_omega_pose(predictions["pose_enc"], size_hw)
         predictions["intrinsic"] = intrinsic
     
     for key in predictions.keys():

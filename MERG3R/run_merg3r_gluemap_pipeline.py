@@ -11,10 +11,9 @@ from algos.alignment import align_extrinsics
 from algos.sequence import create_sequence
 from algos.utils import (
     get_sim_matrix,
-    load_model,
     restore_predictions_order,
-    run_inference_step_by_step,
 )
+from utils.feedforward import load_model, run_inference_step_by_step
 from utils.image_pyramid import (
     build_two_resolution_image_pyramid,
     load_image_tensors_from_dir,
