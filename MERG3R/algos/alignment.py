@@ -2,6 +2,7 @@ import torch
 
 from algos.utils import *
 from algos.sim3utils import weighted_align_point_maps
+from utils.geometry import unproject_depth_map_to_point_map
 
 def align_extrinsics(sequence, ba=False, device='cuda', method='umeyama'):
     if method == 'umeyama':

@@ -4,7 +4,8 @@ from collections import deque, OrderedDict
 import math
 import numpy as np
 
-from algos.utils import convert_to_homogeneous_matrix, remove_homogeneous_row, get_sim_matrix
+from algos.utils import get_sim_matrix
+from utils.geometry import convert_to_homogeneous_matrix, remove_homogeneous_row
 from algos.MST import build_mst
 from algos.shortest_path import most_similar_path
 
