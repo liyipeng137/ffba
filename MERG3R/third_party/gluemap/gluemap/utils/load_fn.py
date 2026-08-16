@@ -1,0 +1,387 @@
+import torch
+import torch.nn.functional as F
+from PIL import Image
+from torchvision import transforms as TF
+
+
+def load_and_preprocess_images_inner(
+    images_ori: list[torch.Tensor],
+    image_size: int = 518,
+    force_square: bool = True,
+    patch_size: int = 14,
+) -> tuple[torch.Tensor, list[torch.Tensor], list[list[float]]]:
+    """Resize and (optionally) pad a batch of (C, H, W) image tensors.
+
+    Each image's longer side is resized to ``image_size`` while preserving
+    aspect ratio, with the shorter side rounded to a multiple of
+    ``patch_size``. When ``force_square`` is set, or when the batch contains
+    images of differing shapes, the resized images are zero-pad-centered to
+    the maximum (H, W) so they can be stacked.
+
+    Args:
+        images_ori: Per-image (C, H, W) float tensors in [0, 1].
+        image_size: Target size for the longer image side.
+        force_square: Pad to a square of side ``image_size``.
+        patch_size: Patch side length the resized images must align to.
+
+    Returns:
+        ``(images, images_ori, images_change)`` where ``images`` is a
+        stacked (N, C, H, W) tensor, ``images_ori`` is the input list
+        echoed back, and each ``images_change[i]`` is
+        ``[scale_x, scale_y, x_offset, y_offset]`` describing how the
+        original image was mapped into the resized/padded grid.
+    """
+    # Check for empty list
+    if len(images_ori) == 0:
+        raise ValueError("At least 1 image is required")
+
+    assert image_size % patch_size == 0, (
+        "Image size must be divisible by patch_size for compatibility with "
+        "model requirements"
+    )
+
+    images = []
+    shapes = set()
+
+    if force_square:
+        shapes.add((image_size, image_size))  # Add square shape for padding
+
+    images_change = []  # (scale_x, scale_y, x_offset, y_offset)
+    # First process all images and collect their shapes
+    for i in range(len(images_ori)):
+        img = images_ori[i].clone()
+
+        # width, height = img.size
+        height, width = img.shape[-2:]
+
+        if width > height:
+            new_width = image_size
+
+            # Calculate height maintaining aspect ratio, divisible by patch_size
+            new_height = (
+                round(height * (new_width / width) / patch_size) * patch_size
+            )
+
+        else:
+            new_height = image_size
+
+            # Calculate width maintaining aspect ratio, divisible by patch_size
+            new_width = (
+                round(width * (new_height / height) / patch_size) * patch_size
+            )
+            shapes.add(
+                (image_size, image_size)
+            )  # since VGGT does not support portrait images, always pad them
+
+        # Resize with new dimensions (width, height)
+        img = F.interpolate(
+            img.unsqueeze(0),
+            size=(int(new_height), int(new_width)),
+            mode="bilinear",
+            align_corners=False,
+        ).squeeze(0)
+
+        shapes.add((img.shape[1], img.shape[2]))
+        images.append(img)
+        images_change.append([new_width / width, new_height / height, 0, 0])
+
+    # Check if we have different shapes
+    if len(shapes) > 1:
+        # Find maximum dimensions
+        max_height = max(shape[0] for shape in shapes)
+        max_width = max(shape[1] for shape in shapes)
+
+        # Pad images if necessary
+        padded_images = []
+        for i, img in enumerate(images):
+            h_padding = max_height - img.shape[1]
+            w_padding = max_width - img.shape[2]
+
+            if h_padding > 0 or w_padding > 0:
+                pad_top = h_padding // 2
+                pad_bottom = h_padding - pad_top
+                pad_left = w_padding // 2
+                pad_right = w_padding - pad_left
+
+                img = torch.nn.functional.pad(
+                    img,
+                    (pad_left, pad_right, pad_top, pad_bottom),
+                    mode="constant",
+                    value=1.0,
+                )
+                images_change[i][-2] += pad_left
+                images_change[i][-1] += pad_top
+
+            padded_images.append(img)
+
+        images = padded_images
+
+    images = torch.stack(images)  # concatenate images
+
+    # Ensure correct shape when single image; verify shape is (1, C, H, W)
+    if len(images_ori) == 1 and images.dim() == 3:
+        images = images.unsqueeze(0)
+
+    return images, images_ori, images_change
+
+
+def load_and_preprocess_images(
+    image_path_list: list[str],
+    image_size: int = 518,
+    force_square: bool = True,
+    patch_size: int = 14,
+) -> tuple[torch.Tensor, list[torch.Tensor], list[list[float]]]:
+    """Read images from disk and preprocess them for the multi-view model.
+
+    Loads each image as RGB, converts to a (C, H, W) float tensor, then
+    delegates to :func:`load_and_preprocess_images_inner` for resizing and
+    padding. See that function for the ``images_change`` schema.
+
+    Args:
+        image_path_list: Paths to RGB images (any format readable by PIL).
+        image_size: Target size for the longer image side.
+        force_square: Pad to a square of side ``image_size``.
+        patch_size: Patch side length the resized images must align to.
+
+    Returns:
+        Same triple as :func:`load_and_preprocess_images_inner`.
+    """
+    # Check for empty list
+    if len(image_path_list) == 0:
+        raise ValueError("At least 1 image is required")
+
+    assert image_size % patch_size == 0, (
+        "Image size must be divisible by patch_size for compatibility with "
+        "model requirements"
+    )
+
+    to_tensor = TF.ToTensor()
+
+    images_ori = []
+    # First process all images and collect their shapes
+    for image_path in image_path_list:
+        img = Image.open(image_path).convert("RGB")
+        images_ori.append(to_tensor(img.copy()))
+
+    return load_and_preprocess_images_inner(
+        images_ori,
+        image_size=image_size,
+        force_square=force_square,
+        patch_size=patch_size,
+    )
+
+
+def load_and_preprocess_images_1024(
+    images_ori: list[torch.Tensor],
+) -> tuple[torch.Tensor, list[list[float]]]:
+    """Resize and pad a batch of images to a 1024x1024 canvas.
+
+    Variant of :func:`load_and_preprocess_images_inner` that always pads to
+    1024 and does not enforce divisibility by a patch size. Used for the
+    high-resolution VGGSfM tracker.
+
+    Args:
+        images_ori: Per-image (C, H, W) float tensors in [0, 1].
+
+    Returns:
+        ``(images, images_change)`` where ``images`` is a stacked
+        (N, C, 1024, 1024) tensor and each ``images_change[i]`` is
+        ``[scale_x, scale_y, x_offset, y_offset]``. Note that, unlike
+        :func:`load_and_preprocess_images_inner`, the original images are
+        not echoed back.
+    """
+    N = len(images_ori)
+    # Check for empty list
+    if len(images_ori) == 0:
+        raise ValueError("At least 1 image is required")
+
+    images = []
+    shapes = set()
+
+    # images_ori = []
+    images_change = []  # (scale_x, scale_y, x_offset, y_offset)
+    # First process all images and collect their shapes
+    for i in range(N):
+        # img = Image.open(image_path).convert("RGB")
+        # images_ori.append(to_tensor(img.copy()))
+        img = images_ori[i].clone()
+
+        # width, height = img.size
+        height, width = img.shape[1:3]
+
+        if width > height:
+            new_width = 1024
+
+            # Calculate height maintaining aspect ratio, divisible by 14
+            new_height = round(height * (new_width / width))
+
+        else:
+            new_height = 1024
+
+            # Calculate width maintaining aspect ratio, divisible by 14
+            new_width = round(width * (new_height / height))
+
+        shapes.add(
+            (1024, 1024)
+        )  # since VGGT does not support portrait images, always pad them
+
+        # Resize with new dimensions (width, height)
+        img = F.interpolate(
+            img.unsqueeze(0),
+            size=(int(new_height), int(new_width)),
+            mode="bilinear",
+            align_corners=False,
+        ).squeeze(0)
+
+        shapes.add((img.shape[1], img.shape[2]))
+        images.append(img)
+        images_change.append([new_width / width, new_height / height, 0, 0])
+
+    # Check if we have different shapes
+    # In theory our model can also work well with different shapes
+
+    if len(shapes) > 1:
+        # print(f"Warning: Found images with different shapes: {shapes}")
+        # Find maximum dimensions
+        max_height = max(shape[0] for shape in shapes)
+        max_width = max(shape[1] for shape in shapes)
+
+        # Pad images if necessary
+        padded_images = []
+        for i, img in enumerate(images):
+            h_padding = max_height - img.shape[1]
+            w_padding = max_width - img.shape[2]
+
+            if h_padding > 0 or w_padding > 0:
+                pad_top = h_padding // 2
+                pad_bottom = h_padding - pad_top
+                pad_left = w_padding // 2
+                pad_right = w_padding - pad_left
+
+                img = torch.nn.functional.pad(
+                    img,
+                    (pad_left, pad_right, pad_top, pad_bottom),
+                    mode="constant",
+                    value=1.0,
+                )
+                images_change[i][-2] += pad_left
+                images_change[i][-1] += pad_top
+
+            padded_images.append(img)
+
+        images = padded_images
+
+    images = torch.stack(images)  # concatenate images
+
+    return images, images_change
+
+
+def calculate_image_shapes(
+    images_shape_ori: list[tuple[int, int]],
+    new_shape_hw: tuple[int, int],
+) -> list[list[float]]:
+    """Compute the ``images_change`` table for a target canvas without
+    actually resizing tensors.
+
+    Mirrors the resize-and-pad logic of
+    :func:`load_and_preprocess_images_inner` but operates purely on shapes,
+    so callers can recover the per-image
+    ``[scale_x, scale_y, x_offset, y_offset]`` mapping after the fact.
+    Patch size is inferred from ``new_shape_hw`` (16 if width is 512, else
+    14).
+
+    Args:
+        images_shape_ori: Per-image ``(height, width)`` of the originals.
+        new_shape_hw: Target ``(height, width)`` of the padded canvas.
+
+    Returns:
+        Per-image ``[scale_x, scale_y, x_offset, y_offset]`` rows.
+    """
+    images_change = []
+
+    max_new_shape = max(new_shape_hw[0], new_shape_hw[1])
+
+    patch_size = 16 if new_shape_hw[1] == 512 else 14
+
+    for image_shape in images_shape_ori:
+        height, width = image_shape
+        if width > height:
+            new_width = max_new_shape
+
+            # Calculate height maintaining aspect ratio, divisible by patch_size
+            new_height = (
+                round(height * (new_width / width) / patch_size) * patch_size
+            )
+
+        else:
+            new_height = max_new_shape
+
+            # Calculate width maintaining aspect ratio, divisible by patch_size
+            new_width = (
+                round(width * (new_height / height) / patch_size) * patch_size
+            )
+
+        images_change.append([new_width / width, new_height / height, 0, 0])
+
+        h_padding = new_shape_hw[0] - new_height
+        w_padding = new_shape_hw[1] - new_width
+
+        if h_padding > 0 or w_padding > 0:
+            pad_top = h_padding // 2
+            pad_left = w_padding // 2
+
+            images_change[-1][-2] += pad_left
+            images_change[-1][-1] += pad_top
+
+    return images_change
+
+
+def unify_image_sizes(
+    images_ori: list[torch.Tensor],
+    images_change: list[list[float]],
+) -> tuple[list[torch.Tensor], list[list[float]]]:
+    """Resize a batch of images to the largest (H, W) in the batch.
+
+    Each image is bilinearly resampled to ``(max_height, max_width)`` and
+    its ``[scale_x, scale_y, ...]`` row in ``images_change`` is rescaled
+    accordingly so the original-pixel mapping stays consistent. Both
+    arguments are mutated in place and also returned.
+
+    Args:
+        images_ori: Per-image (C, H, W) tensors; modified in place.
+        images_change: Per-image ``[scale_x, scale_y, x_offset, y_offset]``
+            rows; the scale fields are updated in place.
+
+    Returns:
+        The same ``(images_ori, images_change)`` references, post-mutation.
+    """
+    N = len(images_ori)
+    # Check for empty list
+    if len(images_ori) == 0:
+        raise ValueError("At least 1 image is required")
+
+    max_width = 0
+    max_height = 0
+    for i in range(N):
+        height, width = images_ori[i].shape[1:3]
+
+        max_width = max(max_width, width)
+        max_height = max(max_height, height)
+
+    for i in range(N):
+        img = F.interpolate(
+            images_ori[i].unsqueeze(0),
+            size=(int(max_height), int(max_width)),
+            mode="bilinear",
+            align_corners=False,
+        ).squeeze(0)
+
+        images_change[i][0] = (
+            images_ori[i].shape[2] / max_width * images_change[i][0]
+        )
+        images_change[i][1] = (
+            images_ori[i].shape[1] / max_height * images_change[i][1]
+        )
+        images_ori[i] = img
+
+    return images_ori, images_change

@@ -205,3 +205,12 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+lingbot-map_old/
+gtsam-develop/
+*.json
+LoGeR/
+logs/
+.todelete/
+tapnet/
+*log

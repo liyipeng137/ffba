@@ -1,0 +1,243 @@
+import argparse
+import logging
+import os
+import time
+
+import torch
+from tqdm import tqdm
+
+from gluemap.datasets.utils import get_image_list
+from gluemap.utils.gpu import synchronize
+from gluemap.utils.load_fn import load_and_preprocess_images
+from gluemap.utils.model_loader import load_models
+
+logger = logging.getLogger(__name__)
+
+
+class SaladRetrievalPipeline:
+    """Pipeline object for SALAD-based image retrieval.
+
+    Computes a global descriptor per image and caches it to disk. Follows the
+    same pattern as the other pipeline classes: stable config is stored as
+    instance attributes; per-dataset inputs are passed to ``run()``.
+    """
+
+    def __init__(
+        self,
+        args: argparse.Namespace,
+        world_size: int,
+        rank: int,
+        file_name: str = "salad_descriptors.pt",
+        device: str = "cuda",
+        dtype: torch.dtype = torch.bfloat16,
+        models: dict[str, torch.nn.Module] | None = None,
+    ):
+        self.args = args
+        self.world_size = world_size
+        self.rank = rank
+        self.file_name = file_name
+        self.device = device
+        self.dtype = dtype
+        self.preloaded_models = models
+        self.model = None
+        self.model_loading_time = 0.0
+        self._owns_model = False
+
+    def _load_model(self) -> torch.nn.Module:
+        if self.model is not None:
+            return self.model
+        t0 = time.perf_counter()
+        if (
+            self.preloaded_models is not None
+            and "salad" in self.preloaded_models
+        ):
+            self.model = self.preloaded_models["salad"]
+            self.device = next(self.model.parameters()).device
+        else:
+            loaded, self.device = load_models(self.args, keys={"salad"})
+            self.model = loaded["salad"]
+            self._owns_model = True
+        self.model_loading_time = time.perf_counter() - t0
+        return self.model
+
+    def _release_model(self) -> None:
+        """Free the SALAD model if we own it (i.e. not caller-supplied)."""
+        if not self._owns_model or self.model is None:
+            return
+        del self.model
+        self.model = None
+        self._owns_model = False
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def _maybe_delete_retrieval_cache(self) -> None:
+        """Delete cached descriptor file on ``rerun_from == "retrieval"``."""
+        if getattr(self.args, "rerun_from", None) != "retrieval":
+            return
+        base_path = self.args.curr_processed or self.args.curr_path
+        path = os.path.join(base_path, self.file_name)
+        if os.path.exists(path):
+            os.remove(path)
+            logger.info(f"[rerun_from=retrieval] Deleted {path}")
+
+    @torch.no_grad()
+    def _compute_descriptors(self) -> torch.Tensor:
+        """Compute SALAD descriptors for every image under args.images_path."""
+        model = self._load_model()
+        batch_size = self.args.retrieval_batch_size
+        images_list = get_image_list(self.args.images_path)
+
+        descriptors = []
+        N = len(images_list)
+        for i in tqdm(range(0, N, batch_size)):
+            num_img = min(N - i, batch_size)
+            images, _, _ = load_and_preprocess_images(
+                images_list[i : i + num_img],
+                image_size=322,  # use the fixed 322 size for SALAD retrieval
+                patch_size=14,
+                force_square=True,
+            )
+            output = model(images.to(self.device)).cpu()
+            descriptors.append(output)
+
+        descriptors = torch.cat(descriptors)
+        return descriptors
+
+    def _run_retrieval(self, file_name: str | None = None) -> None:
+        """Compute/persist descriptors, skipping if cached file is reusable."""
+        if file_name is None:
+            file_name = self.file_name
+
+        base_path = self.args.curr_path
+        if self.args.curr_processed:
+            base_path = self.args.curr_processed
+        if not self.args.force_load or not os.path.exists(
+            os.path.join(base_path, file_name)
+        ):
+            if self.rank == 0:
+                logger.info("Computing SALAD descriptors...")
+                descriptors = self._compute_descriptors()
+
+                os.makedirs(base_path, exist_ok=True)
+                torch.save(descriptors, os.path.join(base_path, file_name))
+
+            if self.args.distributed:
+                synchronize()
+
+    def run(
+        self,
+    ) -> tuple[tuple[dict[str, torch.nn.Module | None], str], dict[str, float]]:
+        """Run retrieval on a single image collection.
+
+        Returns:
+            ``((models_dict, device), timing)`` — ``models_dict`` maps
+            ``"salad"`` to the loaded model (or ``None`` if it was released)
+            and ``timing`` contains ``model_loading``, ``image_retrieval`` and
+            ``total`` seconds.
+        """
+        self._maybe_delete_retrieval_cache()
+
+        t0 = time.perf_counter()
+        self._run_retrieval()
+        t2 = time.perf_counter()
+
+        # Model loading is now lazy: model_loading_time is 0 on cache hit,
+        # and the time spent inside _load_model() on cache miss. Subtract it
+        # from image_retrieval so the two fields are non-overlapping.
+        retrieval_only = (t2 - t0) - self.model_loading_time
+        timing = {
+            "model_loading": self.model_loading_time,
+            "image_retrieval": retrieval_only,
+            "total": t2 - t0,
+        }
+        if self.rank == 0:
+            logger.info(
+                f"[Profiling] Preprocessing: "
+                f"model_loading={self.model_loading_time:.2f}s, "
+                f"image_retrieval={retrieval_only:.2f}s, total={t2 - t0:.2f}s"
+            )
+
+        self._release_model()
+        return ({"salad": self.model}, self.device), timing
+
+    def run_multi(
+        self, datasets: list[str]
+    ) -> tuple[
+        tuple[dict[str, torch.nn.Module | None], str],
+        dict[str, float | dict[str, float]],
+    ]:
+        """Run retrieval across multiple sub-datasets (LAMAR-style layout).
+
+        Each entry in ``datasets`` is treated as a subdirectory under
+        ``args.images_path``; per-dataset timing is reported under
+        ``image_retrieval_per_dataset``.
+        """
+        t0 = time.perf_counter()
+
+        images_path_root = self.args.images_path
+        retrieval_times = {}
+        for dataset in datasets:
+            self.args.images_path = f"{images_path_root}/{dataset}"
+            self.args.curr_path = f"{self.args.write_path}/{dataset}"
+            self._maybe_delete_retrieval_cache()
+            t_ds_start = time.perf_counter()
+            self._run_retrieval()
+            t_ds_end = time.perf_counter()
+            retrieval_times[dataset] = t_ds_end - t_ds_start
+
+        # Restore original paths
+        self.args.images_path = images_path_root
+        self.args.curr_processed = self.args.write_path
+        self.args.curr_path = self.args.write_path
+
+        t2 = time.perf_counter()
+        # Model loading is lazy and happens on the first cache-miss dataset.
+        # Subtract it from that dataset's retrieval time so the per-dataset
+        # numbers reflect pure retrieval cost.
+        retrieval_total = (
+            sum(retrieval_times.values()) - self.model_loading_time
+        )
+        timing = {
+            "model_loading": self.model_loading_time,
+            "image_retrieval": retrieval_total,
+            "image_retrieval_per_dataset": retrieval_times,
+            "total": t2 - t0,
+        }
+        if self.rank == 0:
+            logger.info(
+                f"[Profiling] Preprocessing multi: "
+                f"model_loading={self.model_loading_time:.2f}s, "
+                f"image_retrieval={retrieval_total:.2f}s, total={t2 - t0:.2f}s"
+            )
+
+        self._release_model()
+        return ({"salad": self.model}, self.device), timing
+
+
+def run_preprocessing_pipeline(
+    args: argparse.Namespace,
+    world_size: int,
+    rank: int,
+    file_name: str = "salad_descriptors.pt",
+    models: dict[str, torch.nn.Module] | None = None,
+):
+    """Instantiate ``SaladRetrievalPipeline`` and run it on one collection."""
+    pipeline = SaladRetrievalPipeline(
+        args, world_size, rank, file_name, models=models
+    )
+    return pipeline.run()
+
+
+def run_preprocessing_pipeline_multi(
+    args: argparse.Namespace,
+    world_size: int,
+    rank: int,
+    datasets: list[str],
+    file_name: str = "salad_descriptors.pt",
+    models: dict[str, torch.nn.Module] | None = None,
+):
+    """Instantiate ``SaladRetrievalPipeline`` and run across sub-datasets."""
+    pipeline = SaladRetrievalPipeline(
+        args, world_size, rank, file_name, models=models
+    )
+    return pipeline.run_multi(datasets)

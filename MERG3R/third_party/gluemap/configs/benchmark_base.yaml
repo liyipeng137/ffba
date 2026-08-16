@@ -1,0 +1,23 @@
+# Shared defaults for GLUEMAP benchmark configs.
+# Layers benchmark/evaluation knobs on top of configs/base.yaml.
+# Concrete benchmark configs inherit with: _base_: "benchmark_base.yaml".
+
+_base_: base.yaml
+
+# Ablation flags (consumed by benchmark/run_benchmark.py:_select_pipeline)
+skip_back_and_forth: false
+backbone_ablation: false
+track_ablation: false
+track_modes: ["SPV"]
+direct_inference: false
+
+# Benchmark control (structural — not forwarded as pipeline args)
+benchmark:
+  continue_on_error: true
+  preload_models: true
+
+# Evaluation settings
+evaluation:
+  pose_thresholds: [3, 10, 30]
+  error_metric: pose   # pose | rotation | translation
+  use_evo: false
