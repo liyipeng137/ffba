@@ -29,6 +29,7 @@ class GluemapSpvRefineConfig:
     neighbors_per_center: int = 25
     pair_pose_rotation_threshold: float = 30.0
     vggsfm_group_strategy: str = GROUP_STRATEGY
+    vggsfm_group_batch_size: int = 2
     projected_overlap_dino_candidates: int = 30
     projected_overlap_samples: int = 2048
     projected_overlap_reproj_threshold: float = 4.0
@@ -84,6 +85,7 @@ def _make_refine_args(config: GluemapSpvRefineConfig):
         neighbors_per_center=config.neighbors_per_center,
         pair_pose_rotation_threshold=config.pair_pose_rotation_threshold,
         group_strategy=config.vggsfm_group_strategy,
+        vggsfm_group_batch_size=config.vggsfm_group_batch_size,
         skip_doppelgangers=True,
         valid_dg_threshold=0.8,
         star_sequential_window=0,
@@ -600,6 +602,7 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
         args,
         "Running VGGSfM prior tracking: "
         f"group_strategy={args.group_strategy}, "
+        f"group_batch_size={args.vggsfm_group_batch_size}, "
         f"neighbors_per_center={args.neighbors_per_center}, "
         f"query_points={args.vggsfm_query_points}, "
         f"query_source={QUERY_SOURCE}, tracker_input={TRACKER_INPUT}",

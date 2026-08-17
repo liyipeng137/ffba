@@ -1700,6 +1700,9 @@ def run_vggsfm_prior_tracks(
 ):
     if not args.path_tracker:
         raise ValueError("--path_tracker is required")
+    group_batch_size = int(getattr(args, "vggsfm_group_batch_size", 1))
+    if group_batch_size <= 0:
+        raise ValueError("vggsfm_group_batch_size must be >= 1")
 
     _ensure_gluemap_imports()
     from vggsfm.vggsfm_tracker import TrackerPredictor  # noqa: PLC0415
@@ -1723,7 +1726,6 @@ def run_vggsfm_prior_tracks(
             centers=centers,
             viewing_axes=viewing_axes,
         )
-    tracks = []
     observations = 0
     tracker_images, tracker_image_changes, tracker_stats = (
         prepare_vggsfm_tracker_images(args, images)
@@ -1781,119 +1783,215 @@ def run_vggsfm_prior_tracks(
     total_queries = 0
     valid_center_queries = 0
     attempted_query_views = 0
-    track_lengths = []
+    tracks_by_group = {}
+    track_lengths_by_group = {}
     t_group = time.time()
-    for group in groups:
-        center = group[0]
+    tracking_buckets = defaultdict(list)
+    zero_query_centers = []
+    for group_order, group in enumerate(groups):
+        group = [int(image_idx) for image_idx in group]
+        center = int(group[0])
         query_np = sample_query_points(
             query_points_per_image[center], args.vggsfm_query_points
         )
         if query_np.shape[0] == 0:
+            zero_query_centers.append(center)
             continue
         num_queries = int(query_np.shape[0])
         total_queries += num_queries
         attempted_query_views += num_queries * max(len(group) - 1, 0)
-        group_tensor = tracker_images[group].unsqueeze(0)
-        if args.vggsfm_fine_tracking:
-            group_tensor = group_tensor.to(tracker_device)
-        group_fmaps = (
-            tracker_fmaps[group]
-            .unsqueeze(0)
-            .to(
+        tracking_buckets[(len(group), num_queries)].append(
+            (group_order, group, query_np)
+        )
+
+    bucket_stats = []
+    num_forward_calls = 0
+    effective_batch_size_histogram = defaultdict(int)
+    for bucket_index, ((group_size, query_count), jobs) in enumerate(
+        sorted(tracking_buckets.items()),
+        start=1,
+    ):
+        group_count = len(jobs)
+        batch_count = (group_count + group_batch_size - 1) // group_batch_size
+        tail_batch_size = group_count % group_batch_size or min(
+            group_batch_size, group_count
+        )
+        bucket_stat = {
+            "bucket_index": int(bucket_index),
+            "group_size": int(group_size),
+            "neighbors_per_group": int(group_size - 1),
+            "query_points": int(query_count),
+            "group_count": int(group_count),
+            "batch_count": int(batch_count),
+            "tail_batch_size": int(tail_batch_size),
+        }
+        bucket_stats.append(bucket_stat)
+        debug(
+            args,
+            "VGGSfM batch bucket "
+            f"{bucket_index}/{len(tracking_buckets)}: "
+            f"group_size={group_size}, query_points={query_count}, "
+            f"groups={group_count}, batches={batch_count}, "
+            f"tail_batch_size={tail_batch_size}",
+        )
+
+    debug(
+        args,
+        "VGGSfM batch bucketing done: "
+        f"buckets={len(bucket_stats)}, batch_size={group_batch_size}, "
+        f"runnable_groups={sum(len(jobs) for jobs in tracking_buckets.values())}, "
+        f"zero_query_groups={len(zero_query_centers)}, "
+        f"query_points_per_bucket="
+        f"{[item['query_points'] for item in bucket_stats]}",
+    )
+
+    h, w = metadata["image_size_hw"]
+    for (group_size, query_count), jobs in sorted(tracking_buckets.items()):
+        for batch_start in range(0, len(jobs), group_batch_size):
+            batch_jobs = jobs[batch_start : batch_start + group_batch_size]
+            actual_batch_size = len(batch_jobs)
+            num_forward_calls += 1
+            effective_batch_size_histogram[actual_batch_size] += 1
+
+            group_indices_np = np.asarray(
+                [group for _group_order, group, _query_np in batch_jobs],
+                dtype=np.int64,
+            )
+            tracker_image_indices = torch.as_tensor(
+                group_indices_np,
+                dtype=torch.long,
+                device=tracker_images.device,
+            )
+            group_tensor = tracker_images[tracker_image_indices]
+            if args.vggsfm_fine_tracking:
+                group_tensor = group_tensor.to(tracker_device)
+            tracker_fmap_indices = torch.as_tensor(
+                group_indices_np,
+                dtype=torch.long,
+                device=tracker_fmaps.device,
+            )
+            group_fmaps = tracker_fmaps[tracker_fmap_indices].to(
                 device=tracker_device,
                 dtype=tracker_dtype,
                 non_blocking=True,
             )
-        )
-        query = (
-            torch.from_numpy(query_np)
-            .to(tracker_device, dtype=torch.float32)
-            .unsqueeze(0)
-        )
-        pred_track, _, pred_vis, pred_score = tracker(
-            group_tensor,
-            query,
-            fmaps=group_fmaps,
-            fine_tracking=args.vggsfm_fine_tracking,
-        )
-        del group_fmaps
-        pred_track = pred_track[0].detach().cpu().numpy()
-        pred_vis = pred_vis[0].detach().cpu().numpy()
-        pred_score = pred_score[0].detach().cpu().numpy()
-
-        h, w = metadata["image_size_hw"]
-        center_points = query_np.astype(np.float32, copy=True)
-        if tracker_image_changes is not None:
-            center_points = invert_image_change(
-                center_points, tracker_image_changes[center]
+            query = torch.from_numpy(
+                np.stack([query_np for _group_order, _group, query_np in batch_jobs])
+            ).to(tracker_device, dtype=torch.float32)
+            pred_track_batch, _, pred_vis_batch, pred_score_batch = tracker(
+                group_tensor,
+                query,
+                fmaps=group_fmaps,
+                fine_tracking=args.vggsfm_fine_tracking,
             )
-        center_valid = (
-            (center_points[:, 0] >= 0)
-            & (center_points[:, 0] < w)
-            & (center_points[:, 1] >= 0)
-            & (center_points[:, 1] < h)
-        )
-        valid_center_queries += int(center_valid.sum())
+            del group_fmaps, group_tensor, query
+            pred_track_batch = pred_track_batch.detach().cpu().numpy()
+            pred_vis_batch = pred_vis_batch.detach().cpu().numpy()
+            pred_score_batch = pred_score_batch.detach().cpu().numpy()
 
-        accepted_neighbor_masks = {}
-        mapped_neighbor_tracks = {}
-        for local_idx, image_idx in enumerate(group[1:], start=1):
-            rank_stats = neighbor_rank_stats[local_idx - 1]
-            rank_stats["pairs_executed"] += 1
-            rank_stats["attempted_queries"] += num_queries
+            for batch_index, (group_order, group, query_np) in enumerate(batch_jobs):
+                center = int(group[0])
+                num_queries = int(query_np.shape[0])
+                pred_track = pred_track_batch[batch_index]
+                pred_vis = pred_vis_batch[batch_index]
+                pred_score = pred_score_batch[batch_index]
 
-            visibility_values = np.asarray(pred_vis[local_idx]).reshape(-1)
-            score_values = np.asarray(pred_score[local_idx]).reshape(-1)
-            if (
-                visibility_values.size != num_queries
-                or score_values.size != num_queries
-            ):
-                raise ValueError(
-                    "VGGSfM visibility/score output does not match query count: "
-                    f"queries={num_queries}, visibility={visibility_values.shape}, "
-                    f"score={score_values.shape}"
+                center_points = query_np.astype(np.float32, copy=True)
+                if tracker_image_changes is not None:
+                    center_points = invert_image_change(
+                        center_points, tracker_image_changes[center]
+                    )
+                center_valid = (
+                    (center_points[:, 0] >= 0)
+                    & (center_points[:, 0] < w)
+                    & (center_points[:, 1] >= 0)
+                    & (center_points[:, 1] < h)
                 )
-            visibility_pass = visibility_values >= args.vggsfm_vis_threshold
-            score_pass = visibility_pass & (score_values >= args.vggsfm_score_threshold)
-            neighbor_points = pred_track[local_idx].astype(np.float32, copy=True)
-            if tracker_image_changes is not None:
-                neighbor_points = invert_image_change(
-                    neighbor_points,
-                    tracker_image_changes[int(image_idx)],
-                )
-            in_bounds_pass = (
-                score_pass
-                & (neighbor_points[:, 0] >= 0)
-                & (neighbor_points[:, 0] < w)
-                & (neighbor_points[:, 1] >= 0)
-                & (neighbor_points[:, 1] < h)
-            )
-            accepted = in_bounds_pass & center_valid
+                valid_center_queries += int(center_valid.sum())
 
-            rank_stats["visibility_pass"] += int(visibility_pass.sum())
-            rank_stats["score_pass"] += int(score_pass.sum())
-            rank_stats["in_bounds_pass"] += int(in_bounds_pass.sum())
-            rank_stats["accepted_observations"] += int(accepted.sum())
-            if accepted.any():
-                rank_stats["pairs_with_accepted_observations"] += 1
-            accepted_neighbor_masks[local_idx] = accepted
-            mapped_neighbor_tracks[local_idx] = neighbor_points
+                accepted_neighbor_masks = {}
+                mapped_neighbor_tracks = {}
+                for local_idx, image_idx in enumerate(group[1:], start=1):
+                    rank_stats = neighbor_rank_stats[local_idx - 1]
+                    rank_stats["pairs_executed"] += 1
+                    rank_stats["attempted_queries"] += num_queries
 
-        for point_idx in range(num_queries):
-            if not center_valid[point_idx]:
-                continue
-            obs = [(center, center_points[point_idx])]
-            for local_idx, image_idx in enumerate(group[1:], start=1):
-                if not accepted_neighbor_masks[local_idx][point_idx]:
-                    continue
-                obs.append(
-                    (int(image_idx), mapped_neighbor_tracks[local_idx][point_idx])
-                )
-            if len(obs) >= 2:
-                observations += len(obs)
-                tracks.append(obs)
-                track_lengths.append(len(obs))
+                    visibility_values = np.asarray(pred_vis[local_idx]).reshape(-1)
+                    score_values = np.asarray(pred_score[local_idx]).reshape(-1)
+                    if (
+                        visibility_values.size != num_queries
+                        or score_values.size != num_queries
+                    ):
+                        raise ValueError(
+                            "VGGSfM visibility/score output does not match query "
+                            f"count: queries={num_queries}, "
+                            f"visibility={visibility_values.shape}, "
+                            f"score={score_values.shape}"
+                        )
+                    visibility_pass = visibility_values >= args.vggsfm_vis_threshold
+                    score_pass = visibility_pass & (
+                        score_values >= args.vggsfm_score_threshold
+                    )
+                    neighbor_points = pred_track[local_idx].astype(
+                        np.float32, copy=True
+                    )
+                    if tracker_image_changes is not None:
+                        neighbor_points = invert_image_change(
+                            neighbor_points,
+                            tracker_image_changes[int(image_idx)],
+                        )
+                    in_bounds_pass = (
+                        score_pass
+                        & (neighbor_points[:, 0] >= 0)
+                        & (neighbor_points[:, 0] < w)
+                        & (neighbor_points[:, 1] >= 0)
+                        & (neighbor_points[:, 1] < h)
+                    )
+                    accepted = in_bounds_pass & center_valid
+
+                    rank_stats["visibility_pass"] += int(visibility_pass.sum())
+                    rank_stats["score_pass"] += int(score_pass.sum())
+                    rank_stats["in_bounds_pass"] += int(in_bounds_pass.sum())
+                    rank_stats["accepted_observations"] += int(accepted.sum())
+                    if accepted.any():
+                        rank_stats["pairs_with_accepted_observations"] += 1
+                    accepted_neighbor_masks[local_idx] = accepted
+                    mapped_neighbor_tracks[local_idx] = neighbor_points
+
+                group_tracks = []
+                group_track_lengths = []
+                for point_idx in range(num_queries):
+                    if not center_valid[point_idx]:
+                        continue
+                    obs = [(center, center_points[point_idx])]
+                    for local_idx, image_idx in enumerate(group[1:], start=1):
+                        if not accepted_neighbor_masks[local_idx][point_idx]:
+                            continue
+                        obs.append(
+                            (
+                                int(image_idx),
+                                mapped_neighbor_tracks[local_idx][point_idx],
+                            )
+                        )
+                    if len(obs) >= 2:
+                        observations += len(obs)
+                        group_tracks.append(obs)
+                        group_track_lengths.append(len(obs))
+                tracks_by_group[group_order] = group_tracks
+                track_lengths_by_group[group_order] = group_track_lengths
+    tracks = []
+    track_lengths = []
+    for group_order in range(len(groups)):
+        tracks.extend(tracks_by_group.get(group_order, []))
+        track_lengths.extend(track_lengths_by_group.get(group_order, []))
     group_tracking_time = time.time() - t_group
+    debug(
+        args,
+        "VGGSfM batch tracking done: "
+        f"forward_calls={num_forward_calls}, "
+        f"effective_batch_size_histogram="
+        f"{dict(sorted(effective_batch_size_histogram.items()))}",
+    )
 
     for rank_stats in neighbor_rank_stats:
         attempted = rank_stats["attempted_queries"]
@@ -1917,6 +2015,18 @@ def run_vggsfm_prior_tracks(
         "num_observations": observations,
         "neighbors_per_center": args.neighbors_per_center,
         "group_strategy": args.group_strategy,
+        "batching": {
+            "configured_batch_size": int(group_batch_size),
+            "num_buckets": int(len(bucket_stats)),
+            "num_forward_calls": int(num_forward_calls),
+            "zero_query_group_count": int(len(zero_query_centers)),
+            "zero_query_centers": [int(center) for center in zero_query_centers],
+            "effective_batch_size_histogram": {
+                str(batch_size): int(count)
+                for batch_size, count in sorted(effective_batch_size_histogram.items())
+            },
+            "buckets": bucket_stats,
+        },
         "group_stats": group_stats,
         "query_points": args.vggsfm_query_points,
         "workload": {

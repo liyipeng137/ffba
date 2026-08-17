@@ -148,6 +148,15 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--vggsfm_group_batch_size",
+        type=int,
+        default=2,
+        help=(
+            "Number of equal-shape VGGSfM groups processed per forward. "
+            "Groups are bucketed by group size and query-point count."
+        ),
+    )
+    parser.add_argument(
         "--export_vggsfm_groups_only",
         action="store_true",
         help=(
@@ -765,6 +774,7 @@ def main():
         neighbors_per_center=args.neighbors_per_center,
         pair_pose_rotation_threshold=args.pair_pose_rotation_threshold,
         vggsfm_group_strategy=args.vggsfm_group_strategy,
+        vggsfm_group_batch_size=args.vggsfm_group_batch_size,
         projected_overlap_dino_candidates=(args.projected_overlap_dino_candidates),
         projected_overlap_samples=args.projected_overlap_samples,
         projected_overlap_reproj_threshold=(args.projected_overlap_reproj_threshold),
