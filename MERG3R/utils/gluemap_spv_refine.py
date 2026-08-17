@@ -28,6 +28,11 @@ class GluemapSpvRefineConfig:
     device: str = "cuda"
     neighbors_per_center: int = 25
     pair_pose_rotation_threshold: float = 30.0
+    vggsfm_group_strategy: str = GROUP_STRATEGY
+    projected_overlap_dino_candidates: int = 30
+    projected_overlap_samples: int = 2048
+    projected_overlap_reproj_threshold: float = 4.0
+    projected_overlap_conf_quantile: float = 0.2
     vggsfm_query_points: int = 1024
     aliked_detection_threshold: float = 0.005
     vggsfm_vis_threshold: float = 0.5
@@ -78,7 +83,7 @@ def _make_refine_args(config: GluemapSpvRefineConfig):
         track_mode="SPV" if use_virtual_tracks else "SP",
         neighbors_per_center=config.neighbors_per_center,
         pair_pose_rotation_threshold=config.pair_pose_rotation_threshold,
-        group_strategy=GROUP_STRATEGY,
+        group_strategy=config.vggsfm_group_strategy,
         skip_doppelgangers=True,
         valid_dg_threshold=0.8,
         star_sequential_window=0,
@@ -563,7 +568,7 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
         "s_database_mode": S_DATABASE_MODE,
         "vggsfm_query_source": QUERY_SOURCE,
         "vggsfm_tracker_input": TRACKER_INPUT,
-        "group_strategy": GROUP_STRATEGY,
+        "group_strategy": args.group_strategy,
         "ba_backend": config.ba_backend,
         "bae_optimize_intrinsics": config.bae_optimize_intrinsics,
         "bae_fix_gauge": config.bae_fix_gauge,
@@ -594,11 +599,47 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
     _debug(
         args,
         "Running VGGSfM prior tracking: "
-        f"group_strategy={GROUP_STRATEGY}, "
+        f"group_strategy={args.group_strategy}, "
         f"neighbors_per_center={args.neighbors_per_center}, "
         f"query_points={args.vggsfm_query_points}, "
         f"query_source={QUERY_SOURCE}, tracker_input={TRACKER_INPUT}",
     )
+    tracking_groups = None
+    tracking_group_stats = None
+    if args.group_strategy == "projected_overlap":
+        if coarse_state.retrieval_sim_matrix is None:
+            raise ValueError(
+                "retrieval_sim_matrix is required when "
+                "vggsfm_group_strategy='projected_overlap'"
+            )
+        t0 = time.time()
+        tracking_groups, tracking_group_stats, _ = ref.build_projected_overlap_groups(
+            pairs=pairs,
+            extrinsic=extrinsic,
+            intrinsics=initial_intrinsics_low_all,
+            depth=coarse_state.raw_depth,
+            depth_conf=coarse_state.raw_depth_conf,
+            retrieval_sim_matrix=coarse_state.retrieval_sim_matrix,
+            max_neighbors=int(args.neighbors_per_center),
+            rotation_threshold=float(args.pair_pose_rotation_threshold),
+            dino_candidates=int(config.projected_overlap_dino_candidates),
+            max_samples=int(config.projected_overlap_samples),
+            reprojection_threshold=float(config.projected_overlap_reproj_threshold),
+            confidence_quantile=float(config.projected_overlap_conf_quantile),
+        )
+        stats["timing"]["vggsfm_group_build"] = time.time() - t0
+        _debug(
+            args,
+            "Built projected-overlap VGGSfM groups: "
+            f"groups={len(tracking_groups)}, "
+            f"group_size={tracking_group_stats['group_size']}",
+        )
+    elif args.group_strategy != "pose":
+        raise ValueError(
+            "vggsfm_group_strategy must be 'pose' or 'projected_overlap', "
+            f"got {args.group_strategy!r}"
+        )
+
     t0 = time.time()
     prior_tracks, prior_stats = ref.run_vggsfm_prior_tracks(
         args,
@@ -608,6 +649,8 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
         metadata,
         extrinsic,
         image_names,
+        groups=tracking_groups,
+        group_stats=tracking_group_stats,
     )
     stats["timing"]["vggsfm_prior_tracks"] = time.time() - t0
     stats["vggsfm"] = prior_stats

@@ -396,6 +396,22 @@ projected-overlap hybrid 的候选池为 rotation-valid pose pairs 与 DINO
 top-30 的并集；排序使用 low-resolution depth 的有向 round-trip
 reprojection overlap，DINO 只用于候选召回。
 
+正式 refinement 使用 projected-overlap group：
+
+```bash
+python run_merg3r_gluemap_pipeline.py \
+  --dataset <images> \
+  --output_dir <output> \
+  --pair_k_pose 25 \
+  --no-pair_pose_fill_unfiltered \
+  --neighbors_per_center 12 \
+  --vggsfm_group_strategy projected_overlap
+```
+
+不传 `--vggsfm_group_strategy` 时仍使用 `pose`，便于和已有结果对照。
+正式 projected-overlap 路径复用下方四个 `--projected_overlap_*` 参数；
+如果 sequence 阶段未产生 DINO similarity matrix，Stage A 会自动补算一次。
+
 如果需要 PLY，可用 COLMAP 自带 converter 从 `points3D` 转出。
 
 ## 常用参数
@@ -421,8 +437,9 @@ reprojection overlap，DINO 只用于候选召回。
 | `--pair_k_similarity` | `0` | 额外按 DINO similarity 选邻居，默认关闭 |
 | `--pair_temporal_window` | `0` | 额外加入时序邻居，默认关闭 |
 | `--path_tracker` | required in practice | VGGSfM tracker checkpoint |
-| `--neighbors_per_center` | `25` | 每个 pose group 的邻居上限；rotation-valid 优先，同层按 camera-center 距离排序，不足时才取 unfiltered/fill 邻居 |
-| `--export_vggsfm_groups_only` | off | Stage A 后导出当前 VGGSfM pose groups、contact sheets、JSON 和人工标签 CSV，然后跳过 tracker/refinement |
+| `--neighbors_per_center` | `25` | 每个 VGGSfM group 的邻居上限；`pose` 策略下 rotation-valid 优先，同层按 camera-center 距离排序 |
+| `--vggsfm_group_strategy` | `pose` | 正式 VGGSfM tracking 的 group 构建策略；可选 `pose` 或 `projected_overlap` |
+| `--export_vggsfm_groups_only` | off | Stage A 后按 audit strategy 导出 VGGSfM groups、contact sheets、JSON 和人工标签 CSV，然后跳过 tracker/refinement |
 | `--vggsfm_group_audit_strategy` | `pose` | `pose`、`projected_overlap` 或 `both`；仅影响 group audit 提前退出模式 |
 | `--projected_overlap_dino_candidates` | `30` | 每个 center 加入 projected-overlap 候选池的 DINO retrieval 数量 |
 | `--projected_overlap_samples` | `2048` | 每个 center 用于有向几何投影的 low-res depth 规则网格采样上限 |

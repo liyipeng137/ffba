@@ -1688,7 +1688,15 @@ def precompute_vggsfm_tracker_fmaps(tracker, args, tracker_images, chunk_size=32
 
 @torch.no_grad()
 def run_vggsfm_prior_tracks(
-    args, images, features, pairs, metadata, extrinsic, image_names
+    args,
+    images,
+    features,
+    pairs,
+    metadata,
+    extrinsic,
+    image_names,
+    groups=None,
+    group_stats=None,
 ):
     if not args.path_tracker:
         raise ValueError("--path_tracker is required")
@@ -1703,15 +1711,18 @@ def run_vggsfm_prior_tracks(
 
     centers = camera_centers_from_w2c(extrinsic)
     viewing_axes = camera_viewing_axes_from_w2c(extrinsic)
-    groups, group_stats = build_vggsfm_groups(
-        args,
-        pairs,
-        images.shape[0],
-        image_names,
-        metadata["image_size_hw"],
-        centers=centers,
-        viewing_axes=viewing_axes,
-    )
+    if (groups is None) != (group_stats is None):
+        raise ValueError("groups and group_stats must be provided together")
+    if groups is None:
+        groups, group_stats = build_vggsfm_groups(
+            args,
+            pairs,
+            images.shape[0],
+            image_names,
+            metadata["image_size_hw"],
+            centers=centers,
+            viewing_axes=viewing_axes,
+        )
     tracks = []
     observations = 0
     tracker_images, tracker_image_changes, tracker_stats = (

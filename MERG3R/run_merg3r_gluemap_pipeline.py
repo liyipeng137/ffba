@@ -59,7 +59,7 @@ class Merg3rCoarseState:
 def parse_args():
     parser = argparse.ArgumentParser(
         "Run the integrated Merg3r + GlueMap pipeline with fixed "
-        "pi3x + SIMPLE_PINHOLE + SIFT + ALIKED + pose groups + SPV."
+        "pi3x + SIMPLE_PINHOLE + SIFT + ALIKED + configurable groups + SPV."
     )
     parser.add_argument("--dataset", type=str, required=True)
     parser.add_argument("--output_dir", type=str, required=True)
@@ -137,11 +137,22 @@ def parse_args():
     )
     parser.add_argument("--neighbors_per_center", type=int, default=25)
     parser.add_argument(
+        "--vggsfm_group_strategy",
+        type=str,
+        default=PIPELINE_GROUP_STRATEGY,
+        choices=["pose", "projected_overlap"],
+        help=(
+            "Group strategy used by formal VGGSfM prior tracking. "
+            "'projected_overlap' ranks the union of rotation-valid pose and "
+            "DINO retrieval candidates using coarse projected overlap."
+        ),
+    )
+    parser.add_argument(
         "--export_vggsfm_groups_only",
         action="store_true",
         help=(
-            "Stop after Stage A and export the current pose-based VGGSfM groups "
-            "as per-center images, contact sheets, JSON, and a label CSV."
+            "Stop after Stage A and export the selected VGGSfM audit groups as "
+            "per-center images, contact sheets, JSON, and a label CSV."
         ),
     )
     parser.add_argument(
@@ -503,14 +514,17 @@ def run_merg3r_coarse_stage(args, output_dir):
         retrieval_sim_matrix = retrieval_sim_matrix.numpy().astype(
             np.float32, copy=False
         )
-    needs_projected_overlap_audit = (
+    needs_projected_overlap = (
         args.export_vggsfm_groups_only
         and args.vggsfm_group_audit_strategy in {"projected_overlap", "both"}
+    ) or (
+        not args.export_vggsfm_groups_only
+        and args.vggsfm_group_strategy == "projected_overlap"
     )
-    if needs_projected_overlap_audit and retrieval_sim_matrix is None:
+    if needs_projected_overlap and retrieval_sim_matrix is None:
         print(
             "[PIPELINE] DINO retrieval matrix was not produced by the sequence "
-            "strategy; computing it for projected-overlap group audit.",
+            "strategy; computing it for projected-overlap VGGSfM groups.",
             flush=True,
         )
         retrieval_sim_matrix = (
@@ -617,7 +631,7 @@ def write_stage_a_summary(output_dir, args, state, timing):
             "s_database_mode": PIPELINE_S_DATABASE_MODE,
             "vggsfm_query_source": PIPELINE_QUERY_SOURCE,
             "vggsfm_tracker_input": PIPELINE_TRACKER_INPUT,
-            "group_strategy": PIPELINE_GROUP_STRATEGY,
+            "group_strategy": args.vggsfm_group_strategy,
             "track_mode": PIPELINE_TRACK_MODE,
         },
         "low_image_names": state.low_image_names,
@@ -679,7 +693,7 @@ def main():
                     "s_database_mode": PIPELINE_S_DATABASE_MODE,
                     "vggsfm_query_source": PIPELINE_QUERY_SOURCE,
                     "vggsfm_tracker_input": PIPELINE_TRACKER_INPUT,
-                    "group_strategy": PIPELINE_GROUP_STRATEGY,
+                    "group_strategy": args.vggsfm_group_strategy,
                     "track_mode": PIPELINE_TRACK_MODE,
                 },
                 "args": vars(args),
@@ -750,6 +764,11 @@ def main():
         device=args.device,
         neighbors_per_center=args.neighbors_per_center,
         pair_pose_rotation_threshold=args.pair_pose_rotation_threshold,
+        vggsfm_group_strategy=args.vggsfm_group_strategy,
+        projected_overlap_dino_candidates=(args.projected_overlap_dino_candidates),
+        projected_overlap_samples=args.projected_overlap_samples,
+        projected_overlap_reproj_threshold=(args.projected_overlap_reproj_threshold),
+        projected_overlap_conf_quantile=args.projected_overlap_conf_quantile,
         vggsfm_query_points=args.vggsfm_query_points,
         aliked_detection_threshold=args.aliked_detection_threshold,
         vggsfm_vis_threshold=args.vggsfm_vis_threshold,
