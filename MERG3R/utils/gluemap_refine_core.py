@@ -1609,8 +1609,9 @@ def precompute_vggsfm_tracker_fmaps(tracker, args, tracker_images, chunk_size=32
     estimated_cache_bytes = None
     fallback_reason = None
 
-    if use_cuda_cache:
-        torch.cuda.empty_cache()
+    # Keep the CUDA allocator cache warm across VGGSfM preprocessing chunks.
+    # if use_cuda_cache:
+    #     torch.cuda.empty_cache()
 
     for start in range(0, num_images, chunk_size):
         end = min(start + chunk_size, num_images)
@@ -1645,7 +1646,7 @@ def precompute_vggsfm_tracker_fmaps(tracker, args, tracker_images, chunk_size=32
                         )
                     except torch.OutOfMemoryError:
                         fallback_reason = "CUDA allocation failed"
-                        torch.cuda.empty_cache()
+                        # torch.cuda.empty_cache()
 
             if tracker_fmaps is None:
                 # Preserve the previous FP32 CPU-cache behavior when the
@@ -1660,8 +1661,9 @@ def precompute_vggsfm_tracker_fmaps(tracker, args, tracker_images, chunk_size=32
 
         tracker_fmaps[start:end].copy_(fmaps_chunk.detach(), non_blocking=True)
         del images_chunk, fmaps_chunk
-        if use_cuda_cache:
-            torch.cuda.empty_cache()
+        # Keep the CUDA allocator cache warm for the next chunk.
+        # if use_cuda_cache:
+        #     torch.cuda.empty_cache()
 
     cache_bytes = tracker_fmaps.numel() * tracker_fmaps.element_size()
     resident_on_tracker_device = tracker_fmaps.device.type == tracker_device.type and (
@@ -1857,14 +1859,14 @@ def run_vggsfm_prior_tracks(
                 [group for _group_order, group, _query_np in batch_jobs],
                 dtype=np.int64,
             )
-            tracker_image_indices = torch.as_tensor(
-                group_indices_np,
-                dtype=torch.long,
-                device=tracker_images.device,
-            )
-            group_tensor = tracker_images[tracker_image_indices]
+            group_tensor = None
             if args.vggsfm_fine_tracking:
-                group_tensor = group_tensor.to(tracker_device)
+                tracker_image_indices = torch.as_tensor(
+                    group_indices_np,
+                    dtype=torch.long,
+                    device=tracker_images.device,
+                )
+                group_tensor = tracker_images[tracker_image_indices].to(tracker_device)
             tracker_fmap_indices = torch.as_tensor(
                 group_indices_np,
                 dtype=torch.long,
