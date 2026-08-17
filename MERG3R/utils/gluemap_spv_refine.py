@@ -267,18 +267,33 @@ def _save_group_contact_sheet(
             border_color=border_color,
         )
         label_y = y0 + tile_image_height + 4
-        _draw_text_safe(
-            draw,
-            (x0, label_y),
-            f"R{rank:02d} idx={image_idx:06d} angle={neighbor['rotation_angle_deg']:.1f}",
-            fill=(235, 235, 235),
-        )
-        _draw_text_safe(
-            draw,
-            (x0, label_y + 17),
-            f"distance={neighbor['camera_center_distance']:.4f}",
-            fill=(190, 190, 190),
-        )
+        if "projected_overlap" in neighbor:
+            _draw_text_safe(
+                draw,
+                (x0, label_y),
+                f"R{rank:02d} idx={image_idx:06d} score={neighbor['projected_overlap']:.3f}",
+                fill=(235, 235, 235),
+            )
+            sources = "+".join(neighbor.get("candidate_sources", []))
+            _draw_text_safe(
+                draw,
+                (x0, label_y + 17),
+                f"grid={neighbor['projected_grid_coverage']:.3f} src={sources}",
+                fill=(190, 190, 190),
+            )
+        else:
+            _draw_text_safe(
+                draw,
+                (x0, label_y),
+                f"R{rank:02d} idx={image_idx:06d} angle={neighbor['rotation_angle_deg']:.1f}",
+                fill=(235, 235, 235),
+            )
+            _draw_text_safe(
+                draw,
+                (x0, label_y + 17),
+                f"distance={neighbor['camera_center_distance']:.4f}",
+                fill=(190, 190, 190),
+            )
 
     contact_sheet_path.parent.mkdir(parents=True, exist_ok=True)
     sheet.save(contact_sheet_path, quality=92)
@@ -290,6 +305,12 @@ def export_vggsfm_groups(
     neighbors_per_center=25,
     pair_pose_rotation_threshold=30.0,
     num_workers=16,
+    selection_strategy="pose",
+    retrieval_sim_matrix=None,
+    projected_overlap_dino_candidates=30,
+    projected_overlap_samples=2048,
+    projected_overlap_reproj_threshold=4.0,
+    projected_overlap_conf_quantile=0.2,
 ):
     """Export the current pose groups for visual inspection, then return."""
     output_dir = Path(output_dir)
@@ -304,23 +325,49 @@ def export_vggsfm_groups(
     pairs = np.asarray(coarse_state.pairs, dtype=np.int64)
     centers = ref.camera_centers_from_w2c(extrinsic)
     viewing_axes = ref.camera_viewing_axes_from_w2c(extrinsic)
-    group_args = SimpleNamespace(
-        neighbors_per_center=int(neighbors_per_center),
-        pair_pose_rotation_threshold=float(pair_pose_rotation_threshold),
-    )
-    groups, group_stats = ref.build_vggsfm_groups(
-        group_args,
-        pairs,
-        len(image_names),
-        image_names,
-        tuple(coarse_state.high_image_size_hw),
-        centers=centers,
-        viewing_axes=viewing_axes,
-    )
+    candidate_details = None
+    if selection_strategy == "pose":
+        group_args = SimpleNamespace(
+            neighbors_per_center=int(neighbors_per_center),
+            pair_pose_rotation_threshold=float(pair_pose_rotation_threshold),
+        )
+        groups, group_stats = ref.build_vggsfm_groups(
+            group_args,
+            pairs,
+            len(image_names),
+            image_names,
+            tuple(coarse_state.high_image_size_hw),
+            centers=centers,
+            viewing_axes=viewing_axes,
+        )
+        audit_name = f"pose_k{int(neighbors_per_center)}"
+    elif selection_strategy == "projected_overlap":
+        if retrieval_sim_matrix is None:
+            raise ValueError(
+                "retrieval_sim_matrix is required for projected-overlap audit"
+            )
+        groups, group_stats, candidate_details = ref.build_projected_overlap_groups(
+            pairs=pairs,
+            extrinsic=extrinsic,
+            intrinsics=np.asarray(coarse_state.intrinsic_low, dtype=np.float64),
+            depth=coarse_state.raw_depth,
+            depth_conf=coarse_state.raw_depth_conf,
+            retrieval_sim_matrix=retrieval_sim_matrix,
+            max_neighbors=int(neighbors_per_center),
+            rotation_threshold=float(pair_pose_rotation_threshold),
+            dino_candidates=int(projected_overlap_dino_candidates),
+            max_samples=int(projected_overlap_samples),
+            reprojection_threshold=float(projected_overlap_reproj_threshold),
+            confidence_quantile=float(projected_overlap_conf_quantile),
+        )
+        audit_name = f"projected_overlap_hybrid_k{int(neighbors_per_center)}"
+    else:
+        raise ValueError(
+            "selection_strategy must be 'pose' or 'projected_overlap', "
+            f"got {selection_strategy!r}"
+        )
 
-    audit_dir = (
-        output_dir / "vggsfm_group_audit" / (f"pose_k{int(neighbors_per_center)}")
-    )
+    audit_dir = output_dir / "vggsfm_group_audit" / audit_name
     groups_dir = audit_dir / "groups"
     contact_sheets_dir = audit_dir / "contact_sheets"
     groups_dir.mkdir(parents=True, exist_ok=True)
@@ -352,20 +399,32 @@ def export_vggsfm_groups(
                     group_dir / filename,
                 )
             )
-            neighbors.append(
-                {
-                    "rank": rank,
-                    "image_index": image_idx,
-                    "work_image_name": image_names[image_idx],
-                    "source_image_name": coarse_state.high_image_names[image_idx],
-                    "rotation_angle_deg": rotation_angle,
-                    "camera_center_distance": distance,
-                    "rotation_valid": rotation_angle < rotation_threshold,
-                    "group_image": str(
-                        (Path("groups") / group_dir.name / filename).as_posix()
-                    ),
-                }
-            )
+            neighbor_entry = {
+                "rank": rank,
+                "image_index": image_idx,
+                "work_image_name": image_names[image_idx],
+                "source_image_name": coarse_state.high_image_names[image_idx],
+                "rotation_angle_deg": rotation_angle,
+                "camera_center_distance": distance,
+                "rotation_valid": rotation_angle < rotation_threshold,
+                "group_image": str(
+                    (Path("groups") / group_dir.name / filename).as_posix()
+                ),
+            }
+            if candidate_details is not None:
+                detail = next(
+                    item
+                    for item in candidate_details[center]
+                    if item["image_index"] == image_idx
+                )
+                neighbor_entry.update(
+                    {
+                        key: value
+                        for key, value in detail.items()
+                        if key not in {"image_index", "selected_rank"}
+                    }
+                )
+            neighbors.append(neighbor_entry)
 
         contact_sheet_path = contact_sheets_dir / f"center_{center:06d}.jpg"
         _save_group_contact_sheet(
@@ -401,7 +460,7 @@ def export_vggsfm_groups(
 
     manifest = {
         "mode": "export_vggsfm_groups_only",
-        "strategy": GROUP_STRATEGY,
+        "strategy": selection_strategy,
         "neighbors_per_center": int(neighbors_per_center),
         "pair_pose_rotation_threshold": rotation_threshold,
         "num_images": len(image_names),
@@ -409,6 +468,26 @@ def export_vggsfm_groups(
         "group_stats": group_stats,
         "groups": group_entries,
     }
+    candidate_scores_path = None
+    if candidate_details is not None:
+        candidate_scores_path = audit_dir / "candidate_scores.json"
+        _write_json(
+            candidate_scores_path,
+            {
+                "strategy": "projected_overlap_hybrid",
+                "centers": [
+                    {
+                        "center_index": int(center),
+                        "center_source_image_name": coarse_state.high_image_names[
+                            center
+                        ],
+                        "candidates": candidate_details[center],
+                    }
+                    for center in sorted(candidate_details)
+                ],
+            },
+        )
+        manifest["candidate_scores"] = str(candidate_scores_path)
     manifest_path = audit_dir / "groups.json"
     _write_json(manifest_path, manifest)
 
@@ -442,8 +521,9 @@ def export_vggsfm_groups(
                     )
 
     print(
-        "[PIPELINE-GROUP-EXPORT] Exported VGGSfM pose groups: "
-        f"groups={len(group_entries)}, audit_dir={audit_dir}, "
+        "[PIPELINE-GROUP-EXPORT] Exported VGGSfM groups: "
+        f"strategy={selection_strategy}, groups={len(group_entries)}, "
+        f"audit_dir={audit_dir}, "
         f"manifest={manifest_path}, labels={labels_path}",
         flush=True,
     )

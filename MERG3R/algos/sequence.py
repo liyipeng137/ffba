@@ -23,6 +23,7 @@ class Sequence(ABC):
         self.images = images
         self.image_names = image_names
         self.device = device
+        self.retrieval_sim_matrix = None
 
     @abstractmethod
     def generate_edges(self):
@@ -342,6 +343,7 @@ class GraphSequence(Sequence):
         super().__init__(image_list, image_names)
         self.max_cluster_size = max_cluster_size
         sim_matrix, feats = get_sim_matrix(self.images, return_feats=True)
+        self.retrieval_sim_matrix = sim_matrix.detach().cpu()
         clusters, adjacency, overlaps, result = build_mst(sim_matrix, feats, max_children=3, max_cluster_size=max_cluster_size, num_overlaps=overlap, min_sim=0.0)
         self.clusters=result
         self.generate_edges()
@@ -460,6 +462,7 @@ class ShortestPath(Sequence):
             return
 
         self.sim_matrix = get_sim_matrix(self.images, alpha=alpha)
+        self.retrieval_sim_matrix = self.sim_matrix.detach().cpu()
         self.path = most_similar_path(self.sim_matrix)
         self.split()
         self.generate_edges()

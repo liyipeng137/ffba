@@ -1206,6 +1206,12 @@ def mnn_from_dino_candidates(
     """
     device = X.device
     M, P, D = X.shape
+    K = min(int(K), max(M - 1, 0))
+    if K == 0:
+        return (
+            torch.zeros((M, M), device=device, dtype=torch.float32),
+            torch.empty((M, 0), device=device, dtype=torch.long),
+        )
 
     # Normalize patch tokens for cosine
     X = F.normalize(X, p=2, dim=-1)

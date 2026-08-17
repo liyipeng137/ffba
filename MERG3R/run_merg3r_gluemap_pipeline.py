@@ -52,6 +52,7 @@ class Merg3rCoarseState:
     pair_graph_stats: dict
     raw_depth: np.ndarray
     raw_depth_conf: np.ndarray | None
+    retrieval_sim_matrix: np.ndarray | None
     image_pyramid: dict | None
 
 
@@ -142,6 +143,41 @@ def parse_args():
             "Stop after Stage A and export the current pose-based VGGSfM groups "
             "as per-center images, contact sheets, JSON, and a label CSV."
         ),
+    )
+    parser.add_argument(
+        "--vggsfm_group_audit_strategy",
+        type=str,
+        default="pose",
+        choices=["pose", "projected_overlap", "both"],
+        help=(
+            "Group strategy exported by --export_vggsfm_groups_only. "
+            "'projected_overlap' uses pose-no-fill plus DINO retrieval "
+            "candidates; 'both' also exports the pose baseline."
+        ),
+    )
+    parser.add_argument(
+        "--projected_overlap_dino_candidates",
+        type=int,
+        default=30,
+        help="Per-center DINO candidates added to the projected-overlap pool.",
+    )
+    parser.add_argument(
+        "--projected_overlap_samples",
+        type=int,
+        default=2048,
+        help="Maximum regular-grid source depth samples per center.",
+    )
+    parser.add_argument(
+        "--projected_overlap_reproj_threshold",
+        type=float,
+        default=4.0,
+        help="Round-trip reprojection threshold in low-resolution pixels.",
+    )
+    parser.add_argument(
+        "--projected_overlap_conf_quantile",
+        type=float,
+        default=0.2,
+        help="Drop the lowest source/target depth-confidence quantile.",
     )
     parser.add_argument("--vggsfm_query_points", type=int, default=1024)
     parser.add_argument("--aliked_detection_threshold", type=float, default=0.005)
@@ -321,6 +357,7 @@ def build_mixed_pairs(
     temporal_window,
     pose_rotation_threshold,
     pose_fill_unfiltered,
+    similarity_matrix=None,
 ):
     n = int(images.shape[0])
     pairs = set()
@@ -331,7 +368,11 @@ def build_mixed_pairs(
                 _add_pair(pairs, i, i + step, n)
 
     if k_similarity > 0 and n > 1:
-        sim_matrix = get_sim_matrix(images).detach().cpu()
+        sim_matrix = similarity_matrix
+        if sim_matrix is None:
+            sim_matrix = get_sim_matrix(images).detach().cpu()
+        else:
+            sim_matrix = torch.as_tensor(sim_matrix).detach().cpu()
         for i in range(n):
             row = sim_matrix[i].clone()
             row[i] = -float("inf")
@@ -457,6 +498,28 @@ def run_merg3r_coarse_stage(args, output_dir):
         alpha=args.alpha,
         splitting_type=args.splitting_type,
     )
+    retrieval_sim_matrix = getattr(sequence, "retrieval_sim_matrix", None)
+    if retrieval_sim_matrix is not None:
+        retrieval_sim_matrix = retrieval_sim_matrix.numpy().astype(
+            np.float32, copy=False
+        )
+    needs_projected_overlap_audit = (
+        args.export_vggsfm_groups_only
+        and args.vggsfm_group_audit_strategy in {"projected_overlap", "both"}
+    )
+    if needs_projected_overlap_audit and retrieval_sim_matrix is None:
+        print(
+            "[PIPELINE] DINO retrieval matrix was not produced by the sequence "
+            "strategy; computing it for projected-overlap group audit.",
+            flush=True,
+        )
+        retrieval_sim_matrix = (
+            get_sim_matrix(low_images, alpha=args.alpha)
+            .detach()
+            .cpu()
+            .numpy()
+            .astype(np.float32, copy=False)
+        )
     batches = sequence.image_split
     for idx, batch in enumerate(batches):
         batches[idx] = batch.to("cpu")
@@ -506,6 +569,7 @@ def run_merg3r_coarse_stage(args, output_dir):
         args.pair_temporal_window,
         args.pair_pose_rotation_threshold,
         args.pair_pose_fill_unfiltered,
+        similarity_matrix=retrieval_sim_matrix,
     )
     pair_graph_stats = summarize_pair_graph(pairs, extrinsic.shape[0])
     raw_depth = _normalize_depth_like(
@@ -535,6 +599,7 @@ def run_merg3r_coarse_stage(args, output_dir):
         pair_graph_stats=pair_graph_stats,
         raw_depth=raw_depth,
         raw_depth_conf=raw_depth_conf,
+        retrieval_sim_matrix=retrieval_sim_matrix,
         image_pyramid=image_pyramid_metadata,
     )
     return state, {"seconds": time.time() - t0}
@@ -571,6 +636,14 @@ def write_stage_a_summary(output_dir, args, state, timing):
             "depth_conf_shape": (
                 list(state.raw_depth_conf.shape)
                 if state.raw_depth_conf is not None
+                else None
+            ),
+        },
+        "retrieval_similarity": {
+            "available": state.retrieval_sim_matrix is not None,
+            "shape": (
+                list(state.retrieval_sim_matrix.shape)
+                if state.retrieval_sim_matrix is not None
                 else None
             ),
         },
@@ -638,16 +711,36 @@ def main():
     )
 
     if args.export_vggsfm_groups_only:
-        manifest_path = export_vggsfm_groups(
-            state,
-            output_dir,
-            neighbors_per_center=args.neighbors_per_center,
-            pair_pose_rotation_threshold=args.pair_pose_rotation_threshold,
-            num_workers=args.image_pyramid_workers,
-        )
+        if args.vggsfm_group_audit_strategy == "both":
+            audit_strategies = ["pose", "projected_overlap"]
+        else:
+            audit_strategies = [args.vggsfm_group_audit_strategy]
+        manifest_paths = []
+        for audit_strategy in audit_strategies:
+            manifest_paths.append(
+                export_vggsfm_groups(
+                    state,
+                    output_dir,
+                    neighbors_per_center=args.neighbors_per_center,
+                    pair_pose_rotation_threshold=(args.pair_pose_rotation_threshold),
+                    num_workers=args.image_pyramid_workers,
+                    selection_strategy=audit_strategy,
+                    retrieval_sim_matrix=state.retrieval_sim_matrix,
+                    projected_overlap_dino_candidates=(
+                        args.projected_overlap_dino_candidates
+                    ),
+                    projected_overlap_samples=args.projected_overlap_samples,
+                    projected_overlap_reproj_threshold=(
+                        args.projected_overlap_reproj_threshold
+                    ),
+                    projected_overlap_conf_quantile=(
+                        args.projected_overlap_conf_quantile
+                    ),
+                )
+            )
         print(
             "[PIPELINE] Group export done; refinement was skipped: "
-            f"manifest={manifest_path}",
+            f"manifests={[str(path) for path in manifest_paths]}",
             flush=True,
         )
         return
