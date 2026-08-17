@@ -71,6 +71,11 @@ def camera_centers_from_w2c(extrinsic):
     )
 
 
+def camera_viewing_axes_from_w2c(extrinsic):
+    rotations_c2w = np.transpose(np.asarray(extrinsic)[:, :3, :3], (0, 2, 1))
+    return rotations_c2w[:, :, -1]
+
+
 def to_homogeneous_w2c(extrinsic):
     extrinsic = np.asarray(extrinsic)
     if extrinsic.shape[-2:] == (4, 4):
@@ -204,6 +209,7 @@ def summarize_numeric(values):
             "min": 0.0,
             "median": 0.0,
             "mean": 0.0,
+            "p90": 0.0,
             "max": 0.0,
         }
     return {
@@ -211,6 +217,33 @@ def summarize_numeric(values):
         "min": float(values.min()),
         "median": float(np.median(values)),
         "mean": float(values.mean()),
+        "max": float(values.max()),
+    }
+
+
+def summarize_distribution(values):
+    values = np.asarray(values, dtype=np.float64)
+    if values.size == 0:
+        return {
+            "count": 0,
+            "min": 0.0,
+            "p10": 0.0,
+            "p25": 0.0,
+            "median": 0.0,
+            "mean": 0.0,
+            "p75": 0.0,
+            "p90": 0.0,
+            "max": 0.0,
+        }
+    return {
+        "count": int(values.size),
+        "min": float(values.min()),
+        "p10": float(np.percentile(values, 10)),
+        "p25": float(np.percentile(values, 25)),
+        "median": float(np.median(values)),
+        "mean": float(values.mean()),
+        "p75": float(np.percentile(values, 75)),
+        "p90": float(np.percentile(values, 90)),
         "max": float(values.max()),
     }
 
@@ -346,6 +379,7 @@ def build_virtual_track_diagnostics(
         )
 
     centers = camera_centers_from_w2c(extrinsic)
+    viewing_axes = camera_viewing_axes_from_w2c(extrinsic)
     groups, group_stats = build_vggsfm_groups(
         args,
         pairs,
@@ -353,6 +387,7 @@ def build_virtual_track_diagnostics(
         image_names,
         image_size_hw,
         centers=centers,
+        viewing_axes=viewing_axes,
     )
     center_set = {group[0] for group in groups}
     skipped_centers = [idx for idx in range(num_images) if idx not in center_set]
@@ -887,15 +922,57 @@ def summarize_groups(groups, num_images):
     }
 
 
-def build_pose_groups(pairs, num_images, neighbors_per_center, centers=None):
+def build_pose_groups(
+    pairs,
+    num_images,
+    neighbors_per_center,
+    centers=None,
+    viewing_axes=None,
+    rotation_threshold=None,
+):
     adjacency = defaultdict(list)
     for i, j in pairs.tolist():
         adjacency[int(i)].append(int(j))
         adjacency[int(j)].append(int(i))
 
+    rotation_cos_threshold = None
+    if viewing_axes is not None and rotation_threshold is not None:
+        viewing_axes = np.asarray(viewing_axes, dtype=np.float64)
+        if viewing_axes.shape != (num_images, 3):
+            raise ValueError(
+                "Expected viewing_axes shape "
+                f"({num_images}, 3), got {viewing_axes.shape}"
+            )
+        if not 0.0 <= rotation_threshold <= 180.0:
+            raise ValueError("rotation_threshold must be in [0, 180] degrees")
+        rotation_cos_threshold = float(np.cos(np.deg2rad(rotation_threshold)))
+
+    def is_unfiltered(center, neighbor):
+        dot = float(np.dot(viewing_axes[center], viewing_axes[neighbor]))
+        return bool(np.clip(dot, -1.0, 1.0) <= rotation_cos_threshold)
+
     groups = []
     for center in range(num_images):
-        if centers is None:
+        if rotation_cos_threshold is not None and centers is not None:
+            neighbors = sorted(
+                set(adjacency.get(center, [])),
+                key=lambda x: (
+                    is_unfiltered(center, x),
+                    float(np.linalg.norm(centers[center] - centers[x])),
+                    abs(x - center),
+                    x,
+                ),
+            )
+        elif rotation_cos_threshold is not None:
+            neighbors = sorted(
+                set(adjacency.get(center, [])),
+                key=lambda x: (
+                    is_unfiltered(center, x),
+                    abs(x - center),
+                    x,
+                ),
+            )
+        elif centers is None:
             neighbors = sorted(
                 set(adjacency.get(center, [])),
                 key=lambda x: (abs(x - center), x),
@@ -922,19 +999,48 @@ def build_vggsfm_groups(
     image_names,
     image_size_hw,
     centers=None,
+    viewing_axes=None,
 ):
+    rotation_threshold = getattr(args, "pair_pose_rotation_threshold", None)
     groups = build_pose_groups(
         pairs,
         num_images,
         args.neighbors_per_center,
         centers=centers,
+        viewing_axes=viewing_axes,
+        rotation_threshold=rotation_threshold,
     )
     stats = {
         "strategy": "pose",
+        "neighbor_order": (
+            "rotation_valid_then_camera_distance"
+            if viewing_axes is not None and rotation_threshold is not None
+            else "camera_distance"
+        ),
+        "pose_rotation_threshold": (
+            float(rotation_threshold) if rotation_threshold is not None else None
+        ),
         "input_pairs": int(np.asarray(pairs).reshape(-1, 2).shape[0]),
         "max_neighbors": int(args.neighbors_per_center),
         **summarize_groups(groups, num_images),
     }
+    if viewing_axes is not None and rotation_threshold is not None:
+        valid_counts = []
+        unfiltered_counts = []
+        for group in groups:
+            center = int(group[0])
+            neighbors = np.asarray(group[1:], dtype=np.int64)
+            if neighbors.size == 0:
+                valid_counts.append(0)
+                unfiltered_counts.append(0)
+                continue
+            dots = np.einsum("j,nj->n", viewing_axes[center], viewing_axes[neighbors])
+            angles = np.rad2deg(np.arccos(np.clip(dots, -1.0, 1.0)))
+            num_valid = int(np.sum(angles < rotation_threshold))
+            valid_counts.append(num_valid)
+            unfiltered_counts.append(int(neighbors.size - num_valid))
+        stats["selected_rotation_valid_neighbors"] = summarize_numeric(valid_counts)
+        stats["selected_unfiltered_neighbors"] = summarize_numeric(unfiltered_counts)
     return groups, stats
 
 
@@ -1032,23 +1138,90 @@ def precompute_vggsfm_tracker_fmaps(tracker, args, tracker_images, chunk_size=32
     if chunk_size <= 0:
         raise ValueError("chunk_size must be >= 1")
 
-    fmaps_chunks = []
     num_images = int(tracker_images.shape[0])
+    tracker_device = torch.device(args.device)
+    use_cuda_cache = tracker_device.type == "cuda"
+    cache_budget_fraction = 0.5
+    tracker_fmaps = None
+    storage_dtype = torch.float32
+    free_cuda_bytes_before_cache = None
+    estimated_cache_bytes = None
+    fallback_reason = None
+
+    if use_cuda_cache:
+        torch.cuda.empty_cache()
+
     for start in range(0, num_images, chunk_size):
         end = min(start + chunk_size, num_images)
-        images_chunk = tracker_images[start:end].to(args.device, non_blocking=True)
+        images_chunk = tracker_images[start:end].to(tracker_device, non_blocking=True)
         fmaps_chunk = tracker.process_images_to_fmaps(images_chunk)
-        fmaps_chunks.append(fmaps_chunk.detach().cpu())
+
+        if tracker_fmaps is None:
+            full_shape = (num_images, *fmaps_chunk.shape[1:])
+            if use_cuda_cache:
+                storage_dtype = (
+                    torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+                )
+                element_size = torch.empty((), dtype=storage_dtype).element_size()
+                estimated_cache_bytes = int(np.prod(full_shape)) * element_size
+                free_cuda_bytes_before_cache, _ = torch.cuda.mem_get_info(
+                    tracker_device
+                )
+                cache_budget_bytes = int(
+                    free_cuda_bytes_before_cache * cache_budget_fraction
+                )
+                if estimated_cache_bytes > cache_budget_bytes:
+                    fallback_reason = (
+                        "estimated compressed fmap cache exceeds 50% of "
+                        "currently free CUDA memory"
+                    )
+                else:
+                    try:
+                        tracker_fmaps = torch.empty(
+                            full_shape,
+                            dtype=storage_dtype,
+                            device=tracker_device,
+                        )
+                    except torch.OutOfMemoryError:
+                        fallback_reason = "CUDA allocation failed"
+                        torch.cuda.empty_cache()
+
+            if tracker_fmaps is None:
+                # Preserve the previous FP32 CPU-cache behavior when the
+                # compressed resident cache would leave too little workspace
+                # for the tracker itself.
+                storage_dtype = torch.float32
+                tracker_fmaps = torch.empty(
+                    full_shape,
+                    dtype=storage_dtype,
+                    device="cpu",
+                )
+
+        tracker_fmaps[start:end].copy_(fmaps_chunk.detach(), non_blocking=True)
         del images_chunk, fmaps_chunk
-        if str(args.device).startswith("cuda"):
+        if use_cuda_cache:
             torch.cuda.empty_cache()
 
-    tracker_fmaps = torch.cat(fmaps_chunks, dim=0)
+    cache_bytes = tracker_fmaps.numel() * tracker_fmaps.element_size()
+    resident_on_tracker_device = tracker_fmaps.device.type == tracker_device.type and (
+        tracker_device.index is None
+        or tracker_fmaps.device.index == tracker_device.index
+    )
     return tracker_fmaps, {
         "enabled": True,
         "chunk_size": int(chunk_size),
         "seconds": time.time() - t0,
         "shape": [int(v) for v in tracker_fmaps.shape],
+        "storage_device": str(tracker_fmaps.device),
+        "storage_dtype": str(tracker_fmaps.dtype).removeprefix("torch."),
+        "resident_on_tracker_device": resident_on_tracker_device,
+        "cache_bytes": int(cache_bytes),
+        "estimated_compressed_cache_bytes": estimated_cache_bytes,
+        "free_cuda_bytes_before_cache": free_cuda_bytes_before_cache,
+        "cuda_cache_budget_fraction": (
+            cache_budget_fraction if use_cuda_cache else None
+        ),
+        "fallback_reason": fallback_reason,
     }
 
 
@@ -1068,6 +1241,7 @@ def run_vggsfm_prior_tracks(
     )
 
     centers = camera_centers_from_w2c(extrinsic)
+    viewing_axes = camera_viewing_axes_from_w2c(extrinsic)
     groups, group_stats = build_vggsfm_groups(
         args,
         pairs,
@@ -1075,6 +1249,7 @@ def run_vggsfm_prior_tracks(
         image_names,
         metadata["image_size_hw"],
         centers=centers,
+        viewing_axes=viewing_axes,
     )
     tracks = []
     observations = 0
@@ -1092,7 +1267,49 @@ def run_vggsfm_prior_tracks(
         args,
         tracker_images,
     )
+    tracker_parameter = next(tracker.parameters())
+    tracker_device = tracker_parameter.device
+    tracker_dtype = tracker_parameter.dtype
 
+    neighbor_rank_stats = [
+        {
+            "rank": rank,
+            "pair_count": 0,
+            "rotation_valid_pairs": 0,
+            "unfiltered_pairs": 0,
+            "unclassified_pairs": 0,
+            "pairs_executed": 0,
+            "pairs_with_accepted_observations": 0,
+            "attempted_queries": 0,
+            "visibility_pass": 0,
+            "score_pass": 0,
+            "in_bounds_pass": 0,
+            "accepted_observations": 0,
+        }
+        for rank in range(1, int(args.neighbors_per_center) + 1)
+    ]
+    rotation_threshold = getattr(args, "pair_pose_rotation_threshold", None)
+    total_neighbor_slots = 0
+    for group in groups:
+        center = int(group[0])
+        total_neighbor_slots += max(len(group) - 1, 0)
+        for rank, image_idx in enumerate(group[1:], start=1):
+            rank_stats = neighbor_rank_stats[rank - 1]
+            rank_stats["pair_count"] += 1
+            if rotation_threshold is None:
+                rank_stats["unclassified_pairs"] += 1
+                continue
+            dot = float(np.dot(viewing_axes[center], viewing_axes[int(image_idx)]))
+            angle = float(np.rad2deg(np.arccos(np.clip(dot, -1.0, 1.0))))
+            if angle < rotation_threshold:
+                rank_stats["rotation_valid_pairs"] += 1
+            else:
+                rank_stats["unfiltered_pairs"] += 1
+
+    total_queries = 0
+    valid_center_queries = 0
+    attempted_query_views = 0
+    track_lengths = []
     t_group = time.time()
     for group in groups:
         center = group[0]
@@ -1101,12 +1318,25 @@ def run_vggsfm_prior_tracks(
         )
         if query_np.shape[0] == 0:
             continue
+        num_queries = int(query_np.shape[0])
+        total_queries += num_queries
+        attempted_query_views += num_queries * max(len(group) - 1, 0)
         group_tensor = tracker_images[group].unsqueeze(0)
         if args.vggsfm_fine_tracking:
-            group_tensor = group_tensor.to(args.device)
-        group_fmaps = tracker_fmaps[group].unsqueeze(0).to(args.device)
+            group_tensor = group_tensor.to(tracker_device)
+        group_fmaps = (
+            tracker_fmaps[group]
+            .unsqueeze(0)
+            .to(
+                device=tracker_device,
+                dtype=tracker_dtype,
+                non_blocking=True,
+            )
+        )
         query = (
-            torch.from_numpy(query_np).to(args.device, dtype=torch.float32).unsqueeze(0)
+            torch.from_numpy(query_np)
+            .to(tracker_device, dtype=torch.float32)
+            .unsqueeze(0)
         )
         pred_track, _, pred_vis, pred_score = tracker(
             group_tensor,
@@ -1119,32 +1349,96 @@ def run_vggsfm_prior_tracks(
         pred_vis = pred_vis[0].detach().cpu().numpy()
         pred_score = pred_score[0].detach().cpu().numpy()
 
-        for point_idx in range(query_np.shape[0]):
-            h, w = metadata["image_size_hw"]
-            center_xy = query_np[point_idx].astype(np.float32)
-            if tracker_image_changes is not None:
-                center_xy = invert_image_change(
-                    center_xy, tracker_image_changes[center]
+        h, w = metadata["image_size_hw"]
+        center_points = query_np.astype(np.float32, copy=True)
+        if tracker_image_changes is not None:
+            center_points = invert_image_change(
+                center_points, tracker_image_changes[center]
+            )
+        center_valid = (
+            (center_points[:, 0] >= 0)
+            & (center_points[:, 0] < w)
+            & (center_points[:, 1] >= 0)
+            & (center_points[:, 1] < h)
+        )
+        valid_center_queries += int(center_valid.sum())
+
+        accepted_neighbor_masks = {}
+        mapped_neighbor_tracks = {}
+        for local_idx, image_idx in enumerate(group[1:], start=1):
+            rank_stats = neighbor_rank_stats[local_idx - 1]
+            rank_stats["pairs_executed"] += 1
+            rank_stats["attempted_queries"] += num_queries
+
+            visibility_values = np.asarray(pred_vis[local_idx]).reshape(-1)
+            score_values = np.asarray(pred_score[local_idx]).reshape(-1)
+            if (
+                visibility_values.size != num_queries
+                or score_values.size != num_queries
+            ):
+                raise ValueError(
+                    "VGGSfM visibility/score output does not match query count: "
+                    f"queries={num_queries}, visibility={visibility_values.shape}, "
+                    f"score={score_values.shape}"
                 )
-            if not (0 <= center_xy[0] < w and 0 <= center_xy[1] < h):
+            visibility_pass = visibility_values >= args.vggsfm_vis_threshold
+            score_pass = visibility_pass & (score_values >= args.vggsfm_score_threshold)
+            neighbor_points = pred_track[local_idx].astype(np.float32, copy=True)
+            if tracker_image_changes is not None:
+                neighbor_points = invert_image_change(
+                    neighbor_points,
+                    tracker_image_changes[int(image_idx)],
+                )
+            in_bounds_pass = (
+                score_pass
+                & (neighbor_points[:, 0] >= 0)
+                & (neighbor_points[:, 0] < w)
+                & (neighbor_points[:, 1] >= 0)
+                & (neighbor_points[:, 1] < h)
+            )
+            accepted = in_bounds_pass & center_valid
+
+            rank_stats["visibility_pass"] += int(visibility_pass.sum())
+            rank_stats["score_pass"] += int(score_pass.sum())
+            rank_stats["in_bounds_pass"] += int(in_bounds_pass.sum())
+            rank_stats["accepted_observations"] += int(accepted.sum())
+            if accepted.any():
+                rank_stats["pairs_with_accepted_observations"] += 1
+            accepted_neighbor_masks[local_idx] = accepted
+            mapped_neighbor_tracks[local_idx] = neighbor_points
+
+        for point_idx in range(num_queries):
+            if not center_valid[point_idx]:
                 continue
-            obs = [(center, center_xy.astype(np.float32))]
+            obs = [(center, center_points[point_idx])]
             for local_idx, image_idx in enumerate(group[1:], start=1):
-                if pred_vis[local_idx, point_idx] < args.vggsfm_vis_threshold:
+                if not accepted_neighbor_masks[local_idx][point_idx]:
                     continue
-                if pred_score[local_idx, point_idx] < args.vggsfm_score_threshold:
-                    continue
-                xy = pred_track[local_idx, point_idx].astype(np.float32)
-                if tracker_image_changes is not None:
-                    xy = invert_image_change(xy, tracker_image_changes[int(image_idx)])
-                if not (0 <= xy[0] < w and 0 <= xy[1] < h):
-                    continue
-                obs.append((int(image_idx), xy))
+                obs.append(
+                    (int(image_idx), mapped_neighbor_tracks[local_idx][point_idx])
+                )
             if len(obs) >= 2:
                 observations += len(obs)
                 tracks.append(obs)
+                track_lengths.append(len(obs))
     group_tracking_time = time.time() - t_group
 
+    for rank_stats in neighbor_rank_stats:
+        attempted = rank_stats["attempted_queries"]
+        for count_key, rate_key in (
+            ("visibility_pass", "visibility_pass_rate"),
+            ("score_pass", "score_pass_rate"),
+            ("in_bounds_pass", "in_bounds_pass_rate"),
+            ("accepted_observations", "accepted_observation_rate"),
+        ):
+            rank_stats[rate_key] = (
+                float(rank_stats[count_key] / attempted) if attempted > 0 else 0.0
+            )
+
+    accepted_neighbor_observations = int(
+        sum(rank["accepted_observations"] for rank in neighbor_rank_stats)
+    )
+    queries_forming_tracks = len(tracks)
     return tracks, {
         "num_groups": len(groups),
         "num_tracks": len(tracks),
@@ -1153,6 +1447,36 @@ def run_vggsfm_prior_tracks(
         "group_strategy": args.group_strategy,
         "group_stats": group_stats,
         "query_points": args.vggsfm_query_points,
+        "workload": {
+            "total_neighbor_slots": int(total_neighbor_slots),
+            "actual_query_points": int(total_queries),
+            "attempted_query_views": int(attempted_query_views),
+        },
+        "neighbor_rank_stats": neighbor_rank_stats,
+        "query_track_stats": {
+            "total_queries": int(total_queries),
+            "valid_center_queries": int(valid_center_queries),
+            "invalid_center_queries": int(total_queries - valid_center_queries),
+            "queries_forming_tracks": int(queries_forming_tracks),
+            "queries_without_accepted_neighbor": int(
+                valid_center_queries - queries_forming_tracks
+            ),
+            "forming_track_rate": (
+                float(queries_forming_tracks / total_queries)
+                if total_queries > 0
+                else 0.0
+            ),
+            "forming_track_rate_valid_centers": (
+                float(queries_forming_tracks / valid_center_queries)
+                if valid_center_queries > 0
+                else 0.0
+            ),
+            "track_length": summarize_distribution(track_lengths),
+            "accepted_neighbor_observations": accepted_neighbor_observations,
+            "observation_count_consistent": bool(
+                accepted_neighbor_observations == observations - len(tracks)
+            ),
+        },
         "precompute_fmaps": fmaps_stats,
         "group_tracking_time": group_tracking_time,
         **tracker_stats,
@@ -1756,6 +2080,7 @@ def summarize_angular_errors_by_track_source(
         bucket["min"] = float(values.min())
         bucket["median"] = float(np.median(values))
         bucket["mean"] = float(values.mean())
+        bucket["p90"] = float(np.percentile(values, 90))
         bucket["max"] = float(values.max())
         bucket["lt_threshold_count"] = int(np.sum(values < error_threshold))
         bucket["lt_threshold_ratio"] = float(bucket["lt_threshold_count"] / values.size)
@@ -1789,12 +2114,15 @@ def log_angular_errors_by_track_source(args, iteration, stats):
             error_summary = (
                 f"mean={bucket['mean']:.4f}, "
                 f"median={bucket['median']:.4f}, "
+                f"p90={bucket['p90']:.4f}, "
                 f"max={bucket['max']:.4f}, "
                 f"<{threshold:g}deg="
                 f"{bucket['lt_threshold_ratio'] * 100:.1f}%"
             )
         else:
-            error_summary = "mean=n/a, median=n/a, max=n/a, " f"<{threshold:g}deg=n/a"
+            error_summary = (
+                "mean=n/a, median=n/a, p90=n/a, max=n/a, " f"<{threshold:g}deg=n/a"
+            )
 
         debug(
             args,
@@ -2310,8 +2638,48 @@ def run_merg3r_augmented_refinement_loop(
         iter_stats["seconds"] = time.time() - t_iter
         stats["iterations"].append(iter_stats)
 
+    if reconstruction is None:
+        final_real_by_source = {
+            "total": 0,
+            "s_only": 0,
+            "p_only": 0,
+            "mixed": 0,
+        }
+        final_angular_errors = {
+            "enabled": False,
+            "reason": "missing reconstruction",
+        }
+    else:
+        s_keypoint_count = build_s_keypoint_count(reconstruction, features)
+        source_counts = classify_tracks_by_s_keypoints(
+            reconstruction,
+            s_keypoint_count,
+        )
+        final_real_by_source = {
+            "total": int(source_counts["total"]),
+            "s_only": int(source_counts["s"]),
+            "p_only": int(source_counts["non_s"]),
+            "mixed": int(source_counts["mixed"]),
+        }
+        if args.filter_reproj_error_type == "angular":
+            t0 = time.time()
+            final_angular_errors = summarize_angular_errors_by_track_source(
+                reconstruction,
+                features,
+                args.filter_reproj_error_threshold,
+            )
+            final_angular_errors["seconds"] = time.time() - t0
+        else:
+            final_angular_errors = {
+                "enabled": False,
+                "reason": "only computed when filter_reproj_error_type=angular",
+            }
+    log_angular_errors_by_track_source(args, "final", final_angular_errors)
+
     stats["final"] = {
         "real": summarize_reconstruction(reconstruction),
+        "real_by_source": final_real_by_source,
+        "angular_errors_by_track_source": final_angular_errors,
         "virtual": summarize_reconstruction(virtual_reconstruction),
     }
     return reconstruction, virtual_reconstruction, stats

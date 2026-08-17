@@ -28,6 +28,7 @@ from utils.gluemap_spv_refine import (
     TRACK_MODE as PIPELINE_TRACK_MODE,
     TRACKER_INPUT as PIPELINE_TRACKER_INPUT,
     GluemapSpvRefineConfig,
+    export_vggsfm_groups,
     run_gluemap_spv_refinement,
 )
 
@@ -134,6 +135,14 @@ def parse_args():
         default="/root/.cache/torch/hub/checkpoints/vggsfm_v2_tracker.pt",
     )
     parser.add_argument("--neighbors_per_center", type=int, default=25)
+    parser.add_argument(
+        "--export_vggsfm_groups_only",
+        action="store_true",
+        help=(
+            "Stop after Stage A and export the current pose-based VGGSfM groups "
+            "as per-center images, contact sheets, JSON, and a label CSV."
+        ),
+    )
     parser.add_argument("--vggsfm_query_points", type=int, default=1024)
     parser.add_argument("--aliked_detection_threshold", type=float, default=0.005)
     parser.add_argument("--vggsfm_vis_threshold", type=float, default=0.5)
@@ -628,10 +637,26 @@ def main():
         f"zero={state.pair_graph_stats['zero_degree_images']}"
     )
 
+    if args.export_vggsfm_groups_only:
+        manifest_path = export_vggsfm_groups(
+            state,
+            output_dir,
+            neighbors_per_center=args.neighbors_per_center,
+            pair_pose_rotation_threshold=args.pair_pose_rotation_threshold,
+            num_workers=args.image_pyramid_workers,
+        )
+        print(
+            "[PIPELINE] Group export done; refinement was skipped: "
+            f"manifest={manifest_path}",
+            flush=True,
+        )
+        return
+
     refine_config = GluemapSpvRefineConfig(
         path_tracker=args.path_tracker,
         device=args.device,
         neighbors_per_center=args.neighbors_per_center,
+        pair_pose_rotation_threshold=args.pair_pose_rotation_threshold,
         vggsfm_query_points=args.vggsfm_query_points,
         aliked_detection_threshold=args.aliked_detection_threshold,
         vggsfm_vis_threshold=args.vggsfm_vis_threshold,

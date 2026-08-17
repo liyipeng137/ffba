@@ -183,6 +183,7 @@ utils/gluemap_refine_core.py
 
 1. 保存 high-resolution work images 到 `<output_dir>/images/`。
 2. 按 pose groups 运行 VGGSfM prior tracking。
+   - tracker coarse fmaps 会优先以 BF16（不支持时 FP16）常驻 GPU，避免每个 pose group 重复从 CPU 搬运；若压缩缓存预计占用超过当前空闲显存的 50%，自动回退到原有 FP32 CPU cache。
 3. 准备 SIFT database。
 4. 统计 SIFT observations 和 prior track observations。
 5. 按观测数量过滤低覆盖帧。
@@ -390,7 +391,8 @@ output/
 | `--pair_k_similarity` | `0` | 额外按 DINO similarity 选邻居，默认关闭 |
 | `--pair_temporal_window` | `0` | 额外加入时序邻居，默认关闭 |
 | `--path_tracker` | required in practice | VGGSfM tracker checkpoint |
-| `--neighbors_per_center` | `25` | 每个 pose group 的邻居数量 |
+| `--neighbors_per_center` | `25` | 每个 pose group 的邻居上限；rotation-valid 优先，同层按 camera-center 距离排序，不足时才取 unfiltered/fill 邻居 |
+| `--export_vggsfm_groups_only` | off | Stage A 后导出当前 VGGSfM pose groups、contact sheets、JSON 和人工标签 CSV，然后跳过 tracker/refinement |
 | `--vggsfm_query_points` | `1024` | prior tracking query 点数 |
 | `--prior_match_topology` | `star` | prior tracks 写入 pair matches 的拓扑 |
 | `--min_frame_observations` | `10` | 低覆盖帧过滤阈值 |
@@ -416,6 +418,10 @@ refined_gluemap_aba/
 - pair graph 是否有 `zero_degree_images`；
 - frame filtering 是否丢掉过多帧；
 - SIFT / prior track observations 是否足够；
+- `vggsfm.neighbor_rank_stats` 中第 13～25 名邻居的通过率和有效 observation；
+- `vggsfm.workload.attempted_query_views` 与 `query_track_stats` 的成轨率、track length；
+- `augmented_refinement.final.real_by_source` 中最终 `p_only` / `mixed` 点数；
+- `augmented_refinement.final.angular_errors_by_track_source` 中最终 P 误差；
 - BAE summary 是否收敛；
 - `refined_gluemap_aba` 中的 registered images 和 points3D 数量是否合理。
 
