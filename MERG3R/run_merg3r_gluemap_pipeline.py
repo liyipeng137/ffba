@@ -15,10 +15,9 @@ from algos.utils import (
 )
 from utils.feedforward import load_model, run_inference_step_by_step
 from utils.image_pyramid import (
-    build_two_resolution_image_pyramid,
+    build_two_resolution_image_tensors,
     load_image_tensors_from_dir,
-    load_matching_high_images,
-    scale_intrinsics_low_to_high,
+    scale_intrinsics_with_pyramid_records,
 )
 from utils.gluemap_spv_refine import (
     CAMERA_MODEL as PIPELINE_CAMERA_MODEL,
@@ -28,6 +27,7 @@ from utils.gluemap_spv_refine import (
     TRACK_MODE as PIPELINE_TRACK_MODE,
     TRACKER_INPUT as PIPELINE_TRACKER_INPUT,
     GluemapSpvRefineConfig,
+    export_vggsfm_groups,
     run_gluemap_spv_refinement,
 )
 
@@ -36,7 +36,6 @@ PIPELINE_MODEL = "pi3x"
 
 @dataclass
 class Merg3rCoarseState:
-    low_images: torch.Tensor
     high_images: torch.Tensor
     low_image_names: list[str]
     high_image_names: list[str]
@@ -51,13 +50,14 @@ class Merg3rCoarseState:
     pair_graph_stats: dict
     raw_depth: np.ndarray
     raw_depth_conf: np.ndarray | None
+    retrieval_sim_matrix: np.ndarray | None
     image_pyramid: dict | None
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
         "Run the integrated Merg3r + GlueMap pipeline with fixed "
-        "pi3x + SIMPLE_PINHOLE + SIFT + ALIKED + pose groups + SPV."
+        "pi3x + SIMPLE_PINHOLE + SIFT + ALIKED + configurable groups + SPV."
     )
     parser.add_argument("--dataset", type=str, required=True)
     parser.add_argument("--output_dir", type=str, required=True)
@@ -75,8 +75,8 @@ def parse_args():
         action=argparse.BooleanOptionalAction,
         default=True,
         help=(
-            "Preprocess the input image directory into low/high resolution "
-            "sets. Low-res images feed MERG3R; high-res images feed SIFT, "
+            "Preprocess the input image directory into in-memory low/high "
+            "tensors. Low-res images feed MERG3R; high-res images feed SIFT, "
             "VGGSfM prior, refinement, and final outputs."
         ),
     )
@@ -134,6 +134,69 @@ def parse_args():
         default="/root/.cache/torch/hub/checkpoints/vggsfm_v2_tracker.pt",
     )
     parser.add_argument("--neighbors_per_center", type=int, default=25)
+    parser.add_argument(
+        "--vggsfm_group_strategy",
+        type=str,
+        default=PIPELINE_GROUP_STRATEGY,
+        choices=["pose", "projected_overlap"],
+        help=(
+            "Group strategy used by formal VGGSfM prior tracking. "
+            "'projected_overlap' ranks the union of rotation-valid pose and "
+            "DINO retrieval candidates using coarse projected overlap."
+        ),
+    )
+    parser.add_argument(
+        "--vggsfm_group_batch_size",
+        type=int,
+        default=2,
+        help=(
+            "Number of equal-shape VGGSfM groups processed per forward. "
+            "Groups are bucketed by group size and query-point count."
+        ),
+    )
+    parser.add_argument(
+        "--export_vggsfm_groups_only",
+        action="store_true",
+        help=(
+            "Stop after Stage A and export the selected VGGSfM audit groups as "
+            "per-center images, contact sheets, JSON, and a label CSV."
+        ),
+    )
+    parser.add_argument(
+        "--vggsfm_group_audit_strategy",
+        type=str,
+        default="pose",
+        choices=["pose", "projected_overlap", "both"],
+        help=(
+            "Group strategy exported by --export_vggsfm_groups_only. "
+            "'projected_overlap' uses pose-no-fill plus DINO retrieval "
+            "candidates; 'both' also exports the pose baseline."
+        ),
+    )
+    parser.add_argument(
+        "--projected_overlap_dino_candidates",
+        type=int,
+        default=30,
+        help="Per-center DINO candidates added to the projected-overlap pool.",
+    )
+    parser.add_argument(
+        "--projected_overlap_samples",
+        type=int,
+        default=2048,
+        help="Maximum regular-grid source depth samples per center.",
+    )
+    parser.add_argument(
+        "--projected_overlap_reproj_threshold",
+        type=float,
+        default=4.0,
+        help="Round-trip reprojection threshold in low-resolution pixels.",
+    )
+    parser.add_argument(
+        "--projected_overlap_conf_quantile",
+        type=float,
+        default=0.2,
+        help="Drop the lowest source/target depth-confidence quantile.",
+    )
     parser.add_argument("--vggsfm_query_points", type=int, default=1024)
     parser.add_argument("--aliked_detection_threshold", type=float, default=0.005)
     parser.add_argument("--vggsfm_vis_threshold", type=float, default=0.5)
@@ -305,15 +368,16 @@ def _add_pair(pairs, i, j, n):
 
 
 def build_mixed_pairs(
-    images,
+    num_images,
     extrinsic,
     k_similarity,
     k_pose,
     temporal_window,
     pose_rotation_threshold,
     pose_fill_unfiltered,
+    similarity_matrix=None,
 ):
-    n = int(images.shape[0])
+    n = int(num_images)
     pairs = set()
 
     if temporal_window > 0:
@@ -322,7 +386,12 @@ def build_mixed_pairs(
                 _add_pair(pairs, i, i + step, n)
 
     if k_similarity > 0 and n > 1:
-        sim_matrix = get_sim_matrix(images).detach().cpu()
+        sim_matrix = similarity_matrix
+        if sim_matrix is None:
+            raise ValueError(
+                "similarity_matrix is required when pair_k_similarity > 0"
+            )
+        sim_matrix = torch.as_tensor(sim_matrix).detach().cpu()
         for i in range(n):
             row = sim_matrix[i].clone()
             row[i] = -float("inf")
@@ -385,12 +454,11 @@ def summarize_pair_graph(pairs, num_images):
 def run_merg3r_coarse_stage(args, output_dir):
     t0 = time.time()
     image_pyramid_result = None
-    dataset_for_coarse = args.dataset
     if args.image_pyramid:
         stage2_scale_factor = (
             None if args.stage2_scale_factor == 0 else args.stage2_scale_factor
         )
-        image_pyramid_result = build_two_resolution_image_pyramid(
+        image_pyramid_result = build_two_resolution_image_tensors(
             args.dataset,
             output_dir / "image_pyramid",
             stage1_downscale_n=args.stage1_downscale_n,
@@ -398,31 +466,21 @@ def run_merg3r_coarse_stage(args, output_dir):
             stage2_scale_factor=stage2_scale_factor,
             recursive=args.multi_dirs,
             num_workers=args.image_pyramid_workers,
+            subsample=args.subsample,
+            num_images=args.num_images,
         )
-        dataset_for_coarse = str(image_pyramid_result.low_dir)
-
-    low_images, low_image_names = load_image_tensors_from_dir(
-        dataset_for_coarse,
-        device=args.device,
-        subsample=args.subsample,
-        num_images=args.num_images,
-        recursive=args.multi_dirs,
-    )
-    low_image_size_hw = tuple(int(x) for x in low_images.shape[-2:])
-    if image_pyramid_result is not None:
-        high_images, high_image_names = load_matching_high_images(
-            image_pyramid_result.high_dir,
-            low_image_names,
-            image_pyramid_result.low_dir,
-            device="cpu",
-            num_workers=args.image_pyramid_workers,
-        )
+        low_images = image_pyramid_result.low_images
+        high_images = image_pyramid_result.high_images
+        low_image_names = list(image_pyramid_result.image_names)
+        high_image_names = list(image_pyramid_result.image_names)
+        low_image_size_hw = tuple(int(x) for x in low_images.shape[-2:])
         high_image_size_hw = tuple(int(x) for x in high_images.shape[-2:])
         image_pyramid_metadata = {
             "enabled": True,
+            "materialization": "memory",
             "manifest_path": str(image_pyramid_result.manifest_path),
-            "low_dir": str(image_pyramid_result.low_dir),
-            "high_dir": str(image_pyramid_result.high_dir),
+            "low_dir": None,
+            "high_dir": None,
             "stage1_downscale_n": int(args.stage1_downscale_n),
             "stage1_multiple": int(args.stage1_multiple),
             "num_workers": int(args.image_pyramid_workers),
@@ -433,6 +491,14 @@ def run_merg3r_coarse_stage(args, output_dir):
             ),
         }
     else:
+        low_images, low_image_names = load_image_tensors_from_dir(
+            args.dataset,
+            device="cpu",
+            subsample=args.subsample,
+            num_images=args.num_images,
+            recursive=args.multi_dirs,
+        )
+        low_image_size_hw = tuple(int(x) for x in low_images.shape[-2:])
         high_images = low_images.detach().cpu()
         high_image_names = list(low_image_names)
         high_image_size_hw = low_image_size_hw
@@ -448,6 +514,24 @@ def run_merg3r_coarse_stage(args, output_dir):
         alpha=args.alpha,
         splitting_type=args.splitting_type,
     )
+    retrieval_sim_matrix = getattr(sequence, "retrieval_sim_matrix", None)
+    if retrieval_sim_matrix is not None:
+        retrieval_sim_matrix = retrieval_sim_matrix.numpy().astype(
+            np.float32, copy=False
+        )
+    if retrieval_sim_matrix is None:
+        print(
+            "[PIPELINE] Computing DINO retrieval matrix for all images before "
+            "feed-forward inference.",
+            flush=True,
+        )
+        retrieval_sim_matrix = (
+            get_sim_matrix(low_images, alpha=args.alpha, device=args.device)
+            .detach()
+            .cpu()
+            .numpy()
+            .astype(np.float32, copy=False)
+        )
     batches = sequence.image_split
     for idx, batch in enumerate(batches):
         batches[idx] = batch.to("cpu")
@@ -465,9 +549,14 @@ def run_merg3r_coarse_stage(args, output_dir):
     if args.device.startswith("cuda"):
         torch.cuda.empty_cache()
 
-    for idx, prediction in enumerate(sequence.predictions):
-        prediction["images"] = batches[idx]
+    for prediction in sequence.predictions:
         _as_numpy_prediction(prediction)
+
+    sequence.images = None
+    sequence.image_split = []
+    if image_pyramid_result is not None:
+        image_pyramid_result.low_images = None
+    del batches, low_images
 
     final_predictions, _, _ = align_extrinsics(
         sequence, method=args.alignment_type, ba=False
@@ -477,10 +566,8 @@ def run_merg3r_coarse_stage(args, output_dir):
     extrinsic = _normalize_extrinsic(final_predictions["extrinsic"]).astype(np.float32)
     intrinsic = np.asarray(final_predictions["intrinsic"], dtype=np.float32)
     if image_pyramid_result is not None:
-        intrinsic_high = scale_intrinsics_low_to_high(
+        intrinsic_high = scale_intrinsics_with_pyramid_records(
             intrinsic,
-            low_image_names,
-            image_pyramid_result.low_dir,
             image_pyramid_result.records,
         ).astype(np.float32)
     else:
@@ -490,13 +577,14 @@ def run_merg3r_coarse_stage(args, output_dir):
         dtype=np.int64,
     )
     pairs = build_mixed_pairs(
-        low_images,
+        extrinsic.shape[0],
         extrinsic,
         args.pair_k_similarity,
         args.pair_k_pose,
         args.pair_temporal_window,
         args.pair_pose_rotation_threshold,
         args.pair_pose_fill_unfiltered,
+        similarity_matrix=retrieval_sim_matrix,
     )
     pair_graph_stats = summarize_pair_graph(pairs, extrinsic.shape[0])
     raw_depth = _normalize_depth_like(
@@ -511,7 +599,6 @@ def run_merg3r_coarse_stage(args, output_dir):
         )
 
     state = Merg3rCoarseState(
-        low_images=low_images,
         high_images=high_images,
         low_image_names=list(low_image_names),
         high_image_names=list(high_image_names),
@@ -526,6 +613,7 @@ def run_merg3r_coarse_stage(args, output_dir):
         pair_graph_stats=pair_graph_stats,
         raw_depth=raw_depth,
         raw_depth_conf=raw_depth_conf,
+        retrieval_sim_matrix=retrieval_sim_matrix,
         image_pyramid=image_pyramid_metadata,
     )
     return state, {"seconds": time.time() - t0}
@@ -543,7 +631,7 @@ def write_stage_a_summary(output_dir, args, state, timing):
             "s_database_mode": PIPELINE_S_DATABASE_MODE,
             "vggsfm_query_source": PIPELINE_QUERY_SOURCE,
             "vggsfm_tracker_input": PIPELINE_TRACKER_INPUT,
-            "group_strategy": PIPELINE_GROUP_STRATEGY,
+            "group_strategy": args.vggsfm_group_strategy,
             "track_mode": PIPELINE_TRACK_MODE,
         },
         "low_image_names": state.low_image_names,
@@ -562,6 +650,14 @@ def write_stage_a_summary(output_dir, args, state, timing):
             "depth_conf_shape": (
                 list(state.raw_depth_conf.shape)
                 if state.raw_depth_conf is not None
+                else None
+            ),
+        },
+        "retrieval_similarity": {
+            "available": state.retrieval_sim_matrix is not None,
+            "shape": (
+                list(state.retrieval_sim_matrix.shape)
+                if state.retrieval_sim_matrix is not None
                 else None
             ),
         },
@@ -597,7 +693,7 @@ def main():
                     "s_database_mode": PIPELINE_S_DATABASE_MODE,
                     "vggsfm_query_source": PIPELINE_QUERY_SOURCE,
                     "vggsfm_tracker_input": PIPELINE_TRACKER_INPUT,
-                    "group_strategy": PIPELINE_GROUP_STRATEGY,
+                    "group_strategy": args.vggsfm_group_strategy,
                     "track_mode": PIPELINE_TRACK_MODE,
                 },
                 "args": vars(args),
@@ -628,10 +724,52 @@ def main():
         f"zero={state.pair_graph_stats['zero_degree_images']}"
     )
 
+    if args.export_vggsfm_groups_only:
+        if args.vggsfm_group_audit_strategy == "both":
+            audit_strategies = ["pose", "projected_overlap"]
+        else:
+            audit_strategies = [args.vggsfm_group_audit_strategy]
+        manifest_paths = []
+        for audit_strategy in audit_strategies:
+            manifest_paths.append(
+                export_vggsfm_groups(
+                    state,
+                    output_dir,
+                    neighbors_per_center=args.neighbors_per_center,
+                    pair_pose_rotation_threshold=(args.pair_pose_rotation_threshold),
+                    num_workers=args.image_pyramid_workers,
+                    selection_strategy=audit_strategy,
+                    retrieval_sim_matrix=state.retrieval_sim_matrix,
+                    projected_overlap_dino_candidates=(
+                        args.projected_overlap_dino_candidates
+                    ),
+                    projected_overlap_samples=args.projected_overlap_samples,
+                    projected_overlap_reproj_threshold=(
+                        args.projected_overlap_reproj_threshold
+                    ),
+                    projected_overlap_conf_quantile=(
+                        args.projected_overlap_conf_quantile
+                    ),
+                )
+            )
+        print(
+            "[PIPELINE] Group export done; refinement was skipped: "
+            f"manifests={[str(path) for path in manifest_paths]}",
+            flush=True,
+        )
+        return
+
     refine_config = GluemapSpvRefineConfig(
         path_tracker=args.path_tracker,
         device=args.device,
         neighbors_per_center=args.neighbors_per_center,
+        pair_pose_rotation_threshold=args.pair_pose_rotation_threshold,
+        vggsfm_group_strategy=args.vggsfm_group_strategy,
+        vggsfm_group_batch_size=args.vggsfm_group_batch_size,
+        projected_overlap_dino_candidates=(args.projected_overlap_dino_candidates),
+        projected_overlap_samples=args.projected_overlap_samples,
+        projected_overlap_reproj_threshold=(args.projected_overlap_reproj_threshold),
+        projected_overlap_conf_quantile=args.projected_overlap_conf_quantile,
         vggsfm_query_points=args.vggsfm_query_points,
         aliked_detection_threshold=args.aliked_detection_threshold,
         vggsfm_vis_threshold=args.vggsfm_vis_threshold,

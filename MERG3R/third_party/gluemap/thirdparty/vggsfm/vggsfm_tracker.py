@@ -80,8 +80,9 @@ class TrackerPredictor(nn.Module):
                 batch_num, frame_num, -1, fmaps.shape[-2], fmaps.shape[-1]
             )
 
-            if inference:
-                torch.cuda.empty_cache()
+            # Keep the CUDA allocator cache warm across repeated inference.
+            # if inference:
+            #     torch.cuda.empty_cache()
 
         # Coarse prediction
         coarse_pred_track_lists, pred_vis = self.coarse_predictor(
@@ -92,8 +93,8 @@ class TrackerPredictor(nn.Module):
         )
         coarse_pred_track = coarse_pred_track_lists[-1]
 
-        if inference:
-            torch.cuda.empty_cache()
+        # if inference:
+        #     torch.cuda.empty_cache()
 
         if fine_tracking:
             # Refine the coarse prediction
@@ -106,8 +107,8 @@ class TrackerPredictor(nn.Module):
                 chunk=fine_chunk,
             )
 
-            if inference:
-                torch.cuda.empty_cache()
+            # if inference:
+            #     torch.cuda.empty_cache()
         else:
             fine_pred_track = coarse_pred_track
             pred_score = torch.ones_like(pred_vis)

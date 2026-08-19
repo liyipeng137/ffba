@@ -73,6 +73,21 @@ class BaseTrackerPredictor(nn.Module):
         if not self.fine:
             self.vis_predictor = nn.Sequential(nn.Linear(self.latent_dim, 1))
 
+        # Positional embeddings depend only on the fmap grid and device. They
+        # are shared by every iteration and every group forward.
+        self._pos_embed_cache = {}
+
+    def _get_pos_embed(self, height, width, device):
+        cache_key = (int(height), int(width), device.type, device.index)
+        pos_embed = self._pos_embed_cache.get(cache_key)
+        if pos_embed is None:
+            pos_embed = get_2d_sincos_pos_embed(
+                self.transformer_dim,
+                grid_size=(height, width),
+            ).to(device)
+            self._pos_embed_cache[cache_key] = pos_embed
+        return pos_embed
+
     def forward(
         self, query_points, fmaps=None, iters=4, return_feat=False, down_ratio=1
     ):
@@ -113,6 +128,7 @@ class BaseTrackerPredictor(nn.Module):
         fcorr_fn = CorrBlock(
             fmaps, num_levels=self.corr_levels, radius=self.corr_radius
         )
+        pos_embed = self._get_pos_embed(HH, WW, query_points.device)
 
         coord_preds = []
 
@@ -160,11 +176,6 @@ class BaseTrackerPredictor(nn.Module):
                 pad = torch.zeros_like(flows_emb[..., 0:pad_dim])
                 transformer_input = torch.cat([transformer_input, pad], dim=2)
 
-            # 2D positional embed
-            # TODO: this can be much simplified
-            pos_embed = get_2d_sincos_pos_embed(
-                self.transformer_dim, grid_size=(HH, WW)
-            ).to(query_points.device)
             sampled_pos_emb = sample_features4d(
                 pos_embed.expand(B, -1, -1, -1), coords[:, 0]
             )

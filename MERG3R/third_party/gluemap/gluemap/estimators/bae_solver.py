@@ -1,7 +1,5 @@
 import gc
-import importlib
 import logging
-import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,51 +32,19 @@ class BaeProblemData:
     skipped: dict
 
 
-def _is_relative_to(path: Path, root: Path) -> bool:
-    try:
-        path.relative_to(root)
-    except ValueError:
-        return False
-    return True
-
-
 def _ensure_bae_runtime():
-    third_party_root = Path(__file__).resolve().parents[3]
-    bae_root = third_party_root / "bae"
-    if not (bae_root / "ba_colmap.py").is_file():
-        raise FileNotFoundError(
-            f"Could not find MERG3R/third_party BAE at {bae_root}"
-        )
-
-    bae_root_str = str(bae_root)
-    if not sys.path or sys.path[0] != bae_root_str:
-        sys.path.insert(0, bae_root_str)
-
-    bae_pkg = importlib.import_module("bae")
-    bae_pkg_path = Path(bae_pkg.__file__).resolve()
-    expected_pkg_root = (bae_root / "bae").resolve()
-    if not _is_relative_to(bae_pkg_path, expected_pkg_root):
-        raise ImportError(
-            "Imported the wrong BAE package: "
-            f"{bae_pkg_path}. Expected it under {expected_pkg_root}."
-        )
-
-    ba_colmap = importlib.import_module("ba_colmap")
-    ba_colmap_path = Path(ba_colmap.__file__).resolve()
-    if not _is_relative_to(ba_colmap_path, bae_root.resolve()):
-        raise ImportError(
-            "Imported the wrong ba_colmap module: "
-            f"{ba_colmap_path}. Expected it under {bae_root}."
-        )
-
+    """Load BAE from the active Python environment."""
+    import bae  # noqa: PLC0415
     import pypose as pp  # noqa: PLC0415
     from bae.optim import LM  # noqa: PLC0415
     from bae.utils.pysolvers import PCG  # noqa: PLC0415
     from pypose.autograd.function import psjac  # noqa: PLC0415
 
+    bae_pkg_root = Path(bae.__file__).resolve().parent
+    logger.info("Using BAE runtime from %s", bae_pkg_root)
+
     return SimpleNamespace(
-        bae_root=bae_root,
-        ba_colmap=ba_colmap,
+        bae_root=bae_pkg_root,
         LM=LM,
         PCG=PCG,
         pp=pp,

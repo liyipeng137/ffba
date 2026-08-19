@@ -1206,6 +1206,12 @@ def mnn_from_dino_candidates(
     """
     device = X.device
     M, P, D = X.shape
+    K = min(int(K), max(M - 1, 0))
+    if K == 0:
+        return (
+            torch.zeros((M, M), device=device, dtype=torch.float32),
+            torch.empty((M, 0), device=device, dtype=torch.long),
+        )
 
     # Normalize patch tokens for cosine
     X = F.normalize(X, p=2, dim=-1)
@@ -1317,17 +1323,18 @@ def get_sim_matrix(
         
         resnet_mean = torch.tensor(_RESNET_MEAN, device=device).view(1, 3, 1, 1)
         resnet_std = torch.tensor(_RESNET_STD, device=device).view(1, 3, 1, 1)
-        images_resnet_norm = (images - resnet_mean) / resnet_std
-        
         # Need to split up into subsets because of feature extractor GPU limitations
         num_subsets = (len(images) + subset_size - 1) // subset_size
         frame_feat = torch.empty(size=(0, feature_size), device=device)
         frame_chunks = []
+        non_blocking = images.device.type == "cpu" and images.is_pinned()
         with torch.no_grad():
             for i in range(num_subsets):
-                image_subset = images_resnet_norm[i * subset_size : (i+1) * subset_size]
+                image_subset = images[i * subset_size : (i + 1) * subset_size]
                 if image_subset.shape[0] == 0:
                     continue
+                image_subset = image_subset.to(device, non_blocking=non_blocking)
+                image_subset = (image_subset - resnet_mean) / resnet_std
 
                 if use_hf_dinov3:
                     outputs = model(image_subset)
@@ -1347,7 +1354,7 @@ def get_sim_matrix(
         frame_feat_norm = torch.nn.functional.normalize(frame_feat, p=2, dim=-1)
         frame_feat_norm_mean = torch.mean(frame_feat_norm, dim=1)
         
-        del model, resnet_mean, resnet_std, images_resnet_norm
+        del model, resnet_mean, resnet_std
         sim_matrix = frame_feat_norm_mean @ frame_feat_norm_mean.t()
         sim_matrix = sim_matrix.fill_diagonal_(0)
 

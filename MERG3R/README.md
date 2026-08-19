@@ -123,10 +123,15 @@ Stage A 的结果不直接作为最终 SfM 输出。它主要提供：
 
 作用：
 
-- `low images`：给前馈模型使用，降低显存和推理成本。
-- `high images`：给 SIFT、VGGSfM prior tracking、GlueMap refinement 和最终输出使用。
+- `low images`：在 CPU 内存生成，DINO/Pi3X 按批搬到 GPU；Stage A
+  前馈结束后释放。
+- `high images`：保留在 CPU 内存，供 SIFT、VGGSfM prior tracking、GlueMap
+  refinement 和最终输出按需使用。
+- low/high 中间图片不落盘；`images/` 仍由 `_save_work_images()` 保存一次，供
+  SIFT/pycolmap 和 group audit 使用。
 - `manifest`：记录原图、low 图、high 图之间的 resize/crop/scale 关系。
-- `scale_intrinsics_low_to_high()`：把 Stage A 得到的 low intrinsics 映射到 high 图坐标系。
+- `scale_intrinsics_with_pyramid_records()`：把 Stage A 得到的 low intrinsics
+  映射到 high 图坐标系。
 
 相关参数：
 
@@ -183,6 +188,7 @@ utils/gluemap_refine_core.py
 
 1. 保存 high-resolution work images 到 `<output_dir>/images/`。
 2. 按 pose groups 运行 VGGSfM prior tracking。
+   - tracker coarse fmaps 会优先以 BF16（不支持时 FP16）常驻 GPU，避免每个 pose group 重复从 CPU 搬运；若压缩缓存预计占用超过当前空闲显存的 50%，自动回退到原有 FP32 CPU cache。
 3. 准备 SIFT database。
 4. 统计 SIFT observations 和 prior track observations。
 5. 按观测数量过滤低覆盖帧。
@@ -328,9 +334,7 @@ output/
   refine_stats.json
 
   image_pyramid/
-    low/
-    high/
-    manifest.json
+    image_pyramid_manifest.json
 
   images/
     frame_000000.png
@@ -365,6 +369,52 @@ output/
 <output_dir>/refined_gluemap_aba/
 ```
 
+只审计 VGGSfM group、同时比较 pose baseline 与 projected-overlap hybrid：
+
+```bash
+python run_merg3r_gluemap_pipeline.py \
+  --dataset <images> \
+  --output_dir <output> \
+  --pair_k_pose 25 \
+  --no-pair_pose_fill_unfiltered \
+  --neighbors_per_center 12 \
+  --export_vggsfm_groups_only \
+  --vggsfm_group_audit_strategy both
+```
+
+该模式在相同 Stage A 结果上输出：
+
+```text
+vggsfm_group_audit/
+  pose_k12/
+  projected_overlap_hybrid_k12/
+    groups.json
+    candidate_scores.json
+    labels.csv
+    contact_sheets/
+    groups/
+```
+
+projected-overlap hybrid 的候选池为 rotation-valid pose pairs 与 DINO
+top-30 的并集；排序使用 low-resolution depth 的有向 round-trip
+reprojection overlap，DINO 只用于候选召回。
+
+正式 refinement 使用 projected-overlap group：
+
+```bash
+python run_merg3r_gluemap_pipeline.py \
+  --dataset <images> \
+  --output_dir <output> \
+  --pair_k_pose 25 \
+  --no-pair_pose_fill_unfiltered \
+  --neighbors_per_center 12 \
+  --vggsfm_group_strategy projected_overlap
+```
+
+不传 `--vggsfm_group_strategy` 时仍使用 `pose`，便于和已有结果对照。
+正式 projected-overlap 路径复用下方四个 `--projected_overlap_*` 参数；
+如果 sequence 阶段未产生 DINO similarity matrix，Stage A 会自动补算一次。
+
 如果需要 PLY，可用 COLMAP 自带 converter 从 `points3D` 转出。
 
 ## 常用参数
@@ -390,7 +440,15 @@ output/
 | `--pair_k_similarity` | `0` | 额外按 DINO similarity 选邻居，默认关闭 |
 | `--pair_temporal_window` | `0` | 额外加入时序邻居，默认关闭 |
 | `--path_tracker` | required in practice | VGGSfM tracker checkpoint |
-| `--neighbors_per_center` | `25` | 每个 pose group 的邻居数量 |
+| `--neighbors_per_center` | `25` | 每个 VGGSfM group 的邻居上限；`pose` 策略下 rotation-valid 优先，同层按 camera-center 距离排序 |
+| `--vggsfm_group_strategy` | `pose` | 正式 VGGSfM tracking 的 group 构建策略；可选 `pose` 或 `projected_overlap` |
+| `--vggsfm_group_batch_size` | `2` | 按 `(group_size, query_points)` 分桶后，每次 VGGSfM forward 的 group 数量；尾桶自动降为较小 batch |
+| `--export_vggsfm_groups_only` | off | Stage A 后按 audit strategy 导出 VGGSfM groups、contact sheets、JSON 和人工标签 CSV，然后跳过 tracker/refinement |
+| `--vggsfm_group_audit_strategy` | `pose` | `pose`、`projected_overlap` 或 `both`；仅影响 group audit 提前退出模式 |
+| `--projected_overlap_dino_candidates` | `30` | 每个 center 加入 projected-overlap 候选池的 DINO retrieval 数量 |
+| `--projected_overlap_samples` | `2048` | 每个 center 用于有向几何投影的 low-res depth 规则网格采样上限 |
+| `--projected_overlap_reproj_threshold` | `4.0` | low-res depth round-trip reprojection 一致性阈值，单位为像素 |
+| `--projected_overlap_conf_quantile` | `0.2` | 丢弃每帧最低比例的 depth-confidence 样本 |
 | `--vggsfm_query_points` | `1024` | prior tracking query 点数 |
 | `--prior_match_topology` | `star` | prior tracks 写入 pair matches 的拓扑 |
 | `--min_frame_observations` | `10` | 低覆盖帧过滤阈值 |
@@ -416,6 +474,10 @@ refined_gluemap_aba/
 - pair graph 是否有 `zero_degree_images`；
 - frame filtering 是否丢掉过多帧；
 - SIFT / prior track observations 是否足够；
+- `vggsfm.neighbor_rank_stats` 中第 13～25 名邻居的通过率和有效 observation；
+- `vggsfm.workload.attempted_query_views` 与 `query_track_stats` 的成轨率、track length；
+- `augmented_refinement.final.real_by_source` 中最终 `p_only` / `mixed` 点数；
+- `augmented_refinement.final.angular_errors_by_track_source` 中最终 P 误差；
 - BAE summary 是否收敛；
 - `refined_gluemap_aba` 中的 registered images 和 points3D 数量是否合理。
 
