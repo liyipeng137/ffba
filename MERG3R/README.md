@@ -123,10 +123,15 @@ Stage A 的结果不直接作为最终 SfM 输出。它主要提供：
 
 作用：
 
-- `low images`：给前馈模型使用，降低显存和推理成本。
-- `high images`：给 SIFT、VGGSfM prior tracking、GlueMap refinement 和最终输出使用。
+- `low images`：在 CPU 内存生成，DINO/Pi3X 按批搬到 GPU；Stage A
+  前馈结束后释放。
+- `high images`：保留在 CPU 内存，供 SIFT、VGGSfM prior tracking、GlueMap
+  refinement 和最终输出按需使用。
+- low/high 中间图片不落盘；`images/` 仍由 `_save_work_images()` 保存一次，供
+  SIFT/pycolmap 和 group audit 使用。
 - `manifest`：记录原图、low 图、high 图之间的 resize/crop/scale 关系。
-- `scale_intrinsics_low_to_high()`：把 Stage A 得到的 low intrinsics 映射到 high 图坐标系。
+- `scale_intrinsics_with_pyramid_records()`：把 Stage A 得到的 low intrinsics
+  映射到 high 图坐标系。
 
 相关参数：
 
@@ -329,9 +334,7 @@ output/
   refine_stats.json
 
   image_pyramid/
-    low/
-    high/
-    manifest.json
+    image_pyramid_manifest.json
 
   images/
     frame_000000.png

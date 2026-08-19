@@ -15,10 +15,9 @@ from algos.utils import (
 )
 from utils.feedforward import load_model, run_inference_step_by_step
 from utils.image_pyramid import (
-    build_two_resolution_image_pyramid,
+    build_two_resolution_image_tensors,
     load_image_tensors_from_dir,
-    load_matching_high_images,
-    scale_intrinsics_low_to_high,
+    scale_intrinsics_with_pyramid_records,
 )
 from utils.gluemap_spv_refine import (
     CAMERA_MODEL as PIPELINE_CAMERA_MODEL,
@@ -37,7 +36,6 @@ PIPELINE_MODEL = "pi3x"
 
 @dataclass
 class Merg3rCoarseState:
-    low_images: torch.Tensor
     high_images: torch.Tensor
     low_image_names: list[str]
     high_image_names: list[str]
@@ -77,8 +75,8 @@ def parse_args():
         action=argparse.BooleanOptionalAction,
         default=True,
         help=(
-            "Preprocess the input image directory into low/high resolution "
-            "sets. Low-res images feed MERG3R; high-res images feed SIFT, "
+            "Preprocess the input image directory into in-memory low/high "
+            "tensors. Low-res images feed MERG3R; high-res images feed SIFT, "
             "VGGSfM prior, refinement, and final outputs."
         ),
     )
@@ -370,7 +368,7 @@ def _add_pair(pairs, i, j, n):
 
 
 def build_mixed_pairs(
-    images,
+    num_images,
     extrinsic,
     k_similarity,
     k_pose,
@@ -379,7 +377,7 @@ def build_mixed_pairs(
     pose_fill_unfiltered,
     similarity_matrix=None,
 ):
-    n = int(images.shape[0])
+    n = int(num_images)
     pairs = set()
 
     if temporal_window > 0:
@@ -390,9 +388,10 @@ def build_mixed_pairs(
     if k_similarity > 0 and n > 1:
         sim_matrix = similarity_matrix
         if sim_matrix is None:
-            sim_matrix = get_sim_matrix(images).detach().cpu()
-        else:
-            sim_matrix = torch.as_tensor(sim_matrix).detach().cpu()
+            raise ValueError(
+                "similarity_matrix is required when pair_k_similarity > 0"
+            )
+        sim_matrix = torch.as_tensor(sim_matrix).detach().cpu()
         for i in range(n):
             row = sim_matrix[i].clone()
             row[i] = -float("inf")
@@ -455,12 +454,11 @@ def summarize_pair_graph(pairs, num_images):
 def run_merg3r_coarse_stage(args, output_dir):
     t0 = time.time()
     image_pyramid_result = None
-    dataset_for_coarse = args.dataset
     if args.image_pyramid:
         stage2_scale_factor = (
             None if args.stage2_scale_factor == 0 else args.stage2_scale_factor
         )
-        image_pyramid_result = build_two_resolution_image_pyramid(
+        image_pyramid_result = build_two_resolution_image_tensors(
             args.dataset,
             output_dir / "image_pyramid",
             stage1_downscale_n=args.stage1_downscale_n,
@@ -468,31 +466,21 @@ def run_merg3r_coarse_stage(args, output_dir):
             stage2_scale_factor=stage2_scale_factor,
             recursive=args.multi_dirs,
             num_workers=args.image_pyramid_workers,
+            subsample=args.subsample,
+            num_images=args.num_images,
         )
-        dataset_for_coarse = str(image_pyramid_result.low_dir)
-
-    low_images, low_image_names = load_image_tensors_from_dir(
-        dataset_for_coarse,
-        device=args.device,
-        subsample=args.subsample,
-        num_images=args.num_images,
-        recursive=args.multi_dirs,
-    )
-    low_image_size_hw = tuple(int(x) for x in low_images.shape[-2:])
-    if image_pyramid_result is not None:
-        high_images, high_image_names = load_matching_high_images(
-            image_pyramid_result.high_dir,
-            low_image_names,
-            image_pyramid_result.low_dir,
-            device="cpu",
-            num_workers=args.image_pyramid_workers,
-        )
+        low_images = image_pyramid_result.low_images
+        high_images = image_pyramid_result.high_images
+        low_image_names = list(image_pyramid_result.image_names)
+        high_image_names = list(image_pyramid_result.image_names)
+        low_image_size_hw = tuple(int(x) for x in low_images.shape[-2:])
         high_image_size_hw = tuple(int(x) for x in high_images.shape[-2:])
         image_pyramid_metadata = {
             "enabled": True,
+            "materialization": "memory",
             "manifest_path": str(image_pyramid_result.manifest_path),
-            "low_dir": str(image_pyramid_result.low_dir),
-            "high_dir": str(image_pyramid_result.high_dir),
+            "low_dir": None,
+            "high_dir": None,
             "stage1_downscale_n": int(args.stage1_downscale_n),
             "stage1_multiple": int(args.stage1_multiple),
             "num_workers": int(args.image_pyramid_workers),
@@ -503,6 +491,14 @@ def run_merg3r_coarse_stage(args, output_dir):
             ),
         }
     else:
+        low_images, low_image_names = load_image_tensors_from_dir(
+            args.dataset,
+            device="cpu",
+            subsample=args.subsample,
+            num_images=args.num_images,
+            recursive=args.multi_dirs,
+        )
+        low_image_size_hw = tuple(int(x) for x in low_images.shape[-2:])
         high_images = low_images.detach().cpu()
         high_image_names = list(low_image_names)
         high_image_size_hw = low_image_size_hw
@@ -523,21 +519,14 @@ def run_merg3r_coarse_stage(args, output_dir):
         retrieval_sim_matrix = retrieval_sim_matrix.numpy().astype(
             np.float32, copy=False
         )
-    needs_projected_overlap = (
-        args.export_vggsfm_groups_only
-        and args.vggsfm_group_audit_strategy in {"projected_overlap", "both"}
-    ) or (
-        not args.export_vggsfm_groups_only
-        and args.vggsfm_group_strategy == "projected_overlap"
-    )
-    if needs_projected_overlap and retrieval_sim_matrix is None:
+    if retrieval_sim_matrix is None:
         print(
-            "[PIPELINE] DINO retrieval matrix was not produced by the sequence "
-            "strategy; computing it for projected-overlap VGGSfM groups.",
+            "[PIPELINE] Computing DINO retrieval matrix for all images before "
+            "feed-forward inference.",
             flush=True,
         )
         retrieval_sim_matrix = (
-            get_sim_matrix(low_images, alpha=args.alpha)
+            get_sim_matrix(low_images, alpha=args.alpha, device=args.device)
             .detach()
             .cpu()
             .numpy()
@@ -560,9 +549,14 @@ def run_merg3r_coarse_stage(args, output_dir):
     if args.device.startswith("cuda"):
         torch.cuda.empty_cache()
 
-    for idx, prediction in enumerate(sequence.predictions):
-        prediction["images"] = batches[idx]
+    for prediction in sequence.predictions:
         _as_numpy_prediction(prediction)
+
+    sequence.images = None
+    sequence.image_split = []
+    if image_pyramid_result is not None:
+        image_pyramid_result.low_images = None
+    del batches, low_images
 
     final_predictions, _, _ = align_extrinsics(
         sequence, method=args.alignment_type, ba=False
@@ -572,10 +566,8 @@ def run_merg3r_coarse_stage(args, output_dir):
     extrinsic = _normalize_extrinsic(final_predictions["extrinsic"]).astype(np.float32)
     intrinsic = np.asarray(final_predictions["intrinsic"], dtype=np.float32)
     if image_pyramid_result is not None:
-        intrinsic_high = scale_intrinsics_low_to_high(
+        intrinsic_high = scale_intrinsics_with_pyramid_records(
             intrinsic,
-            low_image_names,
-            image_pyramid_result.low_dir,
             image_pyramid_result.records,
         ).astype(np.float32)
     else:
@@ -585,7 +577,7 @@ def run_merg3r_coarse_stage(args, output_dir):
         dtype=np.int64,
     )
     pairs = build_mixed_pairs(
-        low_images,
+        extrinsic.shape[0],
         extrinsic,
         args.pair_k_similarity,
         args.pair_k_pose,
@@ -607,7 +599,6 @@ def run_merg3r_coarse_stage(args, output_dir):
         )
 
     state = Merg3rCoarseState(
-        low_images=low_images,
         high_images=high_images,
         low_image_names=list(low_image_names),
         high_image_names=list(high_image_names),
