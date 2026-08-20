@@ -1,4 +1,5 @@
 import csv
+import gc
 import json
 import os
 import shutil
@@ -9,6 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import torch
 from PIL import Image, ImageDraw, ImageOps
 
 from algos.utils import export_prediction_depth_maps
@@ -138,6 +140,28 @@ def _make_refine_args(config: GluemapSpvRefineConfig):
 def _debug(args, message):
     if args.debug_print:
         print(f"[PIPELINE-REFINE] {message}", flush=True)
+
+
+def _cuda_memory_snapshot(device):
+    allocated_bytes = int(torch.cuda.memory_allocated(device))
+    reserved_bytes = int(torch.cuda.memory_reserved(device))
+    free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+    return {
+        "allocated_bytes": allocated_bytes,
+        "reserved_bytes": reserved_bytes,
+        "driver_free_bytes": int(free_bytes),
+        "total_bytes": int(total_bytes),
+    }
+
+
+def _format_cuda_memory_snapshot(snapshot):
+    gib = 1024**3
+    return (
+        f"allocated={snapshot['allocated_bytes'] / gib:.2f} GiB, "
+        f"reserved={snapshot['reserved_bytes'] / gib:.2f} GiB, "
+        f"driver_free={snapshot['driver_free_bytes'] / gib:.2f}/"
+        f"{snapshot['total_bytes'] / gib:.2f} GiB"
+    )
 
 
 def _save_one_work_image(item):
@@ -936,6 +960,46 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
         CAMERA_MODEL,
     )
     stats["timing"]["write_coarse"] = time.time() - t0
+
+    if args.device.startswith("cuda") and torch.cuda.is_available():
+        cuda_device = torch.device(args.device)
+        torch.cuda.synchronize(cuda_device)
+        cuda_memory_before = _cuda_memory_snapshot(cuda_device)
+        print(
+            "[PIPELINE-REFINE] CUDA memory before augmented refinement "
+            f"cleanup: {_format_cuda_memory_snapshot(cuda_memory_before)}",
+            flush=True,
+        )
+        gc_collected = int(gc.collect())
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize(cuda_device)
+        cuda_memory_after = _cuda_memory_snapshot(cuda_device)
+        print(
+            "[PIPELINE-REFINE] CUDA memory after augmented refinement "
+            f"cleanup: {_format_cuda_memory_snapshot(cuda_memory_after)}, "
+            f"gc_collected={gc_collected}",
+            flush=True,
+        )
+        stats["augmented_refinement_cuda_cleanup"] = {
+            "enabled": True,
+            "device": str(cuda_device),
+            "gc_collected": gc_collected,
+            "before": cuda_memory_before,
+            "after": cuda_memory_after,
+            "reserved_bytes_released": int(
+                cuda_memory_before["reserved_bytes"]
+                - cuda_memory_after["reserved_bytes"]
+            ),
+            "driver_free_bytes_gained": int(
+                cuda_memory_after["driver_free_bytes"]
+                - cuda_memory_before["driver_free_bytes"]
+            ),
+        }
+    else:
+        stats["augmented_refinement_cuda_cleanup"] = {
+            "enabled": False,
+            "reason": "CUDA device is not active",
+        }
 
     _debug(
         args,
