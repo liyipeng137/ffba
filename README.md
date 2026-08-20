@@ -44,8 +44,8 @@ Stage A 用前馈模型快速给出全局可用的 coarse 几何；Stage B 不�
 
 ```bash
 python run_merg3r_gluemap_pipeline.py  \
-  --dataset /kiri/images/ \
-  --output_dir  /kiri/output/ \
+  --dataset /kiri/tmp/Courtroom540/images \
+  --output_dir  /kiri/tmp/Courtroom540/output \
   --prior_match_topology star \
   --ba_backend bae \
   --bae_max_num_iterations 20 \
@@ -54,8 +54,7 @@ python run_merg3r_gluemap_pipeline.py  \
   --bae_robust_loss huber \
   --bae_huber_delta 1.0 \
   --filter_reproj_error_threshold 1.0 \
-  --neighbors_per_center 16 \
-  --no-pair_pose_fill_unfiltered \
+  --neighbors_per_center 12 \
   --vggsfm_group_strategy projected_overlap \
   --vggsfm_group_batch_size 3
 ```

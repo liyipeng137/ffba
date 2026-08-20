@@ -2315,8 +2315,13 @@ def snap_prior_tracks_to_features(
     }
     snap_distances = []
 
+    # Keep observations in track order, but group their nearest-neighbor queries
+    # by image.  Reconstructing from these original slots is important for the
+    # star match topology, where the first observation is the track center.
+    prepared_tracks = []
+    query_locations = [[] for _ in features]
     for track in tracks:
-        snapped_obs = []
+        prepared_obs = []
         seen_images = set()
         for obs_idx, (image_idx, xy) in enumerate(track):
             image_idx = int(image_idx)
@@ -2329,7 +2334,39 @@ def snap_prior_tracks_to_features(
 
             xy = np.asarray(xy, dtype=np.float32)
             tree = keypoint_trees[image_idx]
-            if tree is None:
+            prepared_obs.append([image_idx, xy, prefix, None])
+            if tree is not None:
+                query_locations[image_idx].append(
+                    (len(prepared_tracks), len(prepared_obs) - 1)
+                )
+        prepared_tracks.append(prepared_obs)
+
+    for image_idx, locations in enumerate(query_locations):
+        if not locations:
+            continue
+        query_points = np.stack(
+            [prepared_tracks[track_idx][obs_idx][1] for track_idx, obs_idx in locations]
+        )
+        distances, keypoint_indices = keypoint_trees[image_idx].query(
+            query_points,
+            k=1,
+            workers=1,
+        )
+        for location, distance, keypoint_idx in zip(
+            locations,
+            distances,
+            keypoint_indices,
+        ):
+            track_idx, obs_idx = location
+            prepared_tracks[track_idx][obs_idx][3] = (
+                float(distance),
+                int(keypoint_idx),
+            )
+
+    for prepared_obs in prepared_tracks:
+        snapped_obs = []
+        for image_idx, xy, prefix, query_result in prepared_obs:
+            if query_result is None:
                 if keep_unsnapped:
                     snapped_obs.append((image_idx, xy))
                     stats["unsnapped_kept_observations"] += 1
@@ -2339,7 +2376,7 @@ def snap_prior_tracks_to_features(
                     stats[f"{prefix}_dropped_observations"] += 1
                 continue
 
-            distance, keypoint_idx = tree.query(xy, k=1)
+            distance, keypoint_idx = query_result
             if float(distance) <= snap_threshold:
                 snapped_xy = features[image_idx]["keypoints"][int(keypoint_idx)].astype(
                     np.float32
