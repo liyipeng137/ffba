@@ -114,20 +114,8 @@ def parse_args():
         ],
     )
     parser.add_argument("--alignment_type", type=str, default="weighted_iterative")
-    parser.add_argument("--pair_k_similarity", type=int, default=0)
     parser.add_argument("--pair_k_pose", type=int, default=25)
-    parser.add_argument("--pair_temporal_window", type=int, default=0)
     parser.add_argument("--pair_pose_rotation_threshold", type=float, default=30.0)
-    parser.add_argument(
-        "--pair_pose_fill_unfiltered",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help=(
-            "When pose-neighbor candidates passing the rotation threshold are "
-            "fewer than pair_k_pose, fill the remaining slots by camera-center "
-            "distance. This keeps the graph dense enough for pose groups."
-        ),
-    )
     parser.add_argument(
         "--path_tracker",
         type=str,
@@ -367,37 +355,14 @@ def _add_pair(pairs, i, j, n):
     pairs.add((a, b))
 
 
-def build_mixed_pairs(
+def build_pose_pairs(
     num_images,
     extrinsic,
-    k_similarity,
     k_pose,
-    temporal_window,
     pose_rotation_threshold,
-    pose_fill_unfiltered,
-    similarity_matrix=None,
 ):
     n = int(num_images)
     pairs = set()
-
-    if temporal_window > 0:
-        for i in range(n):
-            for step in range(1, temporal_window + 1):
-                _add_pair(pairs, i, i + step, n)
-
-    if k_similarity > 0 and n > 1:
-        sim_matrix = similarity_matrix
-        if sim_matrix is None:
-            raise ValueError(
-                "similarity_matrix is required when pair_k_similarity > 0"
-            )
-        sim_matrix = torch.as_tensor(sim_matrix).detach().cpu()
-        for i in range(n):
-            row = sim_matrix[i].clone()
-            row[i] = -float("inf")
-            k = min(k_similarity, n - 1)
-            for j in torch.topk(row, k).indices.tolist():
-                _add_pair(pairs, i, j, n)
 
     if k_pose > 0 and n > 1:
         centers = _camera_centers_from_w2c(extrinsic)
@@ -410,19 +375,10 @@ def build_mixed_pairs(
             ordered = [int(j) for j in np.argsort(dists[i]) if j != i]
             valid_ordered = [j for j in ordered if not invalid[i, j]]
             selected = valid_ordered[: min(k_pose, n - 1)]
-            if pose_fill_unfiltered and len(selected) < min(k_pose, n - 1):
-                selected_set = set(selected)
-                for j in ordered:
-                    if j in selected_set:
-                        continue
-                    selected.append(j)
-                    selected_set.add(j)
-                    if len(selected) >= min(k_pose, n - 1):
-                        break
             for j in selected:
                 _add_pair(pairs, i, int(j), n)
 
-    return np.asarray(sorted(pairs), dtype=np.int64)
+    return np.asarray(sorted(pairs), dtype=np.int64).reshape(-1, 2)
 
 
 def summarize_pair_graph(pairs, num_images):
@@ -576,15 +532,11 @@ def run_merg3r_coarse_stage(args, output_dir):
         final_predictions.get("image_ids", np.arange(extrinsic.shape[0])),
         dtype=np.int64,
     )
-    pairs = build_mixed_pairs(
+    pairs = build_pose_pairs(
         extrinsic.shape[0],
         extrinsic,
-        args.pair_k_similarity,
         args.pair_k_pose,
-        args.pair_temporal_window,
         args.pair_pose_rotation_threshold,
-        args.pair_pose_fill_unfiltered,
-        similarity_matrix=retrieval_sim_matrix,
     )
     pair_graph_stats = summarize_pair_graph(pairs, extrinsic.shape[0])
     raw_depth = _normalize_depth_like(
@@ -662,11 +614,9 @@ def write_stage_a_summary(output_dir, args, state, timing):
             ),
         },
         "pair_selection": {
-            "pair_k_similarity": args.pair_k_similarity,
+            "strategy": "pose_rotation_filtered",
             "pair_k_pose": args.pair_k_pose,
-            "pair_temporal_window": args.pair_temporal_window,
             "pair_pose_rotation_threshold": args.pair_pose_rotation_threshold,
-            "pair_pose_fill_unfiltered": args.pair_pose_fill_unfiltered,
             "num_pairs": int(state.pairs.shape[0]),
             "pair_graph": state.pair_graph_stats,
         },

@@ -40,23 +40,24 @@ Stage A 用前馈模型快速给出全局可用的 coarse 几何；Stage B 不�
 
 ## 当前主入口
 
-推荐直接运行：
+运行示例：
 
 ```bash
-cd MERG3R
-
-python run_merg3r_gluemap_pipeline.py \
-  --dataset ../650_data/image_jpg/ \
-  --output_dir ./650_data/ \
+python run_merg3r_gluemap_pipeline.py  \
+  --dataset /kiri/images/ \
+  --output_dir  /kiri/output/ \
   --prior_match_topology star \
-  --virtual_verify_mode center \
   --ba_backend bae \
   --bae_max_num_iterations 20 \
-  --num_refinement_iterations 2 \
+  --num_refinement_iterations 2  \
   --bae_optimize_intrinsics \
   --bae_robust_loss huber \
   --bae_huber_delta 1.0 \
-  --filter_reproj_error_threshold 1.0
+  --filter_reproj_error_threshold 1.0 \
+  --neighbors_per_center 16 \
+  --no-pair_pose_fill_unfiltered \
+  --vggsfm_group_strategy projected_overlap \
+  --vggsfm_group_batch_size 3
 ```
 
 当前主流程固定使用：
@@ -159,19 +160,9 @@ Stage A 后会构建用于 GlueMap pose groups 的 pair graph。
 ```bash
 --pair_k_pose 25
 --pair_pose_rotation_threshold 30.0
---pair_pose_fill_unfiltered
 ```
 
-可额外启用：
-
-```bash
---pair_k_similarity N
---pair_temporal_window N
-```
-
-思想是：前馈模型已经提供 coarse pose，因此后续稀疏匹配不需要完全盲目地 all-pairs，而是可以优先在几何邻近、视角相近的帧之间建立关系。
-
-`pair_pose_fill_unfiltered` 会在通过 rotation threshold 的邻居不足时，用 camera center 距离补足候选，避免 pair graph 过稀导致后续 pose groups 覆盖不足。
+思想是：前馈模型已经提供 coarse pose，因此后续稀疏匹配不需要完全盲目地 all-pairs，而是在满足 rotation threshold 的候选中，按 camera center 距离优先选择邻居。`pair_k_pose` 是每帧主动选择的上限；候选不足时不补边，也不要求每个 center 都必须有 pair。
 
 ## Stage B: GlueMap/SPV 精修
 
@@ -376,7 +367,6 @@ python run_merg3r_gluemap_pipeline.py \
   --dataset <images> \
   --output_dir <output> \
   --pair_k_pose 25 \
-  --no-pair_pose_fill_unfiltered \
   --neighbors_per_center 12 \
   --export_vggsfm_groups_only \
   --vggsfm_group_audit_strategy both
@@ -406,7 +396,6 @@ python run_merg3r_gluemap_pipeline.py \
   --dataset <images> \
   --output_dir <output> \
   --pair_k_pose 25 \
-  --no-pair_pose_fill_unfiltered \
   --neighbors_per_center 12 \
   --vggsfm_group_strategy projected_overlap
 ```
@@ -437,8 +426,7 @@ python run_merg3r_gluemap_pipeline.py \
 | `--splitting_type` | `interleave` | subset 内图片组织方式 |
 | `--alignment_type` | `weighted_iterative` | MERG3R subset pose 对齐方式 |
 | `--pair_k_pose` | `25` | 每帧按 coarse pose 选取的邻居数量 |
-| `--pair_k_similarity` | `0` | 额外按 DINO similarity 选邻居，默认关闭 |
-| `--pair_temporal_window` | `0` | 额外加入时序邻居，默认关闭 |
+| `--pair_pose_rotation_threshold` | `30.0` | pose pair 允许的最大视角差，单位为度 |
 | `--path_tracker` | required in practice | VGGSfM tracker checkpoint |
 | `--neighbors_per_center` | `25` | 每个 VGGSfM group 的邻居上限；`pose` 策略下 rotation-valid 优先，同层按 camera-center 距离排序 |
 | `--vggsfm_group_strategy` | `pose` | 正式 VGGSfM tracking 的 group 构建策略；可选 `pose` 或 `projected_overlap` |
