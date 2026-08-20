@@ -62,6 +62,8 @@ python run_merg3r_gluemap_pipeline.py  \
 python run_merg3r_gluemap_pipeline.py    \
   --dataset /kiri/tmp/Courtroom540/images \  
   --output_dir  /kiri/tmp/Courtroom540/output_fk/ \
+  --subset_size 200 \
+  --overlap 10 \
   --prior_match_topology star   \
   --ba_backend bae   \
   --bae_max_num_iterations 20 \   
@@ -69,11 +71,12 @@ python run_merg3r_gluemap_pipeline.py    \
   --bae_optimize_intrinsics    \
   --bae_robust_loss huber   \
   --bae_huber_delta 1.0   \
+  --bae_max_observations  2000000 \
   --filter_reproj_error_threshold 0.5  \
   --neighbors_per_center 12   \
   --select_track_min_support 256  \
   --vggsfm_group_strategy projected_overlap \   
-  --vggsfm_group_batch_size 3
+  --vggsfm_group_batch_size 3 
 ```
 
 当前主流程固定使用：
