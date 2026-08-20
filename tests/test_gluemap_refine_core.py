@@ -1,6 +1,6 @@
 import sys
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import numpy as np
 import pytest
@@ -236,3 +236,164 @@ def test_batched_snap_matches_scalar_reference_for_equidistant_keypoints():
 
     _assert_tracks_equal(actual_tracks, expected_tracks)
     assert actual_stats == expected_stats
+
+
+def _budget_track(
+    point3d_id,
+    image_ids,
+    angular_error_p90,
+    max_triangulation_angle_deg,
+    source="p_only",
+):
+    return {
+        "point3D_id": point3d_id,
+        "image_ids": tuple(image_ids),
+        "track_length": len(image_ids),
+        "angular_error_p90": angular_error_p90,
+        "max_triangulation_angle_deg": max_triangulation_angle_deg,
+        "source": source,
+    }
+
+
+def test_bae_budget_plan_is_source_agnostic_and_accepts_whole_track_overshoot():
+    records = [
+        _budget_track(1, [1, 2], 0.8, 1.0, source="p_only"),
+        _budget_track(2, [1, 2], 0.9, 20.0, source="s_only"),
+        _budget_track(3, [1, 2, 3], 0.95, 1.0, source="p_only"),
+    ]
+
+    plan = ref._plan_bae_track_deletions(
+        records,
+        image_observations={1: 3, 2: 3, 3: 1},
+        max_observations=5,
+        min_observations_per_image=0,
+    )
+
+    assert plan["reached_budget"] is True
+    assert plan["remaining_observations"] == 5
+    assert [record["point3D_id"] for record in plan["deleted_records"]] == [2]
+
+    overshoot = ref._plan_bae_track_deletions(
+        [
+            _budget_track(10, [1, 2, 3], 0.5, 10.0),
+            _budget_track(11, [1, 2, 3], 0.4, 10.0),
+        ],
+        image_observations={1: 2, 2: 2, 3: 2},
+        max_observations=4,
+        min_observations_per_image=0,
+    )
+    assert overshoot["reached_budget"] is True
+    assert overshoot["remaining_observations"] == 3
+
+
+def test_bae_budget_plan_uses_small_parallax_after_equal_error():
+    records = [
+        _budget_track(1, [1, 2], 0.8, 10.0),
+        _budget_track(2, [1, 2], 0.8, 2.0),
+        _budget_track(3, [1, 2, 3], 0.9, 1.0),
+    ]
+
+    plan = ref._plan_bae_track_deletions(
+        records,
+        image_observations={1: 3, 2: 3, 3: 1},
+        max_observations=5,
+        min_observations_per_image=0,
+    )
+
+    assert [record["point3D_id"] for record in plan["deleted_records"]] == [2]
+
+
+def test_bae_budget_plan_reports_unreachable_floor_without_mutating_records():
+    records = [
+        _budget_track(1, [1, 2], 0.9, 1.0),
+        _budget_track(2, [1, 3], 0.8, 1.0),
+        _budget_track(3, [2, 3], 0.7, 1.0),
+    ]
+
+    plan = ref._plan_bae_track_deletions(
+        records,
+        image_observations={1: 2, 2: 2, 3: 2},
+        max_observations=2,
+        min_observations_per_image=1,
+    )
+
+    assert plan["reached_budget"] is False
+    assert plan["remaining_observations"] == 4
+    assert [record["point3D_id"] for record in plan["deleted_records"]] == [1]
+    assert [record["point3D_id"] for record in records] == [1, 2, 3]
+
+
+def test_track_max_triangulation_angle_degrees():
+    angle = ref._track_max_triangulation_angle_degrees(
+        point_xyz=np.zeros(3),
+        image_ids=[1, 2],
+        camera_centers={
+            1: np.array([-1.0, 0.0, 0.0]),
+            2: np.array([0.0, -1.0, 0.0]),
+        },
+    )
+
+    assert angle == pytest.approx(90.0)
+
+
+def test_bae_budget_pruning_deletes_selected_track_in_place():
+    class FakeReconstruction:
+        def __init__(self, points3d, images):
+            self.points3D = points3d
+            self.images = images
+
+        def delete_point3D(self, point3d_id):
+            del self.points3D[point3d_id]
+
+    def image_at(center):
+        pose = SimpleNamespace(
+            rotation=SimpleNamespace(matrix=lambda: np.eye(3)),
+            translation=-np.asarray(center, dtype=np.float64),
+        )
+        return SimpleNamespace(cam_from_world=lambda: pose)
+
+    def point(xyz, observations):
+        elements = [
+            SimpleNamespace(image_id=image_id, point2D_idx=point2d_idx)
+            for image_id, point2d_idx in observations
+        ]
+        return SimpleNamespace(
+            xyz=np.asarray(xyz, dtype=np.float64),
+            track=SimpleNamespace(elements=elements),
+        )
+
+    reconstruction = FakeReconstruction(
+        points3d={
+            1: point([0.0, 0.0, 5.0], [(1, 0), (2, 0)]),
+            2: point([0.0, 0.0, 5.0], [(1, 1), (2, 1)]),
+            3: point([0.0, 0.0, 5.0], [(1, 1), (2, 1), (3, 1)]),
+        },
+        images={
+            1: image_at([-1.0, 0.0, 0.0]),
+            2: image_at([1.0, 0.0, 0.0]),
+            3: image_at([0.0, 1.0, 0.0]),
+        },
+    )
+    features = [{"keypoints": np.zeros((1, 2), dtype=np.float32)} for _ in range(3)]
+    angular_errors = {
+        1: [(1, 0, 0.9), (2, 0, 0.9)],
+        2: [(1, 1, 0.8), (2, 1, 0.8)],
+        3: [(1, 1, 0.95), (2, 1, 0.95), (3, 1, 0.95)],
+    }
+
+    stats = ref.prune_reconstruction_for_bae_observation_budget(
+        reconstruction,
+        features,
+        max_observations=5,
+        angular_errors_per_track=angular_errors,
+        min_observations_per_image=0,
+    )
+
+    assert stats["applied"] is True
+    assert stats["before"]["observations"] == 7
+    assert stats["after"]["observations"] == 5
+    assert stats["deleted_by_source"]["s_only"] == {
+        "tracks": 1,
+        "observations": 2,
+    }
+    assert set(reconstruction.points3D) == {2, 3}

@@ -48,6 +48,7 @@ class GluemapSpvRefineConfig:
     ba_backend: str = "ceres"
     ba_max_num_iterations: int = 100
     bae_max_num_iterations: int = 20
+    bae_max_observations: int = 0
     bae_optimize_intrinsics: bool = False
     bae_fix_gauge: str = "two_cams"
     bae_robust_loss: str = "none"
@@ -113,6 +114,7 @@ def _make_refine_args(config: GluemapSpvRefineConfig):
         ba_backend=config.ba_backend,
         ba_max_num_iterations=config.ba_max_num_iterations,
         bae_max_num_iterations=config.bae_max_num_iterations,
+        bae_max_observations=config.bae_max_observations,
         bae_optimize_intrinsics=config.bae_optimize_intrinsics,
         bae_fix_gauge=config.bae_fix_gauge,
         bae_robust_loss=config.bae_robust_loss,

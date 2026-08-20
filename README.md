@@ -458,6 +458,7 @@ python run_merg3r_gluemap_pipeline.py \
 | `--min_frame_observations` | `10` | 低覆盖帧过滤阈值 |
 | `--ba_backend` | `bae` | `bae` 或 `ceres` |
 | `--bae_max_num_iterations` | `20` | BAE 迭代次数 |
+| `--bae_max_observations` | `0` | 每轮进入 BAE 的 real observation 硬上限；`0` 表示禁用，超限时按质量排序原地删除完整 track |
 | `--bae_fix_gauge` | `two_cams` | BAE gauge fixing 策略 |
 | `--bae_robust_loss` | `huber` | BAE robust loss |
 | `--num_refinement_iterations` | `3` | augmented refinement 外层轮数 |

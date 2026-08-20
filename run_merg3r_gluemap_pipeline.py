@@ -223,6 +223,16 @@ def parse_args():
         help="BAE optimizer iterations when --ba_backend=bae.",
     )
     parser.add_argument(
+        "--bae_max_observations",
+        type=int,
+        default=0,
+        help=(
+            "Maximum real observations passed to each BAE round. Values <= 0 "
+            "disable the budget. When exceeded, whole real tracks are pruned "
+            "in place immediately before BAE; ignored by the Ceres backend."
+        ),
+    )
+    parser.add_argument(
         "--bae_optimize_intrinsics",
         default=True,
         action="store_true",
@@ -732,6 +742,7 @@ def main():
         ba_backend=args.ba_backend,
         ba_max_num_iterations=args.ba_max_num_iterations,
         bae_max_num_iterations=args.bae_max_num_iterations,
+        bae_max_observations=args.bae_max_observations,
         bae_optimize_intrinsics=args.bae_optimize_intrinsics,
         bae_fix_gauge=args.bae_fix_gauge,
         bae_robust_loss=args.bae_robust_loss,
