@@ -38,6 +38,15 @@ refined_gluemap_aba/  # 最终 refined COLMAP model
 
 Stage A 用前馈模型快速给出全局可用的 coarse 几何；Stage B 不再完全依赖前馈 depth，而是把 coarse pose 作为先验，交给 GlueMap 风格的稀疏特征、prior track 和 BA 流程去生成最终可交付的 SfM 稀疏重建。
 
+## 环境准备
+```bash
+conda env create -f env_base.yaml
+pip install trimesh numba "xformers==0.0.32.post1" "git+https://github.com/pypose/pypose.git"
+cd third_party/gluemap && pip install .
+cd third_party/bae && USE_CUDSS=0 python -m pip install --no-build-isolation -v -e .
+# prepare vggsfm_track weights
+```
+
 ## 当前主入口
 
 运行示例：
