@@ -261,13 +261,14 @@ seed reconstruction
 --augmented_ba_normalized_reproj_threshold 1e-2
 ```
 
-如需仅在最后一轮收紧预过滤阈值，例如三轮分别使用
-`1.0 / 1.0 / 0.5`：
+如需仅在最后一轮减弱 Huber 降权、增强中等残差的拟合力度，例如
+三轮分别使用 `delta=1.0 / 1.0 / 2.0`：
 
 ```bash
 --num_refinement_iterations 3
---filter_reproj_error_threshold 1.0
---final_filter_reproj_error_threshold 0.5
+--bae_robust_loss huber
+--bae_huber_delta 1.0
+--final_bae_huber_delta 2.0
 ```
 
 ## BAE 后端
@@ -482,8 +483,8 @@ python run_merg3r_gluemap_pipeline.py \
 | `--bae_max_observations` | `0` | 每轮进入 BAE 的 real observation 硬上限；`0` 表示禁用，超限时按质量排序原地删除完整 track |
 | `--bae_fix_gauge` | `two_cams` | BAE gauge fixing 策略 |
 | `--bae_robust_loss` | `huber` | BAE robust loss |
+| `--final_bae_huber_delta` | unset | 仅在 augmented refinement 最后一轮使用的 BAE Huber delta；未设置时每轮均使用 `--bae_huber_delta` |
 | `--num_refinement_iterations` | `3` | augmented refinement 外层轮数 |
-| `--final_filter_reproj_error_threshold` | unset | 仅在 augmented refinement 最后一轮使用的预过滤阈值；未设置时每轮均使用 `--filter_reproj_error_threshold` |
 
 ## 推荐检查点
 

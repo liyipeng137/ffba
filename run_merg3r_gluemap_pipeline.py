@@ -269,6 +269,16 @@ def parse_args():
         default=1.0,
         help="Huber delta in pixels when --bae_robust_loss=huber.",
     )
+    parser.add_argument(
+        "--final_bae_huber_delta",
+        type=float,
+        default=None,
+        help=(
+            "Optional BAE Huber delta used only in the final augmented "
+            "refinement iteration. When omitted, --bae_huber_delta is used "
+            "for every iteration."
+        ),
+    )
     parser.add_argument("--num_refinement_iterations", type=int, default=3)
     parser.add_argument("--augmented_ba_max_filter_iterations", type=int, default=3)
     parser.add_argument(
@@ -286,16 +296,6 @@ def parse_args():
         choices=["angular", "pixel", "normalized"],
     )
     parser.add_argument("--filter_reproj_error_threshold", type=float, default=0.5)
-    parser.add_argument(
-        "--final_filter_reproj_error_threshold",
-        type=float,
-        default=None,
-        help=(
-            "Optional reprojection-error threshold used only in the final "
-            "augmented refinement iteration. When omitted, "
-            "--filter_reproj_error_threshold is used for every iteration."
-        ),
-    )
     parser.add_argument("--virtual_init_angular_error_threshold", type=float)
     parser.add_argument(
         "--virtual_verify_mode",
@@ -757,6 +757,7 @@ def main():
         bae_fix_gauge=args.bae_fix_gauge,
         bae_robust_loss=args.bae_robust_loss,
         bae_huber_delta=args.bae_huber_delta,
+        final_bae_huber_delta=args.final_bae_huber_delta,
         num_refinement_iterations=args.num_refinement_iterations,
         augmented_ba_max_filter_iterations=args.augmented_ba_max_filter_iterations,
         augmented_ba_normalized_reproj_threshold=(
@@ -767,9 +768,6 @@ def main():
         select_track_min_support=args.select_track_min_support,
         filter_reproj_error_type=args.filter_reproj_error_type,
         filter_reproj_error_threshold=args.filter_reproj_error_threshold,
-        final_filter_reproj_error_threshold=(
-            args.final_filter_reproj_error_threshold
-        ),
         virtual_init_angular_error_threshold=args.virtual_init_angular_error_threshold,
         virtual_verify_mode=args.virtual_verify_mode,
         save_virtual_tracks_debug=args.save_virtual_tracks_debug,

@@ -53,6 +53,7 @@ class GluemapSpvRefineConfig:
     bae_fix_gauge: str = "two_cams"
     bae_robust_loss: str = "none"
     bae_huber_delta: float = 1.0
+    final_bae_huber_delta: float | None = None
     num_refinement_iterations: int = 2
     augmented_ba_max_filter_iterations: int = 3
     augmented_ba_normalized_reproj_threshold: float = 1e-2
@@ -61,7 +62,6 @@ class GluemapSpvRefineConfig:
     select_track_min_support: int = 512
     filter_reproj_error_type: str = "angular"
     filter_reproj_error_threshold: float = 0.5
-    final_filter_reproj_error_threshold: float | None = None
     virtual_init_angular_error_threshold: float | None = None
     virtual_verify_mode: str = "n2"
     save_virtual_tracks_debug: bool = False
@@ -120,6 +120,7 @@ def _make_refine_args(config: GluemapSpvRefineConfig):
         bae_fix_gauge=config.bae_fix_gauge,
         bae_robust_loss=config.bae_robust_loss,
         bae_huber_delta=config.bae_huber_delta,
+        final_bae_huber_delta=config.final_bae_huber_delta,
         num_refinement_iterations=config.num_refinement_iterations,
         augmented_ba_max_filter_iterations=(config.augmented_ba_max_filter_iterations),
         augmented_ba_normalized_reproj_threshold=(
@@ -132,9 +133,6 @@ def _make_refine_args(config: GluemapSpvRefineConfig):
         enable_reprojection_filter=True,
         filter_reproj_error_type=config.filter_reproj_error_type,
         filter_reproj_error_threshold=config.filter_reproj_error_threshold,
-        final_filter_reproj_error_threshold=(
-            config.final_filter_reproj_error_threshold
-        ),
         virtual_init_angular_error_threshold=(
             config.virtual_init_angular_error_threshold
         ),
@@ -606,6 +604,7 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
         "bae_fix_gauge": config.bae_fix_gauge,
         "bae_robust_loss": config.bae_robust_loss,
         "bae_huber_delta": config.bae_huber_delta,
+        "final_bae_huber_delta": config.final_bae_huber_delta,
         "timing": {"save_work_images": save_work_images_seconds},
         "work_images": {
             "images_dir": str(images_dir),
@@ -1013,8 +1012,8 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
         f"iterations={args.num_refinement_iterations}, "
         f"ba_max_iters={args.ba_max_num_iterations}, "
         f"filter_reproj_threshold={args.filter_reproj_error_threshold}, "
-        "final_filter_reproj_threshold="
-        f"{args.final_filter_reproj_error_threshold}",
+        f"bae_huber_delta={args.bae_huber_delta}, "
+        f"final_bae_huber_delta={args.final_bae_huber_delta}",
     )
     t0 = time.time()
     (

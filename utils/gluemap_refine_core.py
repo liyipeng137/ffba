@@ -3192,12 +3192,12 @@ def triangulate_from_seed_reconstruction(
     return reconstruction
 
 
-def _filter_reproj_error_threshold_for_iteration(args, outer_iter):
-    final_threshold = getattr(args, "final_filter_reproj_error_threshold", None)
+def _bae_huber_delta_for_iteration(args, outer_iter):
+    final_delta = getattr(args, "final_bae_huber_delta", None)
     is_final_iteration = outer_iter == int(args.num_refinement_iterations) - 1
-    if is_final_iteration and final_threshold is not None:
-        return float(final_threshold)
-    return float(args.filter_reproj_error_threshold)
+    if is_final_iteration and final_delta is not None:
+        return float(final_delta)
+    return float(getattr(args, "bae_huber_delta", 1.0))
 
 
 def run_merg3r_augmented_refinement_loop(
@@ -3239,14 +3239,9 @@ def run_merg3r_augmented_refinement_loop(
             f"Unknown BA backend {ba_backend!r}, expected 'ceres' or 'bae'"
         )
     use_virtual_tracks = ba_backend == "ceres"
-    final_filter_reproj_error_threshold = getattr(
-        args, "final_filter_reproj_error_threshold", None
-    )
-    if (
-        final_filter_reproj_error_threshold is not None
-        and final_filter_reproj_error_threshold <= 0
-    ):
-        raise ValueError("final_filter_reproj_error_threshold must be positive")
+    final_bae_huber_delta = getattr(args, "final_bae_huber_delta", None)
+    if final_bae_huber_delta is not None and final_bae_huber_delta <= 0:
+        raise ValueError("final_bae_huber_delta must be positive")
     if use_virtual_tracks and virtual_predictions_dict is None:
         raise ValueError(
             "track_mode=SPV requires virtual predictions, but they were not built"
@@ -3263,9 +3258,10 @@ def run_merg3r_augmented_refinement_loop(
         "filter_reproj_error_threshold": float(
             args.filter_reproj_error_threshold
         ),
-        "final_filter_reproj_error_threshold": (
-            float(final_filter_reproj_error_threshold)
-            if final_filter_reproj_error_threshold is not None
+        "bae_huber_delta": float(getattr(args, "bae_huber_delta", 1.0)),
+        "final_bae_huber_delta": (
+            float(final_bae_huber_delta)
+            if final_bae_huber_delta is not None
             else None
         ),
         "setup": {},
@@ -3410,16 +3406,13 @@ def run_merg3r_augmented_refinement_loop(
     )
 
     reconstruction = None
-    last_filter_reproj_error_threshold = float(args.filter_reproj_error_threshold)
     for outer_iter in range(args.num_refinement_iterations):
         is_final_round = outer_iter == args.num_refinement_iterations - 1
-        filter_reproj_error_threshold = (
-            _filter_reproj_error_threshold_for_iteration(args, outer_iter)
-        )
-        last_filter_reproj_error_threshold = filter_reproj_error_threshold
+        bae_huber_delta = _bae_huber_delta_for_iteration(args, outer_iter)
+        ba_options.bae_huber_delta = bae_huber_delta
         iter_stats = {
             "iteration": int(outer_iter + 1),
-            "filter_reproj_error_threshold": filter_reproj_error_threshold,
+            "bae_huber_delta": bae_huber_delta,
         }
         t_iter = time.time()
 
@@ -3490,7 +3483,7 @@ def run_merg3r_augmented_refinement_loop(
             angular_result = summarize_angular_errors_by_track_source(
                 reconstruction,
                 features,
-                filter_reproj_error_threshold,
+                args.filter_reproj_error_threshold,
                 return_errors_per_track=cache_angular_errors_for_bae_pruning,
             )
             if cache_angular_errors_for_bae_pruning:
@@ -3515,14 +3508,14 @@ def run_merg3r_augmented_refinement_loop(
             real_filter_stats = run_reprojection_filter_with_stats(
                 reconstruction,
                 args.filter_reproj_error_type,
-                filter_reproj_error_threshold,
+                args.filter_reproj_error_threshold,
                 log_prefix="real: ",
             )
             if use_virtual_tracks:
                 virtual_filter_stats = run_reprojection_filter_with_stats(
                     virtual_reconstruction,
                     args.filter_reproj_error_type,
-                    filter_reproj_error_threshold,
+                    args.filter_reproj_error_threshold,
                     negative_depth_observations=(negative_depth_observations_1indexed),
                     log_prefix="virtual: ",
                 )
@@ -3631,7 +3624,7 @@ def run_merg3r_augmented_refinement_loop(
             final_angular_errors = summarize_angular_errors_by_track_source(
                 reconstruction,
                 features,
-                last_filter_reproj_error_threshold,
+                args.filter_reproj_error_threshold,
             )
             final_angular_errors["seconds"] = time.time() - t0
         else:
