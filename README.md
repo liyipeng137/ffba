@@ -261,6 +261,15 @@ seed reconstruction
 --augmented_ba_normalized_reproj_threshold 1e-2
 ```
 
+如需仅在最后一轮收紧预过滤阈值，例如三轮分别使用
+`1.0 / 1.0 / 0.5`：
+
+```bash
+--num_refinement_iterations 3
+--filter_reproj_error_threshold 1.0
+--final_filter_reproj_error_threshold 0.5
+```
+
 ## BAE 后端
 
 原 GlueMap / pycolmap 路线默认依赖 Ceres solver；当前主流程默认使用 [third_party/bae](third_party/bae) 作为 PyTorch BA 后端：
@@ -474,6 +483,7 @@ python run_merg3r_gluemap_pipeline.py \
 | `--bae_fix_gauge` | `two_cams` | BAE gauge fixing 策略 |
 | `--bae_robust_loss` | `huber` | BAE robust loss |
 | `--num_refinement_iterations` | `3` | augmented refinement 外层轮数 |
+| `--final_filter_reproj_error_threshold` | unset | 仅在 augmented refinement 最后一轮使用的预过滤阈值；未设置时每轮均使用 `--filter_reproj_error_threshold` |
 
 ## 推荐检查点
 

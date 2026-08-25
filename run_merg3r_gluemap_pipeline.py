@@ -286,6 +286,16 @@ def parse_args():
         choices=["angular", "pixel", "normalized"],
     )
     parser.add_argument("--filter_reproj_error_threshold", type=float, default=0.5)
+    parser.add_argument(
+        "--final_filter_reproj_error_threshold",
+        type=float,
+        default=None,
+        help=(
+            "Optional reprojection-error threshold used only in the final "
+            "augmented refinement iteration. When omitted, "
+            "--filter_reproj_error_threshold is used for every iteration."
+        ),
+    )
     parser.add_argument("--virtual_init_angular_error_threshold", type=float)
     parser.add_argument(
         "--virtual_verify_mode",
@@ -757,6 +767,9 @@ def main():
         select_track_min_support=args.select_track_min_support,
         filter_reproj_error_type=args.filter_reproj_error_type,
         filter_reproj_error_threshold=args.filter_reproj_error_threshold,
+        final_filter_reproj_error_threshold=(
+            args.final_filter_reproj_error_threshold
+        ),
         virtual_init_angular_error_threshold=args.virtual_init_angular_error_threshold,
         virtual_verify_mode=args.virtual_verify_mode,
         save_virtual_tracks_debug=args.save_virtual_tracks_debug,

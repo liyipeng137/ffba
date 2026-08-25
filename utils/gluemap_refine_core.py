@@ -3192,6 +3192,14 @@ def triangulate_from_seed_reconstruction(
     return reconstruction
 
 
+def _filter_reproj_error_threshold_for_iteration(args, outer_iter):
+    final_threshold = getattr(args, "final_filter_reproj_error_threshold", None)
+    is_final_iteration = outer_iter == int(args.num_refinement_iterations) - 1
+    if is_final_iteration and final_threshold is not None:
+        return float(final_threshold)
+    return float(args.filter_reproj_error_threshold)
+
+
 def run_merg3r_augmented_refinement_loop(
     args,
     pycolmap,
@@ -3231,6 +3239,14 @@ def run_merg3r_augmented_refinement_loop(
             f"Unknown BA backend {ba_backend!r}, expected 'ceres' or 'bae'"
         )
     use_virtual_tracks = ba_backend == "ceres"
+    final_filter_reproj_error_threshold = getattr(
+        args, "final_filter_reproj_error_threshold", None
+    )
+    if (
+        final_filter_reproj_error_threshold is not None
+        and final_filter_reproj_error_threshold <= 0
+    ):
+        raise ValueError("final_filter_reproj_error_threshold must be positive")
     if use_virtual_tracks and virtual_predictions_dict is None:
         raise ValueError(
             "track_mode=SPV requires virtual predictions, but they were not built"
@@ -3244,6 +3260,14 @@ def run_merg3r_augmented_refinement_loop(
         "refinement_mode": "SPV" if use_virtual_tracks else "SP",
         "ba_backend": ba_backend,
         "num_refinement_iterations": int(args.num_refinement_iterations),
+        "filter_reproj_error_threshold": float(
+            args.filter_reproj_error_threshold
+        ),
+        "final_filter_reproj_error_threshold": (
+            float(final_filter_reproj_error_threshold)
+            if final_filter_reproj_error_threshold is not None
+            else None
+        ),
         "setup": {},
         "iterations": [],
     }
@@ -3386,8 +3410,17 @@ def run_merg3r_augmented_refinement_loop(
     )
 
     reconstruction = None
+    last_filter_reproj_error_threshold = float(args.filter_reproj_error_threshold)
     for outer_iter in range(args.num_refinement_iterations):
-        iter_stats = {"iteration": int(outer_iter + 1)}
+        is_final_round = outer_iter == args.num_refinement_iterations - 1
+        filter_reproj_error_threshold = (
+            _filter_reproj_error_threshold_for_iteration(args, outer_iter)
+        )
+        last_filter_reproj_error_threshold = filter_reproj_error_threshold
+        iter_stats = {
+            "iteration": int(outer_iter + 1),
+            "filter_reproj_error_threshold": filter_reproj_error_threshold,
+        }
         t_iter = time.time()
 
         t0 = time.time()
@@ -3457,7 +3490,7 @@ def run_merg3r_augmented_refinement_loop(
             angular_result = summarize_angular_errors_by_track_source(
                 reconstruction,
                 features,
-                args.filter_reproj_error_threshold,
+                filter_reproj_error_threshold,
                 return_errors_per_track=cache_angular_errors_for_bae_pruning,
             )
             if cache_angular_errors_for_bae_pruning:
@@ -3482,14 +3515,14 @@ def run_merg3r_augmented_refinement_loop(
             real_filter_stats = run_reprojection_filter_with_stats(
                 reconstruction,
                 args.filter_reproj_error_type,
-                args.filter_reproj_error_threshold,
+                filter_reproj_error_threshold,
                 log_prefix="real: ",
             )
             if use_virtual_tracks:
                 virtual_filter_stats = run_reprojection_filter_with_stats(
                     virtual_reconstruction,
                     args.filter_reproj_error_type,
-                    args.filter_reproj_error_threshold,
+                    filter_reproj_error_threshold,
                     negative_depth_observations=(negative_depth_observations_1indexed),
                     log_prefix="virtual: ",
                 )
@@ -3539,7 +3572,6 @@ def run_merg3r_augmented_refinement_loop(
         # intermediate BAE rounds the next triangulation re-creates points with
         # clear_points=True, so its pruning is wasted. ceres rounds always
         # filter (their virtual-driven loop and per-round cleanup rely on it).
-        is_final_round = outer_iter == args.num_refinement_iterations - 1
         ba_options.run_post_ba_filter = use_virtual_tracks or is_final_round
 
         t0 = time.time()
@@ -3599,7 +3631,7 @@ def run_merg3r_augmented_refinement_loop(
             final_angular_errors = summarize_angular_errors_by_track_source(
                 reconstruction,
                 features,
-                args.filter_reproj_error_threshold,
+                last_filter_reproj_error_threshold,
             )
             final_angular_errors["seconds"] = time.time() - t0
         else:

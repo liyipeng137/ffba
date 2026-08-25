@@ -61,6 +61,7 @@ class GluemapSpvRefineConfig:
     select_track_min_support: int = 512
     filter_reproj_error_type: str = "angular"
     filter_reproj_error_threshold: float = 0.5
+    final_filter_reproj_error_threshold: float | None = None
     virtual_init_angular_error_threshold: float | None = None
     virtual_verify_mode: str = "n2"
     save_virtual_tracks_debug: bool = False
@@ -131,6 +132,9 @@ def _make_refine_args(config: GluemapSpvRefineConfig):
         enable_reprojection_filter=True,
         filter_reproj_error_type=config.filter_reproj_error_type,
         filter_reproj_error_threshold=config.filter_reproj_error_threshold,
+        final_filter_reproj_error_threshold=(
+            config.final_filter_reproj_error_threshold
+        ),
         virtual_init_angular_error_threshold=(
             config.virtual_init_angular_error_threshold
         ),
@@ -1007,7 +1011,10 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
         args,
         "Running augmented refinement: "
         f"iterations={args.num_refinement_iterations}, "
-        f"ba_max_iters={args.ba_max_num_iterations}",
+        f"ba_max_iters={args.ba_max_num_iterations}, "
+        f"filter_reproj_threshold={args.filter_reproj_error_threshold}, "
+        "final_filter_reproj_threshold="
+        f"{args.final_filter_reproj_error_threshold}",
     )
     t0 = time.time()
     (

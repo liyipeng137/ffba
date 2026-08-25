@@ -17,6 +17,35 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from utils import gluemap_refine_core as ref
 
 
+def test_final_filter_reproj_error_threshold_defaults_to_legacy_behavior():
+    args = SimpleNamespace(
+        filter_reproj_error_threshold=1.0,
+        num_refinement_iterations=3,
+    )
+
+    thresholds = [
+        ref._filter_reproj_error_threshold_for_iteration(args, outer_iter)
+        for outer_iter in range(args.num_refinement_iterations)
+    ]
+
+    assert thresholds == [1.0, 1.0, 1.0]
+
+
+def test_final_filter_reproj_error_threshold_only_applies_to_final_iteration():
+    args = SimpleNamespace(
+        filter_reproj_error_threshold=1.0,
+        final_filter_reproj_error_threshold=0.5,
+        num_refinement_iterations=3,
+    )
+
+    thresholds = [
+        ref._filter_reproj_error_threshold_for_iteration(args, outer_iter)
+        for outer_iter in range(args.num_refinement_iterations)
+    ]
+
+    assert thresholds == [1.0, 1.0, 0.5]
+
+
 def _scalar_snap_prior_tracks_to_features(
     tracks,
     features,
