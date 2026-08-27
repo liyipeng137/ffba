@@ -2125,9 +2125,12 @@ def filter_low_coverage_frames(
     p_counts,
     min_frame_observations,
     enabled=True,
+    keep_indices=None,
 ):
     total_counts = s_counts + p_counts
-    if not enabled:
+    if keep_indices is not None:
+        keep_indices = np.asarray(keep_indices, dtype=np.int64)
+    elif not enabled:
         keep_indices = np.arange(len(image_names), dtype=np.int64)
     else:
         keep_indices = np.where(total_counts >= min_frame_observations)[0]
@@ -2189,25 +2192,37 @@ def filter_low_coverage_frames(
 
 
 def _write_cameras_and_images(
-    database, pycolmap, image_names, image_size_hw, intrinsic, camera_model
+    database,
+    pycolmap,
+    image_names,
+    image_size_hw,
+    intrinsics,
+    camera_model,
+    intrinsics_mapping=None,
 ):
     from gluemap.utils.colmap import (
         camera_from_intrinsics_matrix,
     )  # noqa: I001, PLC0415
 
     height, width = image_size_hw
-    camera = camera_from_intrinsics_matrix(
-        intrinsic,
-        camera_model,
-        width,
-        height,
-        1,
-    )
-    database.write_camera(camera)
+    intrinsics = np.asarray(intrinsics, dtype=np.float64)
+    if intrinsics.ndim == 2:
+        intrinsics = intrinsics[None]
+    if intrinsics_mapping is None:
+        intrinsics_mapping = {idx: 0 for idx in range(len(image_names))}
+    for camera_idx, intrinsic in enumerate(intrinsics):
+        camera = camera_from_intrinsics_matrix(
+            intrinsic,
+            camera_model,
+            width,
+            height,
+            camera_idx + 1,
+        )
+        database.write_camera(camera, use_camera_id=True)
     for idx, name in enumerate(image_names):
         image = pycolmap.Image()
         image.image_id = idx + 1
-        image.camera_id = 1
+        image.camera_id = int(intrinsics_mapping[idx]) + 1
         image.name = name
         database.write_image(image, use_image_id=True)
 
@@ -2507,6 +2522,7 @@ def write_tracks_database(
     merge_threshold=1e-3,
     snap_target="features",
     match_topology="all_pairs",
+    intrinsics_mapping=None,
 ):
     pycolmap = _lazy_import_pycolmap()
     if os.path.exists(db_path):
@@ -2536,7 +2552,13 @@ def write_tracks_database(
     )
     database = pycolmap.Database.open(db_path)
     _write_cameras_and_images(
-        database, pycolmap, image_names, image_size_hw, intrinsic, camera_model
+        database,
+        pycolmap,
+        image_names,
+        image_size_hw,
+        intrinsic,
+        camera_model,
+        intrinsics_mapping=intrinsics_mapping,
     )
     for idx, keypoints_i in enumerate(keypoints):
         database.write_keypoints(idx + 1, keypoints_i)

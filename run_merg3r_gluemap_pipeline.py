@@ -3,6 +3,7 @@ import json
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import torch
@@ -16,8 +17,17 @@ from algos.utils import (
 from utils.feedforward import load_model, run_inference_step_by_step
 from utils.image_pyramid import (
     build_two_resolution_image_tensors,
+    iter_image_files,
     load_image_tensors_from_dir,
     scale_intrinsics_with_pyramid_records,
+)
+from utils.pano_rig import (
+    PanoRigMetadata,
+    build_rig_pose_pairs,
+    expand_center_extrinsics,
+    intrinsics_for_image_size,
+    intrinsics_from_pinhole_crop,
+    make_pano_rig_metadata,
 )
 from utils.gluemap_spv_refine import (
     CAMERA_MODEL as PIPELINE_CAMERA_MODEL,
@@ -52,6 +62,7 @@ class Merg3rCoarseState:
     raw_depth_conf: np.ndarray | None
     retrieval_sim_matrix: np.ndarray | None
     image_pyramid: dict | None
+    rig: PanoRigMetadata | None = None
 
 
 def parse_args():
@@ -70,6 +81,31 @@ def parse_args():
     parser.add_argument("--num_images", type=int, default=-1)
     parser.add_argument("--subsample", type=int, default=1)
     parser.add_argument("--multi_dirs", action="store_true")
+    parser.add_argument(
+        "--pano_hfov_degrees",
+        type=float,
+        default=90.0,
+        help="Horizontal FOV used to export every square perspective view.",
+    )
+    parser.add_argument(
+        "--pano_pair_max_axis_angle",
+        type=float,
+        default=85.0,
+        help=(
+            "Maximum viewing-axis angle for cross-frame rig pair candidates. "
+            "The default connects adjacent 60-degree virtual views but not "
+            "the 120-degree left/right pair."
+        ),
+    )
+    parser.add_argument(
+        "--stop_before_bae",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Write the rig-aware coarse model and merged database, then stop "
+            "before triangulation/BAE. This is the supported pano-v1 mode."
+        ),
+    )
     parser.add_argument(
         "--image_pyramid",
         action=argparse.BooleanOptionalAction,
@@ -115,7 +151,7 @@ def parse_args():
     )
     parser.add_argument("--alignment_type", type=str, default="weighted_iterative")
     parser.add_argument("--pair_k_pose", type=int, default=25)
-    parser.add_argument("--pair_pose_rotation_threshold", type=float, default=30.0)
+    parser.add_argument("--pair_pose_rotation_threshold", type=float, default=75.0)
     parser.add_argument(
         "--path_tracker",
         type=str,
@@ -234,8 +270,8 @@ def parse_args():
     )
     parser.add_argument(
         "--bae_optimize_intrinsics",
-        default=True,
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=False,
         help=(
             "Let the BAE backend optimize SIMPLE_PINHOLE f while fixing cx/cy. "
             "Ignored by the Ceres backend."
@@ -429,14 +465,19 @@ def summarize_pair_graph(pairs, num_images):
 
 def run_merg3r_coarse_stage(args, output_dir):
     t0 = time.time()
+    center_dataset = Path(args.dataset) / "center"
+    if not center_dataset.is_dir():
+        raise ValueError(
+            f"Pano input must contain a center/ directory: {center_dataset}"
+        )
     image_pyramid_result = None
     if args.image_pyramid:
         stage2_scale_factor = (
             None if args.stage2_scale_factor == 0 else args.stage2_scale_factor
         )
         image_pyramid_result = build_two_resolution_image_tensors(
-            args.dataset,
-            output_dir / "image_pyramid",
+            center_dataset,
+            output_dir / "image_pyramid_stage_a_center",
             stage1_downscale_n=args.stage1_downscale_n,
             multiple=args.stage1_multiple,
             stage2_scale_factor=stage2_scale_factor,
@@ -468,7 +509,7 @@ def run_merg3r_coarse_stage(args, output_dir):
         }
     else:
         low_images, low_image_names = load_image_tensors_from_dir(
-            args.dataset,
+            center_dataset,
             device="cpu",
             subsample=args.subsample,
             num_images=args.num_images,
@@ -591,12 +632,237 @@ def run_merg3r_coarse_stage(args, output_dir):
     return state, {"seconds": time.time() - t0}
 
 
+def _pyramid_intrinsics(result, hfov_degrees):
+    low_intrinsics = []
+    high_intrinsics = []
+    for record in result.records:
+        low_k, high_k = intrinsics_from_pinhole_crop(record, hfov_degrees)
+        low_intrinsics.append(low_k)
+        high_intrinsics.append(high_k)
+    return np.asarray(low_intrinsics), np.asarray(high_intrinsics)
+
+
+def prepare_pano_stage_b(args, output_dir, center_state):
+    if args.multi_dirs:
+        raise ValueError("Pano v1 does not support --multi_dirs")
+    if args.vggsfm_group_strategy != "pose":
+        raise ValueError(
+            "Pano v1 supports --vggsfm_group_strategy=pose only because side "
+            "views do not have Stage A depth maps"
+        )
+
+    stage2_scale_factor = (
+        None if args.stage2_scale_factor == 0 else args.stage2_scale_factor
+    )
+    sensor_results = []
+    sensor_low_intrinsics = []
+    sensor_high_intrinsics = []
+    all_sensor_frame_names = {}
+    for sensor_name in ("left", "center", "right"):
+        sensor_dir = Path(args.dataset) / sensor_name
+        if not sensor_dir.is_dir():
+            raise ValueError(
+                "Pano input must contain left/, center/, and right/; missing "
+                f"{sensor_dir}"
+            )
+        all_sensor_frame_names[sensor_name] = [
+            path.name for path in iter_image_files(sensor_dir, recursive=False)
+        ]
+        if args.image_pyramid:
+            result = build_two_resolution_image_tensors(
+                sensor_dir,
+                output_dir / "image_pyramid_stage_b" / sensor_name,
+                stage1_downscale_n=args.stage1_downscale_n,
+                multiple=args.stage1_multiple,
+                stage2_scale_factor=stage2_scale_factor,
+                recursive=False,
+                num_workers=args.image_pyramid_workers,
+                subsample=args.subsample,
+                num_images=args.num_images,
+            )
+            low_k, high_k = _pyramid_intrinsics(result, args.pano_hfov_degrees)
+        else:
+            high_images, image_names = load_image_tensors_from_dir(
+                sensor_dir,
+                device="cpu",
+                subsample=args.subsample,
+                num_images=args.num_images,
+                recursive=False,
+            )
+            result = SimpleNamespace(
+                high_images=high_images,
+                low_images=high_images,
+                image_names=image_names,
+                records=[],
+                manifest_path=None,
+            )
+            intrinsic = intrinsics_for_image_size(
+                high_images.shape[-2:], args.pano_hfov_degrees
+            )
+            low_k = np.repeat(intrinsic[None], len(image_names), axis=0)
+            high_k = low_k.copy()
+        sensor_results.append(result)
+        sensor_low_intrinsics.append(low_k)
+        sensor_high_intrinsics.append(high_k)
+
+    if not all_sensor_frame_names["center"]:
+        raise ValueError("Pano input directories contain no supported images")
+    for sensor_name in ("left", "right"):
+        if all_sensor_frame_names[sensor_name] != all_sensor_frame_names["center"]:
+            raise ValueError(
+                f"{sensor_name}/ must contain exactly the same image basenames "
+                "as center/"
+            )
+    if args.image_pyramid:
+        source_sizes = {
+            tuple(record.source_size_wh)
+            for result in sensor_results
+            for record in result.records
+        }
+        if len(source_sizes) != 1:
+            raise ValueError(
+                "All pano source images must have identical dimensions, got "
+                f"{sorted(source_sizes)}"
+            )
+
+    frame_names = [Path(name).name for name in sensor_results[1].image_names]
+    for sensor_name, result in zip(
+        ("left", "center", "right"), sensor_results, strict=True
+    ):
+        names = [Path(name).name for name in result.image_names]
+        if names != frame_names:
+            raise ValueError(
+                f"{sensor_name}/ filenames do not exactly match center/ after "
+                "--subsample/--num_images selection"
+            )
+    if frame_names != [Path(name).name for name in center_state.high_image_names]:
+        raise ValueError("Stage A center frames do not match Stage B center frames")
+
+    metadata = make_pano_rig_metadata(frame_names, args.pano_hfov_degrees)
+    if metadata.num_frames < 2:
+        raise ValueError("Pano v1 requires at least two synchronized rig frames")
+    high_images = torch.stack(
+        [
+            sensor_results[sensor_idx].high_images[frame_idx]
+            for frame_idx in range(metadata.num_frames)
+            for sensor_idx in range(len(metadata.sensor_names))
+        ]
+    )
+    high_shapes = {tuple(result.high_images.shape[-2:]) for result in sensor_results}
+    low_shapes = {tuple(result.low_images.shape[-2:]) for result in sensor_results}
+    if len(high_shapes) != 1 or len(low_shapes) != 1:
+        raise ValueError(
+            "All pano sensors must have identical processed shapes: "
+            f"low={sorted(low_shapes)}, high={sorted(high_shapes)}"
+        )
+    high_image_size_hw = next(iter(high_shapes))
+    low_image_size_hw = next(iter(low_shapes))
+    if center_state.raw_depth.shape[0] != metadata.num_frames:
+        raise ValueError("Stage A center depth count does not match pano frames")
+
+    extrinsic = expand_center_extrinsics(center_state.extrinsic, metadata).astype(
+        np.float32
+    )
+    intrinsic_low = np.asarray(
+        [
+            sensor_low_intrinsics[sensor_idx][frame_idx]
+            for frame_idx in range(metadata.num_frames)
+            for sensor_idx in range(len(metadata.sensor_names))
+        ],
+        dtype=np.float32,
+    )
+    intrinsic_high = np.asarray(
+        [
+            sensor_high_intrinsics[sensor_idx][frame_idx]
+            for frame_idx in range(metadata.num_frames)
+            for sensor_idx in range(len(metadata.sensor_names))
+        ],
+        dtype=np.float32,
+    )
+    pairs = build_rig_pose_pairs(
+        extrinsic,
+        metadata,
+        max_neighbors=args.pair_k_pose,
+        max_axis_angle_degrees=args.pano_pair_max_axis_angle,
+    )
+    pair_graph_stats = summarize_pair_graph(pairs, metadata.num_images)
+    return Merg3rCoarseState(
+        high_images=high_images,
+        low_image_names=list(center_state.low_image_names),
+        high_image_names=[
+            f"{sensor_name}/{frame_name}"
+            for frame_name in frame_names
+            for sensor_name in metadata.sensor_names
+        ],
+        low_image_size_hw=tuple(int(value) for value in low_image_size_hw),
+        high_image_size_hw=tuple(int(value) for value in high_image_size_hw),
+        final_predictions=center_state.final_predictions,
+        extrinsic=extrinsic,
+        intrinsic_low=intrinsic_low,
+        intrinsic_high=intrinsic_high,
+        image_ids=np.arange(metadata.num_images, dtype=np.int64),
+        pairs=pairs,
+        pair_graph_stats=pair_graph_stats,
+        raw_depth=center_state.raw_depth,
+        raw_depth_conf=center_state.raw_depth_conf,
+        retrieval_sim_matrix=None,
+        image_pyramid={
+            "enabled": bool(args.image_pyramid),
+            "stage_a_center": center_state.image_pyramid,
+            "stage_b_manifests": {
+                sensor_name: (
+                    str(result.manifest_path)
+                    if result.manifest_path is not None
+                    else None
+                )
+                for sensor_name, result in zip(
+                    metadata.sensor_names, sensor_results, strict=True
+                )
+            },
+        },
+        rig=metadata,
+    )
+
+
+def write_pano_stage_b_summary(output_dir, args, state):
+    payload = {
+        "stage": "pano_stage_b_input_and_pose_expansion",
+        "status": "completed",
+        "input_contract": {
+            "directories": ["left", "center", "right"],
+            "matching": "identical unique basenames in all directories",
+            "source_images": "square, same resolution, same extraction FOV",
+            "sensor_yaws_degrees": [-60.0, 0.0, 60.0],
+            "hfov_degrees": float(args.pano_hfov_degrees),
+        },
+        "rig": state.rig.to_dict(),
+        "extrinsic_shape": list(state.extrinsic.shape),
+        "intrinsic_low_shape": list(state.intrinsic_low.shape),
+        "intrinsic_high_shape": list(state.intrinsic_high.shape),
+        "pair_selection": {
+            "strategy": "cross_frame_frustum_overlap_round_robin_sensor",
+            "same_frame_pairs": False,
+            "max_neighbors_per_image": int(args.pair_k_pose),
+            "max_axis_angle_degrees": float(args.pano_pair_max_axis_angle),
+            "pair_graph": state.pair_graph_stats,
+        },
+        "depth": {
+            "scope": "center_frames_only",
+            "shape": list(state.raw_depth.shape),
+            "copied_to_side_views": False,
+        },
+    }
+    with open(output_dir / "pipeline_stage_b_pano_summary.json", "w") as f:
+        json.dump(payload, f, indent=2)
+
+
 def write_stage_a_summary(output_dir, args, state, timing):
     summary = {
         "source": "MERG3R/run_merg3r_gluemap_pipeline.py",
         "stage": "merg3r_coarse",
         "status": "stage_a_completed",
-        "dataset": args.dataset,
+        "dataset": str(Path(args.dataset) / "center"),
+        "image_scope": "center_only",
         "pipeline_defaults": {
             "model": PIPELINE_MODEL,
             "camera_model": PIPELINE_CAMERA_MODEL,
@@ -666,19 +932,32 @@ def main():
                     "group_strategy": args.vggsfm_group_strategy,
                     "track_mode": PIPELINE_TRACK_MODE,
                 },
+                "pano_v1": {
+                    "input_directories": ["left", "center", "right"],
+                    "sensor_yaws_degrees": [-60.0, 0.0, 60.0],
+                    "stage_a_images": "center only",
+                    "stage_b_images": "left + center + right",
+                    "frame_filtering": "center driven whole triplet",
+                    "stop_before_bae": bool(args.stop_before_bae),
+                },
                 "args": vars(args),
             },
             f,
             indent=2,
         )
 
-    state, timing = run_merg3r_coarse_stage(args, output_dir)
-    write_stage_a_summary(output_dir, args, state, timing)
+    center_state, timing = run_merg3r_coarse_stage(args, output_dir)
+    write_stage_a_summary(output_dir, args, center_state, timing)
+    state = prepare_pano_stage_b(args, output_dir, center_state)
+    write_pano_stage_b_summary(output_dir, args, state)
 
-    print(f"[PIPELINE] Stage A done: output_dir={output_dir}")
+    print(
+        "[PIPELINE] Stage A center-only and Stage B rig expansion done: "
+        f"output_dir={output_dir}"
+    )
     print(
         "[PIPELINE] "
-        f"images={state.extrinsic.shape[0]}, "
+        f"rig_frames={state.rig.num_frames}, images={state.extrinsic.shape[0]}, "
         f"pairs={state.pairs.shape[0]}, "
         f"low_image_size_hw={state.low_image_size_hw}, "
         f"high_image_size_hw={state.high_image_size_hw}, "
@@ -773,13 +1052,20 @@ def main():
         save_virtual_tracks_debug=args.save_virtual_tracks_debug,
         debug_print=args.debug_print,
         work_image_workers=args.image_pyramid_workers,
+        stop_before_bae=args.stop_before_bae,
     )
     refine_result = run_gluemap_spv_refinement(state, output_dir, refine_config)
-    print(
-        "[PIPELINE] Refinement done: "
-        f"refined_dir={refine_result.refined_dir}, "
-        f"virtual_dir={refine_result.virtual_refined_dir}"
-    )
+    if refine_result.refined_dir is None:
+        print(
+            "[PIPELINE] Pano pre-BAE preparation done: "
+            f"coarse_rig_dir={refine_result.pre_bae_dir}"
+        )
+    else:
+        print(
+            "[PIPELINE] Refinement done: "
+            f"refined_dir={refine_result.refined_dir}, "
+            f"virtual_dir={refine_result.virtual_refined_dir}"
+        )
 
 
 if __name__ == "__main__":

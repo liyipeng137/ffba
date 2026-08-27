@@ -15,6 +15,13 @@ from PIL import Image, ImageDraw, ImageOps
 
 from algos.utils import export_prediction_depth_maps
 from utils import gluemap_refine_core as ref
+from utils.pano_rig import (
+    build_pose_audit,
+    center_driven_keep_indices,
+    configure_rig_database,
+    filter_metadata,
+    write_rig_reconstruction,
+)
 
 CAMERA_MODEL = "SIMPLE_PINHOLE"
 S_DATABASE_MODE = "sift"
@@ -67,6 +74,7 @@ class GluemapSpvRefineConfig:
     save_virtual_tracks_debug: bool = False
     debug_print: bool = True
     work_image_workers: int = 16
+    stop_before_bae: bool = True
 
 
 @dataclass
@@ -77,12 +85,13 @@ class GluemapSpvRefineResult:
     intrinsic: np.ndarray
     intrinsics_mapping: dict[int, int]
     stats: dict
-    refined_dir: Path
+    pre_bae_dir: Path
+    refined_dir: Path | None
     virtual_refined_dir: Path | None
 
 
 def _make_refine_args(config: GluemapSpvRefineConfig):
-    use_virtual_tracks = config.ba_backend == "ceres"
+    use_virtual_tracks = config.ba_backend == "ceres" and not config.stop_before_bae
     return SimpleNamespace(
         path_tracker=config.path_tracker,
         track_mode="SPV" if use_virtual_tracks else "SP",
@@ -169,14 +178,13 @@ def _format_cuda_memory_snapshot(snapshot):
 
 
 def _save_one_work_image(item):
-    idx, image, images_dir = item
-    name = f"frame_{idx:06d}.png"
+    _idx, image, images_dir, name = item
     array = (image.permute(1, 2, 0).numpy() * 255.0).round().astype(np.uint8)
     Image.fromarray(array).save(images_dir / name)
     return name
 
 
-def _save_work_images(images, output_dir, num_workers=16):
+def _save_work_images(images, output_dir, num_workers=16, image_names=None):
     images_dir = output_dir / "images"
     images_dir.mkdir(parents=True, exist_ok=True)
     images_cpu = images.detach().cpu().float().clamp(0, 1)
@@ -186,9 +194,21 @@ def _save_work_images(images, output_dir, num_workers=16):
         raise ValueError("num_workers must be >= 1")
     if int(images_cpu.shape[0]) == 0:
         raise ValueError("Cannot save work images from an empty tensor")
+    if image_names is None:
+        image_names = [
+            f"frame_{idx:06d}.png" for idx in range(int(images_cpu.shape[0]))
+        ]
+    image_names = [str(name) for name in image_names]
+    if len(image_names) != int(images_cpu.shape[0]):
+        raise ValueError("Work image name count does not match image tensor")
+    if len(set(image_names)) != len(image_names):
+        raise ValueError("Work image names must be unique")
     worker_count = min(num_workers, int(images_cpu.shape[0]))
 
-    work_items = [(idx, image, images_dir) for idx, image in enumerate(images_cpu)]
+    work_items = [
+        (idx, image, images_dir, image_names[idx])
+        for idx, image in enumerate(images_cpu)
+    ]
     if worker_count == 1:
         image_names = [_save_one_work_image(item) for item in work_items]
     else:
@@ -571,6 +591,13 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
     args = _make_refine_args(config)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    rig = coarse_state.rig
+    if rig is None:
+        raise ValueError("The pano branch requires explicit rig metadata")
+    if not config.stop_before_bae:
+        raise NotImplementedError(
+            "Pano rig BAE is not implemented yet; keep --stop-before-bae enabled"
+        )
 
     t_start = time.time()
     t0 = time.time()
@@ -578,6 +605,7 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
         coarse_state.high_images,
         output_dir,
         num_workers=config.work_image_workers,
+        image_names=rig.image_names,
     )
     save_work_images_seconds = time.time() - t0
     image_size_hw = tuple(coarse_state.high_image_size_hw)
@@ -605,6 +633,8 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
         "bae_robust_loss": config.bae_robust_loss,
         "bae_huber_delta": config.bae_huber_delta,
         "final_bae_huber_delta": config.final_bae_huber_delta,
+        "stop_before_bae": bool(config.stop_before_bae),
+        "rig": rig.to_dict(),
         "timing": {"save_work_images": save_work_images_seconds},
         "work_images": {
             "images_dir": str(images_dir),
@@ -722,7 +752,9 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
     prefilter_image_names = list(image_names)
     _debug(args, "Preparing prefilter SIFT database")
     t0 = time.time()
-    prefilter_intrinsics_mapping = {idx: 0 for idx in range(len(image_names))}
+    prefilter_intrinsics_mapping = {
+        idx: int(sensor_idx) for idx, sensor_idx in enumerate(rig.image_sensor_indices)
+    }
     features, sift_prefilter_stats = ref.prepare_sift_database_for_refine(
         args,
         output_dir,
@@ -748,6 +780,13 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
         args, ref.format_count_summary("S+P observations/frame", s_counts + p_counts)
     )
 
+    center_indices = np.asarray(rig.center_image_indices, dtype=np.int64)
+    center_total_counts = s_counts[center_indices] + p_counts[center_indices]
+    kept_frame_indices, forced_keep_indices = center_driven_keep_indices(
+        rig,
+        center_total_counts,
+        args.min_frame_observations,
+    )
     (
         image_names,
         images,
@@ -767,12 +806,25 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
         p_counts,
         args.min_frame_observations,
         enabled=True,
+        keep_indices=forced_keep_indices,
+    )
+    rig = filter_metadata(rig, kept_frame_indices)
+    coverage_stats.update(
+        {
+            "strategy": "center_driven_whole_rig_frame",
+            "center_observations": center_total_counts.tolist(),
+            "kept_frame_indices": kept_frame_indices.tolist(),
+            "kept_frame_source_indices": list(rig.frame_source_indices),
+            "dropped_frame_indices": sorted(
+                set(range(len(center_total_counts))) - set(kept_frame_indices.tolist())
+            ),
+        }
     )
     stats["frame_filtering"] = coverage_stats
     stats["num_images_after_filter"] = len(image_names)
     _debug(
         args,
-        "Frame filtering: "
+        "Center-driven rig frame filtering: "
         f"min_obs={coverage_stats['min_frame_observations']}, "
         f"dropped={len(coverage_stats['dropped_indices'])}, "
         f"remaining={len(image_names)}",
@@ -794,9 +846,10 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
     kept_indices = np.asarray(coverage_stats["kept_indices"], dtype=np.int64)
     initial_intrinsics_high = initial_intrinsics_high_all[kept_indices]
     initial_intrinsics_low = initial_intrinsics_low_all[kept_indices]
-    depth = coarse_state.raw_depth[kept_indices]
+    center_depth_indices = np.asarray(rig.frame_source_indices, dtype=np.int64)
+    depth = coarse_state.raw_depth[center_depth_indices]
     depth_conf = (
-        coarse_state.raw_depth_conf[kept_indices]
+        coarse_state.raw_depth_conf[center_depth_indices]
         if coarse_state.raw_depth_conf is not None
         else None
     )
@@ -809,22 +862,38 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
         depth_conf_threshold = 2.0
     stats["depth_export"] = export_prediction_depth_maps(
         depth_predictions,
-        image_names,
+        [image_names[idx] for idx in rig.center_image_indices],
         output_dir / "pred_depth",
         conf_threshold=depth_conf_threshold,
     )
     stats["timing"]["depth_export"] = time.time() - t0
 
     t0 = time.time()
-    (
-        averaged_intrinsics,
-        global_intrinsics,
-        intrinsics_mapping,
-    ) = ref.average_intrinsics_with_gluemap(initial_intrinsics_high, CAMERA_MODEL)
+    intrinsics_mapping = {
+        idx: int(sensor_idx) for idx, sensor_idx in enumerate(rig.image_sensor_indices)
+    }
+    sensor_intrinsics = []
+    for sensor_idx in range(len(rig.sensor_names)):
+        image_idx = rig.image_sensor_indices.index(sensor_idx)
+        sensor_intrinsics.append(initial_intrinsics_high[image_idx].copy())
+    averaged_intrinsics = np.asarray(
+        [sensor_intrinsics[sensor_idx] for sensor_idx in rig.image_sensor_indices]
+    )
+    global_intrinsics = [
+        torch.from_numpy(intrinsic).to(torch.float64).unsqueeze(0)
+        for intrinsic in sensor_intrinsics
+    ]
     stats["timing"]["intrinsics_averaging"] = time.time() - t0
-    intrinsic = averaged_intrinsics[0]
+    intrinsic = sensor_intrinsics[rig.center_sensor_index]
     stats["intrinsics"] = ref.summarize_intrinsics(
         initial_intrinsics_high, averaged_intrinsics, CAMERA_MODEL
+    )
+    stats["intrinsics"].update(
+        {
+            "method": "fixed_from_panorama_extraction_contract",
+            "mapping": "one_camera_per_rig_sensor",
+            "optimized": False,
+        }
     )
     ref.save_intrinsics_artifacts(
         output_dir,
@@ -835,7 +904,7 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
     )
     _debug(
         args,
-        "Intrinsics averaged: "
+        "Fixed panorama intrinsics prepared: "
         f"fx={intrinsic[0, 0]:.2f}, fy={intrinsic[1, 1]:.2f}, "
         f"cx={intrinsic[0, 2]:.2f}, cy={intrinsic[1, 2]:.2f}, "
         f"time={stats['timing']['intrinsics_averaging']:.2f}s",
@@ -879,7 +948,7 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
         virtual_predictions_dict = None
         stats["virtual_tracks"] = {
             "enabled": False,
-            "reason": "BAE backend uses SP real tracks only",
+            "reason": "pano v1 stops before BAE and has center-only depth",
         }
         stats["timing"]["virtual_tracks"] = 0.0
         _debug(args, "Skipping virtual tracks for BAE SP refinement")
@@ -916,7 +985,7 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
         str(output_dir / "database_vggsfm_prior.db"),
         image_names,
         image_size_hw,
-        intrinsic,
+        sensor_intrinsics,
         CAMERA_MODEL,
         prior_tracks,
         features=features,
@@ -926,6 +995,7 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
         merge_threshold=args.prior_keypoint_merge_threshold,
         snap_target="sift",
         match_topology=args.prior_match_topology,
+        intrinsics_mapping=intrinsics_mapping,
     )
     stats["timing"]["write_prior_db"] = time.time() - t0
     prior_db_stats = stats["prior_database"]
@@ -952,19 +1022,72 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
         primary_features_first=False,
     )
     stats["timing"]["merge_databases"] = time.time() - t0
+    configure_rig_database(
+        output_dir / "database_merged.db",
+        image_names,
+        image_size_hw,
+        sensor_intrinsics,
+        rig,
+        camera_model=CAMERA_MODEL,
+    )
 
-    coarse_dir = output_dir / "coarse"
-    _debug(args, f"Writing coarse reconstruction: {coarse_dir}")
+    coarse_dir = output_dir / "pre_bae_rig"
+    _debug(args, f"Writing rig-aware pre-BAE reconstruction: {coarse_dir}")
     t0 = time.time()
-    ref.write_coarse_reconstruction(
+    pre_bae_reconstruction = write_rig_reconstruction(
         coarse_dir,
         image_names,
         image_size_hw,
-        extrinsic,
-        intrinsic,
-        CAMERA_MODEL,
+        extrinsic[np.asarray(rig.center_image_indices, dtype=np.int64)],
+        sensor_intrinsics,
+        rig,
+        camera_model=CAMERA_MODEL,
     )
     stats["timing"]["write_coarse"] = time.time() - t0
+    stats["pre_bae_reconstruction"] = {
+        "directory": str(coarse_dir),
+        "num_rigs": int(len(pre_bae_reconstruction.rigs)),
+        "num_cameras": int(len(pre_bae_reconstruction.cameras)),
+        "num_frames": int(len(pre_bae_reconstruction.frames)),
+        "num_images": int(len(pre_bae_reconstruction.images)),
+        "num_points3D": int(len(pre_bae_reconstruction.points3D)),
+        "pose_semantics": "sensor_from_world = sensor_from_rig * rig_from_world",
+    }
+    pose_audit = build_pose_audit(extrinsic, rig)
+    pose_audit_path = output_dir / "pre_bae_rig_pose_audit.json"
+    _write_json(pose_audit_path, pose_audit)
+    stats["pre_bae_reconstruction"]["pose_audit"] = str(pose_audit_path)
+    stats["pre_bae_reconstruction"]["max_projection_center_spread"] = pose_audit[
+        "max_projection_center_spread"
+    ]
+    stats["pre_bae_reconstruction"]["max_absolute_yaw_error_degrees"] = pose_audit[
+        "max_absolute_yaw_error_degrees"
+    ]
+
+    if config.stop_before_bae:
+        stats["timing"]["total"] = time.time() - t_start
+        stats["status"] = "stopped_before_bae_as_requested"
+        stats["output"] = {
+            "pre_bae_dir": str(coarse_dir),
+            "database_merged": str(output_dir / "database_merged.db"),
+            "refined_dir": None,
+        }
+        _write_json(output_dir / "refine_stats.json", stats)
+        _debug(
+            args,
+            "Stopped before BAE after writing the fixed rig model and merged DB",
+        )
+        return GluemapSpvRefineResult(
+            image_names=image_names,
+            extrinsic=extrinsic,
+            pairs=pairs,
+            intrinsic=intrinsic,
+            intrinsics_mapping=intrinsics_mapping,
+            stats=stats,
+            pre_bae_dir=coarse_dir,
+            refined_dir=None,
+            virtual_refined_dir=None,
+        )
 
     if args.device.startswith("cuda") and torch.cuda.is_available():
         cuda_device = torch.device(args.device)
@@ -1074,6 +1197,7 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
         intrinsic=intrinsic,
         intrinsics_mapping=intrinsics_mapping,
         stats=stats,
+        pre_bae_dir=coarse_dir,
         refined_dir=refined_dir,
         virtual_refined_dir=virtual_dir,
     )
