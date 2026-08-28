@@ -14,6 +14,7 @@ from utils.pano_rig import (
     configure_rig_database,
     expand_center_extrinsics,
     filter_metadata,
+    intrinsics_for_image_size,
     intrinsics_from_pinhole_crop,
     make_pano_rig_metadata,
     write_rig_reconstruction,
@@ -94,15 +95,31 @@ def test_center_filter_keeps_or_drops_complete_triplets():
 def test_intrinsics_account_for_resize_and_crop():
     record = SimpleNamespace(
         source_path="center/000.png",
-        source_size_wh=(1200, 1200),
-        low_base_size_wh=(300, 300),
-        low_crop_box=(3, 3, 297, 297),
-        high_base_size_wh=(1200, 1200),
-        high_crop_box=(12, 12, 1188, 1188),
+        source_size_wh=(1920, 1080),
+        low_base_size_wh=(480, 270),
+        low_crop_box=(2, 2, 478, 268),
+        high_base_size_wh=(1920, 1080),
+        high_crop_box=(8, 8, 1912, 1072),
     )
-    low, high = intrinsics_from_pinhole_crop(record, 90.0)
-    np.testing.assert_allclose(low, [[150, 0, 147], [0, 150, 147], [0, 0, 1]])
-    np.testing.assert_allclose(high, [[600, 0, 588], [0, 600, 588], [0, 0, 1]])
+    focal = 1920 / (2.0 * np.tan(np.deg2rad(110.0) / 2.0))
+    low, high = intrinsics_from_pinhole_crop(record, 110.0)
+    np.testing.assert_allclose(
+        low,
+        [[focal * 0.25, 0, 238], [0, focal * 0.25, 133], [0, 0, 1]],
+    )
+    np.testing.assert_allclose(
+        high,
+        [[focal, 0, 952], [0, focal, 532], [0, 0, 1]],
+    )
+
+
+def test_intrinsics_for_16_by_9_image_with_110_degree_hfov():
+    intrinsic = intrinsics_for_image_size((1080, 1920), 110.0)
+    focal = 1920 / (2.0 * np.tan(np.deg2rad(110.0) / 2.0))
+    np.testing.assert_allclose(
+        intrinsic,
+        [[focal, 0, 960], [0, focal, 540], [0, 0, 1]],
+    )
 
 
 def test_pycolmap_rig_reconstruction_and_database_round_trip(tmp_path):

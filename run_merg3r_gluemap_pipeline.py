@@ -84,8 +84,11 @@ def parse_args():
     parser.add_argument(
         "--pano_hfov_degrees",
         type=float,
-        default=90.0,
-        help="Horizontal FOV used to export every square perspective view.",
+        default=110.0,
+        help=(
+            "Horizontal FOV of every perspective view. Pano v1 defaults to "
+            "the 1920x1080 test-data contract: HFOV=110 degrees."
+        ),
     )
     parser.add_argument(
         "--pano_pair_max_axis_angle",
@@ -831,7 +834,10 @@ def write_pano_stage_b_summary(output_dir, args, state):
         "input_contract": {
             "directories": ["left", "center", "right"],
             "matching": "identical unique basenames in all directories",
-            "source_images": "square, same resolution, same extraction FOV",
+            "source_images": (
+                "same resolution/aspect ratio and extraction HFOV; current "
+                "test contract is 1920x1080 at HFOV 110 degrees"
+            ),
             "sensor_yaws_degrees": [-60.0, 0.0, 60.0],
             "hfov_degrees": float(args.pano_hfov_degrees),
         },

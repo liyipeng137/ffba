@@ -28,7 +28,7 @@ class PanoRigMetadata:
     sensor_names: tuple[str, ...] = SENSOR_NAMES
     sensor_yaws_degrees: tuple[float, ...] = SENSOR_YAWS_DEGREES
     center_sensor_index: int = CENTER_SENSOR_INDEX
-    hfov_degrees: float = 90.0
+    hfov_degrees: float = 110.0
 
     @property
     def num_frames(self) -> int:
@@ -56,7 +56,7 @@ class PanoRigMetadata:
         return payload
 
 
-def make_pano_rig_metadata(frame_names, hfov_degrees=90.0):
+def make_pano_rig_metadata(frame_names, hfov_degrees=110.0):
     frame_names = [str(name) for name in frame_names]
     if not frame_names:
         raise ValueError("A pano rig requires at least one frame")
@@ -129,12 +129,17 @@ def expand_center_extrinsics(center_extrinsic, metadata):
 
 
 def intrinsics_from_pinhole_crop(record, hfov_degrees):
-    """Compute exact K after the resize and centered crop in a pyramid record."""
+    """Compute K from source HFOV after resize and centered crop.
+
+    The source is assumed to have square pixels, so its focal lengths in pixel
+    units are equal. Independent resize scales are then applied to fx and fy;
+    this also remains correct if preprocessing introduces a small anisotropy.
+    """
 
     source_width, source_height = record.source_size_wh
-    if source_width != source_height:
+    if source_width <= 0 or source_height <= 0:
         raise ValueError(
-            "Pano v1 requires square source pinholes, got "
+            "Pano source dimensions must be positive, got "
             f"{source_width}x{source_height} for {record.source_path}"
         )
     focal_source = source_width / (2.0 * np.tan(np.deg2rad(float(hfov_degrees)) / 2.0))
@@ -161,9 +166,9 @@ def intrinsics_from_pinhole_crop(record, hfov_degrees):
 
 def intrinsics_for_image_size(image_size_hw, hfov_degrees):
     height, width = (int(value) for value in image_size_hw)
-    if height != width:
+    if width <= 0 or height <= 0:
         raise ValueError(
-            f"Pano v1 requires square processed pinholes, got {width}x{height}"
+            f"Pano processed dimensions must be positive, got {width}x{height}"
         )
     focal = width / (2.0 * np.tan(np.deg2rad(float(hfov_degrees)) / 2.0))
     return np.array(

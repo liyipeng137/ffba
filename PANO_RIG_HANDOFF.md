@@ -40,15 +40,19 @@ The contract is:
    the basenames lexicographically must produce temporal order.
 2. The three files with one basename are synchronized virtual cameras from the
    same panorama/video timestamp.
-3. Every source image is a square, distortion-free pinhole view. All images use
-   the same source dimensions and horizontal FOV.
+3. Every source image is a distortion-free pinhole view. All images use the
+   same source dimensions, aspect ratio, square-pixel convention, and horizontal
+   FOV. Rectangular images are supported.
 4. Sensor yaw is fixed to `left=-60°`, `center=0°`, `right=+60°`; pitch and roll
    are zero. Positive yaw points toward camera-right.
 5. The three virtual views have the same optical center. Rig translation is
    exactly zero in v1.
-6. Default horizontal FOV is `90°`. If extraction uses another FOV, pass
+6. The current test-data/default contract is `1920x1080` (16:9) with horizontal
+   FOV `110°`. If extraction uses another horizontal FOV, pass
    `--pano_hfov_degrees`. Intrinsics are derived from this known extraction FOV
-   and adjusted for the pipeline resize and center crop.
+   and adjusted for the pipeline resize and center crop. For the uncropped
+   1920x1080 input, this gives approximately `fx=fy=672.20`, `cx=960`,
+   `cy=540`, and vertical FOV `77.55°`.
 7. `--num_images` means number of rig timestamps and `--subsample` is applied
    identically to all three directories. Recursive input (`--multi_dirs`) is not
    supported.
@@ -56,6 +60,18 @@ The contract is:
 At least two complete triplets are required. The default run mode is
 `--stop-before-bae`; `--no-stop-before-bae` intentionally raises because the
 rig-aware BAE implementation is the next milestone.
+
+The default test command is:
+
+```bash
+python run_merg3r_gluemap_pipeline.py \
+  --dataset /path/to/pano_dataset \
+  --output_dir /path/to/pano_output \
+  --path_tracker /path/to/vggsfm_v2_tracker.pt
+```
+
+`--pano_hfov_degrees 110` is implicit in this command. Keep the explicit flag
+when recording experiments if the extraction settings may otherwise be unclear.
 
 ## Implemented flow
 
@@ -184,7 +200,8 @@ whether the center Stage A trajectory itself is accurate.
 
 Using `/Users/lyp/pycodex/`:
 
-- `pytest -q tests/test_pano_rig.py`: 5 passed.
+- `pytest -q tests/test_pano_rig.py`: 6 passed, including 1920x1080 HFOV 110
+  intrinsics before and after pyramid resize/crop.
 - `pytest -q tests/test_gluemap_refine_core.py`: 15 passed.
 - `ruff check` on changed Python files and the new test: passed.
 - `python -m py_compile` on changed pipeline modules: passed.
@@ -224,4 +241,3 @@ Before implementing BAE, the first real-data checkpoint should decide whether
 the center-only trajectory plus fixed yaw gives plausible coarse side poses and
 whether left/right-as-center groups improve side coverage without excessive bad
 tracks.
-

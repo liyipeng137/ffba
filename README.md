@@ -1,5 +1,11 @@
 # FeedForwardWithBA / MERG3R + GlueMap 主流程说明
 
+> `codex/pano-rig` 分支已将正式入口切换为三路 panorama rig 输入。当前
+> `--dataset` 必须包含 `left/`、`center/`、`right/`，默认测试契约是
+> `1920x1080`、水平 FOV `110°`，并在 BAE 前停止。具体命令和约束以
+> [PANO_RIG_HANDOFF.md](PANO_RIG_HANDOFF.md) 为准；本文后续单目录示例是
+> 原管道背景资料。
+
 本文档以当前主入口 [run_merg3r_gluemap_pipeline.py](run_merg3r_gluemap_pipeline.py) 为准。
 
 这个项目的目标不是保留原始 MERG3R 或 GlueMap 的独立运行形态，而是把前馈式几何模型、MERG3R 的分块合并能力、GlueMap 的稀疏匹配/三角化能力，以及 BAE bundle adjustment 后端缝合成一个可交付 SfM POD 的主流程。
