@@ -34,6 +34,7 @@ class BaeProblemData:
     virtual_point_ids: list[int]
     camera_id: int
     camera_ids: list[int]
+    intrinsics_camera_ids: list[list[int]]
     camera_model: str
     bae_root: Path
     skipped: dict
@@ -412,12 +413,83 @@ def _build_bae_problem(
             f"{sorted(camera_models)}"
         )
     camera_model = next(iter(camera_models))
-    intrinsics = np.stack(
-        [_intrinsics_from_camera(camera)[0] for camera in cameras], axis=0
+
+    image_to_intrinsics_group = _config_value(
+        rig_config, "image_to_intrinsics_group"
     )
-    camera_id_to_intrinsics = {
-        camera_id: idx for idx, camera_id in enumerate(used_camera_ids)
+    camera_id_to_group = {}
+    for image_id in used_image_ids:
+        image = reconstruction.images[image_id]
+        camera_id = int(image.camera_id)
+        group_id = (
+            _lookup_image_config(
+                image_to_intrinsics_group,
+                image_id,
+                image.name,
+                "image_to_intrinsics_group",
+            )
+            if image_to_intrinsics_group is not None
+            else camera_id
+        )
+        previous = camera_id_to_group.setdefault(camera_id, group_id)
+        if previous != group_id:
+            raise ValueError(
+                f"Camera {camera_id} maps to multiple intrinsic groups: "
+                f"{previous!r} and {group_id!r}"
+            )
+
+    group_ids = sorted(set(camera_id_to_group.values()), key=repr)
+    group_to_intrinsics = {
+        group_id: idx for idx, group_id in enumerate(group_ids)
     }
+    camera_id_to_intrinsics = {
+        camera_id: group_to_intrinsics[group_id]
+        for camera_id, group_id in camera_id_to_group.items()
+    }
+
+    # Include cameras with no surviving observations in writeback. They do not
+    # add residuals, but a shared focal must remain identical on every sensor
+    # camera after frame/observation filtering.
+    all_camera_id_to_group = dict(camera_id_to_group)
+    if image_to_intrinsics_group is not None:
+        for image_id, image in reconstruction.images.items():
+            group_id = _lookup_image_config(
+                image_to_intrinsics_group,
+                image_id,
+                image.name,
+                "image_to_intrinsics_group",
+            )
+            if group_id in group_to_intrinsics:
+                camera_id = int(image.camera_id)
+                previous = all_camera_id_to_group.setdefault(camera_id, group_id)
+                if previous != group_id:
+                    raise ValueError(
+                        f"Camera {camera_id} maps to multiple intrinsic groups: "
+                        f"{previous!r} and {group_id!r}"
+                    )
+    intrinsics_camera_ids = [
+        sorted(
+            camera_id
+            for camera_id, camera_group_id in all_camera_id_to_group.items()
+            if camera_group_id == group_id
+        )
+        for group_id in group_ids
+    ]
+    intrinsics = np.stack(
+        [
+            np.mean(
+                [
+                    _intrinsics_from_camera(
+                        reconstruction.cameras[camera_id]
+                    )[0]
+                    for camera_id in camera_ids
+                ],
+                axis=0,
+            )
+            for camera_ids in intrinsics_camera_ids
+        ],
+        axis=0,
+    )
 
     real_points = [
         _point_xyz(reconstruction.points3D[point3D_id])
@@ -480,6 +552,7 @@ def _build_bae_problem(
         virtual_point_ids=virtual_point_ids,
         camera_id=used_camera_ids[0],
         camera_ids=used_camera_ids,
+        intrinsics_camera_ids=intrinsics_camera_ids,
         camera_model=camera_model,
         bae_root=bae_root,
         skipped=skipped,
@@ -1290,13 +1363,15 @@ def _write_optimized_reconstruction(
         )
         if optimized_intrinsics.ndim == 1:
             optimized_intrinsics = optimized_intrinsics[None]
-        for intrinsics_idx, camera_id in enumerate(problem.camera_ids):
-            reconstruction.cameras[camera_id].params = (
-                _camera_params_from_intrinsics(
-                    problem.camera_model,
-                    optimized_intrinsics[intrinsics_idx],
-                )
+        for intrinsics_idx, camera_ids in enumerate(
+            problem.intrinsics_camera_ids
+        ):
+            params = _camera_params_from_intrinsics(
+                problem.camera_model,
+                optimized_intrinsics[intrinsics_idx],
             )
+            for camera_id in camera_ids:
+                reconstruction.cameras[camera_id].params = params.copy()
 
     if virtual_reconstruction is not None:
         for offset, point3D_id in enumerate(problem.virtual_point_ids):

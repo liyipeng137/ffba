@@ -15,6 +15,7 @@ from algos.utils import (
     restore_predictions_order,
 )
 from utils.feedforward import load_model, run_inference_step_by_step
+from utils import gluemap_refine_core as ref
 from utils.image_pyramid import (
     build_two_resolution_image_tensors,
     iter_image_files,
@@ -25,7 +26,7 @@ from utils.pano_rig import (
     CUBEMAP_FOV_DEGREES,
     PanoRigMetadata,
     SENSOR_NAMES,
-    build_rig_pose_pairs,
+    build_rig_projected_overlap_selection,
     expand_center_extrinsics,
     intrinsics_for_image_size,
     intrinsics_from_pinhole_crop,
@@ -33,7 +34,6 @@ from utils.pano_rig import (
 )
 from utils.gluemap_spv_refine import (
     CAMERA_MODEL as PIPELINE_CAMERA_MODEL,
-    GROUP_STRATEGY as PIPELINE_GROUP_STRATEGY,
     QUERY_SOURCE as PIPELINE_QUERY_SOURCE,
     S_DATABASE_MODE as PIPELINE_S_DATABASE_MODE,
     TRACK_MODE as PIPELINE_TRACK_MODE,
@@ -65,6 +65,9 @@ class Merg3rCoarseState:
     retrieval_sim_matrix: np.ndarray | None
     image_pyramid: dict | None
     rig: PanoRigMetadata | None = None
+    tracking_groups: list[list[int]] | None = None
+    tracking_group_stats: dict | None = None
+    frame_overlap_stats: dict | None = None
 
 
 def parse_args():
@@ -163,7 +166,7 @@ def parse_args():
     parser.add_argument(
         "--vggsfm_group_strategy",
         type=str,
-        default=PIPELINE_GROUP_STRATEGY,
+        default="projected_overlap",
         choices=["pose", "projected_overlap"],
         help=(
             "Group strategy used by formal VGGSfM prior tracking. "
@@ -649,12 +652,6 @@ def prepare_pano_stage_b(args, output_dir, center_state):
         raise ValueError("Cubemap pano mode does not support --multi_dirs")
     if not np.isclose(args.pano_hfov_degrees, CUBEMAP_FOV_DEGREES):
         raise ValueError("Standard cubemap faces require --pano_hfov_degrees=90")
-    if args.vggsfm_group_strategy != "pose":
-        raise ValueError(
-            "Cubemap pano mode supports --vggsfm_group_strategy=pose only "
-            "because non-center faces do not have Stage A depth maps"
-        )
-
     stage2_scale_factor = (
         None if args.stage2_scale_factor == 0 else args.stage2_scale_factor
     )
@@ -787,13 +784,49 @@ def prepare_pano_stage_b(args, output_dir, center_state):
         ],
         dtype=np.float32,
     )
-    pairs = build_rig_pose_pairs(
-        extrinsic,
-        metadata,
-        max_neighbors=args.pair_k_pose,
-        max_axis_angle_degrees=args.pano_pair_max_axis_angle,
+    if center_state.retrieval_sim_matrix is None:
+        raise ValueError(
+            "Stage A global center-view DINO similarities are required for "
+            "pano pair selection"
+        )
+    frame_neighbor_budget = max(
+        int(args.pair_k_pose),
+        int(args.neighbors_per_center),
+        int(args.projected_overlap_dino_candidates),
+    )
+    _, frame_overlap_stats, frame_candidate_details = (
+        ref.build_projected_overlap_groups(
+            pairs=center_state.pairs,
+            extrinsic=center_state.extrinsic,
+            intrinsics=np.asarray(sensor_low_intrinsics[0], dtype=np.float64),
+            depth=center_state.raw_depth,
+            depth_conf=center_state.raw_depth_conf,
+            retrieval_sim_matrix=center_state.retrieval_sim_matrix,
+            max_neighbors=frame_neighbor_budget,
+            rotation_threshold=float(args.pair_pose_rotation_threshold),
+            dino_candidates=int(args.projected_overlap_dino_candidates),
+            max_samples=int(args.projected_overlap_samples),
+            reprojection_threshold=float(
+                args.projected_overlap_reproj_threshold
+            ),
+            confidence_quantile=float(args.projected_overlap_conf_quantile),
+        )
+    )
+    pairs, tracking_groups, tracking_group_stats = (
+        build_rig_projected_overlap_selection(
+            extrinsic,
+            metadata,
+            frame_candidate_details,
+            max_pair_neighbors=args.pair_k_pose,
+            max_group_neighbors=args.neighbors_per_center,
+            max_axis_angle_degrees=args.pano_pair_max_axis_angle,
+            group_rotation_threshold_degrees=(
+                args.pair_pose_rotation_threshold
+            ),
+        )
     )
     pair_graph_stats = summarize_pair_graph(pairs, metadata.num_images)
+    pair_graph_stats["selection_strategy"] = tracking_group_stats["strategy"]
     return Merg3rCoarseState(
         high_images=high_images,
         low_image_names=list(center_state.low_image_names),
@@ -813,7 +846,7 @@ def prepare_pano_stage_b(args, output_dir, center_state):
         pair_graph_stats=pair_graph_stats,
         raw_depth=center_state.raw_depth,
         raw_depth_conf=center_state.raw_depth_conf,
-        retrieval_sim_matrix=None,
+        retrieval_sim_matrix=center_state.retrieval_sim_matrix,
         image_pyramid={
             "enabled": bool(args.image_pyramid),
             "stage_a_center": center_state.image_pyramid,
@@ -829,6 +862,9 @@ def prepare_pano_stage_b(args, output_dir, center_state):
             },
         },
         rig=metadata,
+        tracking_groups=tracking_groups,
+        tracking_group_stats=tracking_group_stats,
+        frame_overlap_stats=frame_overlap_stats,
     )
 
 
@@ -853,12 +889,14 @@ def write_pano_stage_b_summary(output_dir, args, state):
         "intrinsic_low_shape": list(state.intrinsic_low.shape),
         "intrinsic_high_shape": list(state.intrinsic_high.shape),
         "pair_selection": {
-            "strategy": "cross_frame_frustum_overlap_round_robin_sensor",
+            "strategy": "center_depth_projected_overlap_plus_rig_geometry",
             "same_frame_pairs": False,
             "max_neighbors_per_image": int(args.pair_k_pose),
             "max_axis_angle_degrees": float(args.pano_pair_max_axis_angle),
             "pair_graph": state.pair_graph_stats,
+            "frame_projected_overlap": state.frame_overlap_stats,
         },
+        "vggsfm_group_selection": state.tracking_group_stats,
         "depth": {
             "scope": "center_frames_only",
             "shape": list(state.raw_depth.shape),

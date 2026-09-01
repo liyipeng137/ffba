@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from utils.pano_rig import (
     build_pose_audit,
     build_rig_pose_pairs,
+    build_rig_projected_overlap_selection,
     center_driven_keep_indices,
     configure_rig_database,
     expand_center_extrinsics,
@@ -95,6 +96,47 @@ def test_rig_pairs_exclude_same_frame_include_90_and_exclude_opposites():
     assert {sensor_indices[idx] for idx in neighbors} == {0, 1, 2, 3, 4}
 
 
+def test_rig_projected_overlap_expansion_uses_depth_rank_and_face_geometry():
+    metadata = make_pano_rig_metadata(["000.png", "001.png", "002.png"])
+    expanded = expand_center_extrinsics(_center_poses(3), metadata)
+    details = {
+        0: [
+            {
+                "image_index": 1,
+                "projected_overlap": 0.9,
+                "projected_grid_coverage": 0.8,
+                "projected_visible_ratio": 0.95,
+                "dino_similarity": 0.7,
+            },
+            {
+                "image_index": 2,
+                "projected_overlap": 0.2,
+                "projected_grid_coverage": 0.3,
+                "projected_visible_ratio": 0.6,
+                "dino_similarity": 0.8,
+            },
+        ],
+        1: [{"image_index": 0, "projected_overlap": 0.9}],
+        2: [{"image_index": 0, "projected_overlap": 0.2}],
+    }
+    pairs, groups, stats = build_rig_projected_overlap_selection(
+        expanded,
+        metadata,
+        details,
+        max_pair_neighbors=2,
+        max_group_neighbors=2,
+        max_axis_angle_degrees=95.0,
+        group_rotation_threshold_degrees=75.0,
+    )
+
+    frame_indices = np.asarray(metadata.image_frame_indices)
+    assert np.all(frame_indices[pairs[:, 0]] != frame_indices[pairs[:, 1]])
+    group_by_center = {group[0]: group for group in groups}
+    assert group_by_center[0] == [0, 5, 10]
+    assert stats["strategy"] == "rig_center_depth_projected_overlap"
+    assert stats["selected_rotation_valid_neighbors"]["max"] == 2
+
+
 def test_center_filter_keeps_or_drops_complete_five_face_frames():
     metadata = make_pano_rig_metadata(["000.png", "001.png", "002.png"])
     kept_frames, kept_images = center_driven_keep_indices(
@@ -120,31 +162,33 @@ def test_intrinsics_account_for_resize_and_crop():
         high_base_size_wh=(1920, 1080),
         high_crop_box=(8, 8, 1912, 1072),
     )
-    focal = 1920 / (2.0 * np.tan(np.deg2rad(110.0) / 2.0))
+    focal = 1919 / (2.0 * np.tan(np.deg2rad(110.0) / 2.0))
     low, high = intrinsics_from_pinhole_crop(record, 110.0)
     np.testing.assert_allclose(
         low,
-        [[focal * 0.25, 0, 238], [0, focal * 0.25, 133], [0, 0, 1]],
+        [[focal * 0.25, 0, 237.5], [0, focal * 0.25, 132.5], [0, 0, 1]],
     )
     np.testing.assert_allclose(
         high,
-        [[focal, 0, 952], [0, focal, 532], [0, 0, 1]],
+        [[focal, 0, 951.5], [0, focal, 531.5], [0, 0, 1]],
     )
 
 
 def test_intrinsics_helper_preserves_non_cubemap_behavior():
     intrinsic = intrinsics_for_image_size((1080, 1920), 110.0)
-    focal = 1920 / (2.0 * np.tan(np.deg2rad(110.0) / 2.0))
+    focal = 1919 / (2.0 * np.tan(np.deg2rad(110.0) / 2.0))
     np.testing.assert_allclose(
         intrinsic,
-        [[focal, 0, 960], [0, focal, 540], [0, 0, 1]],
+        [[focal, 0, 959.5], [0, focal, 539.5], [0, 0, 1]],
     )
 
 
 def test_standard_square_cubemap_intrinsics_are_90_degrees():
     intrinsic = intrinsics_for_image_size((512, 512), 90.0)
     np.testing.assert_allclose(
-        intrinsic, [[256, 0, 256], [0, 256, 256], [0, 0, 1]], atol=1e-12
+        intrinsic,
+        [[255.5, 0, 255.5], [0, 255.5, 255.5], [0, 0, 1]],
+        atol=1e-12,
     )
 
 

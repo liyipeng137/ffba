@@ -474,26 +474,34 @@ Stage B:
 - triangulates merged tracks;
 - runs augmented refinement and BAE.
 
-Non-center faces have no feed-forward depth. Cubemap mode therefore currently
-requires `--vggsfm_group_strategy pose`.
+Non-center faces still have no fabricated feed-forward depth. Stage A now also
+retains the global center-view DINO similarity matrix. Center-to-center frame
+candidates are ranked with real bidirectional depth round-trip projected
+overlap, using the union of pose and global-DINO candidates. The selected frame
+scores are then expanded to five-face image pairs/groups with the exact known
+sensor viewing axes. `projected_overlap` is now the runner default; `pose`
+remains available as a tracking-group comparison mode.
 
 Frame filtering is center-driven: if a center frame is removed, all five images
 for that timestamp are removed together.
 
 ### 6.3 Pair and group behavior
 
-`build_rig_pose_pairs`:
+`build_rig_projected_overlap_selection`:
 
 - excludes every same-timestamp pair because Cubemap5 is co-located;
-- filters cross-frame candidates by viewing-axis angle;
-- defaults to a 95-degree maximum, connecting adjacent cubemap directions but
-  not opposite directions;
-- sorts candidates by camera-center distance, frame gap, and axis angle;
-- interleaves target sensors round-robin so one face cannot consume the whole
-  neighbor budget.
+- uses true center-depth round-trip projected overlap for cross-frame ranking;
+- adds global center DINO top-k candidates to the pose candidate pool;
+- transfers the frame score to synchronized sensors without inventing depth for
+  Left/Right/Up/Down;
+- filters sensor pairs by the exact viewing-axis angle (95-degree default), so
+  adjacent directions remain eligible but opposite directions do not;
+- builds a high-recall symmetric pair graph and a separately ordered VGGSfM
+  group list, with rotation-valid neighbors ahead of wider-angle fallbacks.
 
-Every face may be a VGGSfM group center. Groups use pose-based selection because
-only `center` has Stage A depth.
+Every face may be a VGGSfM group center. Its frame candidates come from center
+projected overlap, while the particular sensor pairing is resolved by fixed rig
+geometry.
 
 ### 6.4 BAE rig constraints
 
@@ -508,7 +516,8 @@ For Cubemap5:
 - one timestamp owns one optimizable SE(3) `rig_from_world` block;
 - its five images share the same pose index;
 - `sensor_from_rig` is registered as a fixed BAE tensor buffer;
-- intrinsics are shared per sensor/camera ID across timestamps;
+- COLMAP keeps one camera ID per sensor, but BAE maps all five cameras to one
+  global focal parameter block (principal point remains fixed);
 - gauge fixing operates on rig frames;
 - optimized rig poses are expanded back to image poses for writeback;
 - native COLMAP rig/frame relationships are retained and audited.

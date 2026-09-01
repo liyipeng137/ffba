@@ -210,6 +210,14 @@ def test_end_to_end_outputs_five_standard_cubemap_faces(tmp_path: Path):
     assert manifest["output"]["vfov_degrees"] == 90.0
     assert manifest["output"]["width"] == manifest["output"]["height"] == 64
     assert manifest["output"]["batch_size"] == 2
+    assert manifest["output"]["fx_pixels"] == 31.5
+    assert manifest["output"]["fy_pixels"] == 31.5
+    assert manifest["output"]["cx_pixels"] == 31.5
+    assert manifest["output"]["cy_pixels"] == 31.5
+    assert (
+        manifest["output"]["pixel_center_convention"]
+        == "pytorch360convert_linspace_endpoints"
+    )
     assert manifest["cubemap"]["face_mapping"] == list(FACE_SPECS)
     assert manifest["cubemap"]["omitted_faces"][0]["cubemap_face"] == "Back"
     assert manifest["sampling"]["output_frame_count"] == 3

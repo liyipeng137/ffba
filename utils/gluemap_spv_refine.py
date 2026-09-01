@@ -397,24 +397,28 @@ def export_vggsfm_groups(
         )
         audit_name = f"pose_k{int(neighbors_per_center)}"
     elif selection_strategy == "projected_overlap":
-        if retrieval_sim_matrix is None:
+        if coarse_state.tracking_groups is not None:
+            groups = coarse_state.tracking_groups
+            group_stats = coarse_state.tracking_group_stats
+        elif retrieval_sim_matrix is None:
             raise ValueError(
                 "retrieval_sim_matrix is required for projected-overlap audit"
             )
-        groups, group_stats, candidate_details = ref.build_projected_overlap_groups(
-            pairs=pairs,
-            extrinsic=extrinsic,
-            intrinsics=np.asarray(coarse_state.intrinsic_low, dtype=np.float64),
-            depth=coarse_state.raw_depth,
-            depth_conf=coarse_state.raw_depth_conf,
-            retrieval_sim_matrix=retrieval_sim_matrix,
-            max_neighbors=int(neighbors_per_center),
-            rotation_threshold=float(pair_pose_rotation_threshold),
-            dino_candidates=int(projected_overlap_dino_candidates),
-            max_samples=int(projected_overlap_samples),
-            reprojection_threshold=float(projected_overlap_reproj_threshold),
-            confidence_quantile=float(projected_overlap_conf_quantile),
-        )
+        else:
+            groups, group_stats, candidate_details = ref.build_projected_overlap_groups(
+                pairs=pairs,
+                extrinsic=extrinsic,
+                intrinsics=np.asarray(coarse_state.intrinsic_low, dtype=np.float64),
+                depth=coarse_state.raw_depth,
+                depth_conf=coarse_state.raw_depth_conf,
+                retrieval_sim_matrix=retrieval_sim_matrix,
+                max_neighbors=int(neighbors_per_center),
+                rotation_threshold=float(pair_pose_rotation_threshold),
+                dino_candidates=int(projected_overlap_dino_candidates),
+                max_samples=int(projected_overlap_samples),
+                reprojection_threshold=float(projected_overlap_reproj_threshold),
+                confidence_quantile=float(projected_overlap_conf_quantile),
+            )
         audit_name = f"projected_overlap_hybrid_k{int(neighbors_per_center)}"
     else:
         raise ValueError(
@@ -670,26 +674,36 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
     tracking_groups = None
     tracking_group_stats = None
     if args.group_strategy == "projected_overlap":
-        if coarse_state.retrieval_sim_matrix is None:
-            raise ValueError(
-                "retrieval_sim_matrix is required when "
-                "vggsfm_group_strategy='projected_overlap'"
-            )
         t0 = time.time()
-        tracking_groups, tracking_group_stats, _ = ref.build_projected_overlap_groups(
-            pairs=pairs,
-            extrinsic=extrinsic,
-            intrinsics=initial_intrinsics_low_all,
-            depth=coarse_state.raw_depth,
-            depth_conf=coarse_state.raw_depth_conf,
-            retrieval_sim_matrix=coarse_state.retrieval_sim_matrix,
-            max_neighbors=int(args.neighbors_per_center),
-            rotation_threshold=float(args.pair_pose_rotation_threshold),
-            dino_candidates=int(config.projected_overlap_dino_candidates),
-            max_samples=int(config.projected_overlap_samples),
-            reprojection_threshold=float(config.projected_overlap_reproj_threshold),
-            confidence_quantile=float(config.projected_overlap_conf_quantile),
-        )
+        if coarse_state.tracking_groups is not None:
+            tracking_groups = coarse_state.tracking_groups
+            tracking_group_stats = coarse_state.tracking_group_stats
+        else:
+            if coarse_state.retrieval_sim_matrix is None:
+                raise ValueError(
+                    "retrieval_sim_matrix is required when "
+                    "vggsfm_group_strategy='projected_overlap'"
+                )
+            tracking_groups, tracking_group_stats, _ = (
+                ref.build_projected_overlap_groups(
+                    pairs=pairs,
+                    extrinsic=extrinsic,
+                    intrinsics=initial_intrinsics_low_all,
+                    depth=coarse_state.raw_depth,
+                    depth_conf=coarse_state.raw_depth_conf,
+                    retrieval_sim_matrix=coarse_state.retrieval_sim_matrix,
+                    max_neighbors=int(args.neighbors_per_center),
+                    rotation_threshold=float(args.pair_pose_rotation_threshold),
+                    dino_candidates=int(config.projected_overlap_dino_candidates),
+                    max_samples=int(config.projected_overlap_samples),
+                    reprojection_threshold=float(
+                        config.projected_overlap_reproj_threshold
+                    ),
+                    confidence_quantile=float(
+                        config.projected_overlap_conf_quantile
+                    ),
+                )
+            )
         stats["timing"]["vggsfm_group_build"] = time.time() - t0
         _debug(
             args,
@@ -1154,12 +1168,15 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
         rig.image_frame_indices,
         rig.image_sensor_indices,
         sensor_from_rig_by_sensor,
+        shared_focal=True,
     )
     stats["bae_rig_config"] = {
         "enabled": True,
         "num_rig_frames": int(rig.num_frames),
         "num_images": int(rig.num_images),
         "num_sensors": int(len(rig.sensor_names)),
+        "shared_focal": bool(bae_rig_config["shared_focal"]),
+        "num_intrinsics_groups": 1,
         "pose_semantics": bae_rig_config["pose_semantics"],
     }
     t0 = time.time()

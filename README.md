@@ -438,15 +438,16 @@ vggsfm_group_audit/
   pose_k12/
   projected_overlap_hybrid_k12/
     groups.json
-    candidate_scores.json
     labels.csv
     contact_sheets/
     groups/
 ```
 
-projected-overlap hybrid 的候选池为 rotation-valid pose pairs 与 DINO
-top-30 的并集；排序使用 low-resolution depth 的有向 round-trip
-reprojection overlap，DINO 只用于候选召回。
+Cubemap5 的 projected-overlap 候选池在 Stage A 的全部 center 帧上构建：
+rotation-valid pose candidates 与全局 center DINO top-k 取并集，再用两端
+真实 center depth 的 low-resolution round-trip reprojection overlap 排序。
+随后按五个面的固定视轴扩展成 sensor pairs/groups；不会给非 center 面复制
+或伪造 depth。
 
 正式 refinement 使用 projected-overlap group：
 
@@ -459,8 +460,9 @@ python run_merg3r_gluemap_pipeline.py \
   --vggsfm_group_strategy projected_overlap
 ```
 
-不传 `--vggsfm_group_strategy` 时仍使用 `pose`，便于和已有结果对照。
-正式 projected-overlap 路径复用下方四个 `--projected_overlap_*` 参数；
+主 runner 不传 `--vggsfm_group_strategy` 时默认使用 `projected_overlap`；
+仍可显式传 `pose` 做已有结果对照。正式 projected-overlap 路径复用下方
+四个 `--projected_overlap_*` 参数；
 如果 sequence 阶段未产生 DINO similarity matrix，Stage A 会自动补算一次。
 
 如果需要 PLY，可用 COLMAP 自带 converter 从 `points3D` 转出。
@@ -485,10 +487,10 @@ python run_merg3r_gluemap_pipeline.py \
 | `--splitting_type` | `interleave` | subset 内图片组织方式 |
 | `--alignment_type` | `weighted_iterative` | MERG3R subset pose 对齐方式 |
 | `--pair_k_pose` | `25` | 每帧按 coarse pose 选取的邻居数量 |
-| `--pair_pose_rotation_threshold` | `30.0` | pose pair 允许的最大视角差，单位为度 |
+| `--pair_pose_rotation_threshold` | `75.0` | pose pair 允许的最大视角差，单位为度 |
 | `--path_tracker` | required in practice | VGGSfM tracker checkpoint |
 | `--neighbors_per_center` | `25` | 每个 VGGSfM group 的邻居上限；`pose` 策略下 rotation-valid 优先，同层按 camera-center 距离排序 |
-| `--vggsfm_group_strategy` | `pose` | 正式 VGGSfM tracking 的 group 构建策略；可选 `pose` 或 `projected_overlap` |
+| `--vggsfm_group_strategy` | `projected_overlap` | 正式 VGGSfM tracking 的 group 构建策略；可选 `pose` 或 `projected_overlap` |
 | `--vggsfm_group_batch_size` | `2` | 按 `(group_size, query_points)` 分桶后，每次 VGGSfM forward 的 group 数量；尾桶自动降为较小 batch |
 | `--export_vggsfm_groups_only` | off | Stage A 后按 audit strategy 导出 VGGSfM groups、contact sheets、JSON 和人工标签 CSV，然后跳过 tracker/refinement |
 | `--vggsfm_group_audit_strategy` | `pose` | `pose`、`projected_overlap` 或 `both`；仅影响 group audit 提前退出模式 |

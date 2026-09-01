@@ -3227,6 +3227,7 @@ def build_bae_rig_config(
     image_frame_indices,
     image_sensor_indices,
     sensor_from_rig_by_sensor,
+    shared_focal=False,
 ):
     """Build BAE's pipeline-independent hard-rig pose configuration.
 
@@ -3253,6 +3254,7 @@ def build_bae_rig_config(
     image_to_frame = {}
     image_to_sensor = {}
     image_to_sensor_from_rig = {}
+    image_to_intrinsics_group = {}
     for image_name, frame_idx, sensor_idx in zip(
         image_names,
         image_frame_indices,
@@ -3282,11 +3284,16 @@ def build_bae_rig_config(
         image_to_frame[image_name] = frame_idx
         image_to_sensor[image_name] = sensor_idx
         image_to_sensor_from_rig[image_name] = transform.copy()
+        image_to_intrinsics_group[image_name] = (
+            0 if shared_focal else sensor_idx
+        )
 
     return {
         "image_to_frame": image_to_frame,
         "image_to_sensor": image_to_sensor,
         "image_to_sensor_from_rig": image_to_sensor_from_rig,
+        "image_to_intrinsics_group": image_to_intrinsics_group,
+        "shared_focal": bool(shared_focal),
         "pose_semantics": (
             "sensor_from_world = sensor_from_rig @ rig_from_world"
         ),

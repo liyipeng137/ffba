@@ -181,17 +181,28 @@ def intrinsics_from_pinhole_crop(record, hfov_degrees):
             "Pano source dimensions must be positive, got "
             f"{source_width}x{source_height} for {record.source_path}"
         )
-    focal_source = source_width / (2.0 * np.tan(np.deg2rad(float(hfov_degrees)) / 2.0))
+    # pytorch360convert.e2c samples each face with linspace(-0.5, 0.5, W).
+    # Pixel 0 and pixel W-1 lie exactly on the two HFOV boundary rays, so the
+    # matching pinhole differs by half a pixel from the usual edge convention.
+    focal_source = (source_width - 1.0) / (
+        2.0 * np.tan(np.deg2rad(float(hfov_degrees)) / 2.0)
+    )
+    source_cx = (source_width - 1.0) * 0.5
+    source_cy = (source_height - 1.0) * 0.5
 
     def scaled(base_size_wh, crop_box):
         base_width, base_height = base_size_wh
         left, top, _right, _bottom = crop_box
         scale_x = base_width / source_width
         scale_y = base_height / source_height
+        # PIL resize uses the standard pixel-center transform. Apply it before
+        # the centered crop so K matches the actual resampled image.
+        principal_x = (source_cx + 0.5) * scale_x - 0.5 - left
+        principal_y = (source_cy + 0.5) * scale_y - 0.5 - top
         return np.array(
             [
-                [focal_source * scale_x, 0.0, source_width * 0.5 * scale_x - left],
-                [0.0, focal_source * scale_y, source_height * 0.5 * scale_y - top],
+                [focal_source * scale_x, 0.0, principal_x],
+                [0.0, focal_source * scale_y, principal_y],
                 [0.0, 0.0, 1.0],
             ],
             dtype=np.float64,
@@ -209,11 +220,187 @@ def intrinsics_for_image_size(image_size_hw, hfov_degrees):
         raise ValueError(
             f"Pano processed dimensions must be positive, got {width}x{height}"
         )
-    focal = width / (2.0 * np.tan(np.deg2rad(float(hfov_degrees)) / 2.0))
+    focal = (width - 1.0) / (
+        2.0 * np.tan(np.deg2rad(float(hfov_degrees)) / 2.0)
+    )
     return np.array(
-        [[focal, 0.0, width * 0.5], [0.0, focal, height * 0.5], [0.0, 0.0, 1.0]],
+        [
+            [focal, 0.0, (width - 1.0) * 0.5],
+            [0.0, focal, (height - 1.0) * 0.5],
+            [0.0, 0.0, 1.0],
+        ],
         dtype=np.float64,
     )
+
+
+def build_rig_projected_overlap_selection(
+    extrinsic,
+    metadata,
+    frame_candidate_details,
+    max_pair_neighbors,
+    max_group_neighbors,
+    max_axis_angle_degrees,
+    group_rotation_threshold_degrees,
+):
+    """Expand depth-ranked frame candidates into five-face pairs and groups.
+
+    ``frame_candidate_details`` is produced by projected-overlap scoring on
+    the Stage-A center views. That scoring uses real depth in both frames.
+    Here the score is transferred to the synchronized rig frame and combined
+    with each virtual sensor's known viewing axis. No depth is fabricated for
+    Left/Right/Up/Down.
+    """
+
+    extrinsic = np.asarray(extrinsic, dtype=np.float64)
+    if extrinsic.shape != (metadata.num_images, 3, 4):
+        raise ValueError(
+            f"Expected expanded extrinsic shape ({metadata.num_images},3,4), "
+            f"got {extrinsic.shape}"
+        )
+    max_pair_neighbors = int(max_pair_neighbors)
+    max_group_neighbors = int(max_group_neighbors)
+    if max_pair_neighbors <= 0 or max_group_neighbors <= 0:
+        raise ValueError("Pair and group neighbor limits must be >= 1")
+    if not 0.0 < float(max_axis_angle_degrees) <= 180.0:
+        raise ValueError("max_axis_angle_degrees must be in (0, 180]")
+    if not 0.0 <= float(group_rotation_threshold_degrees) <= 180.0:
+        raise ValueError("group_rotation_threshold_degrees must be in [0, 180]")
+
+    rotations = extrinsic[:, :3, :3]
+    translations = extrinsic[:, :3, 3]
+    centers = np.einsum(
+        "nij,nj->ni", -rotations.transpose(0, 2, 1), translations
+    )
+    axes = rotations.transpose(0, 2, 1)[:, :, 2]
+    frame_indices = np.asarray(metadata.image_frame_indices, dtype=np.int64)
+    sensors_per_frame = len(metadata.sensor_names)
+    pair_set = set()
+    groups = []
+    valid_neighbor_counts = []
+    unfiltered_neighbor_counts = []
+
+    def finite_score(detail, name, default=0.0):
+        value = float(detail.get(name, default))
+        return value if np.isfinite(value) else default
+
+    for source_idx in range(metadata.num_images):
+        source_frame = int(frame_indices[source_idx])
+        candidates = []
+        for frame_detail in frame_candidate_details.get(source_frame, []):
+            target_frame = int(frame_detail["image_index"])
+            if target_frame == source_frame:
+                continue
+            for target_sensor in range(sensors_per_frame):
+                target_idx = target_frame * sensors_per_frame + target_sensor
+                dot = float(np.dot(axes[source_idx], axes[target_idx]))
+                angle = float(np.rad2deg(np.arccos(np.clip(dot, -1.0, 1.0))))
+                if angle >= float(max_axis_angle_degrees):
+                    continue
+                distance = float(
+                    np.linalg.norm(centers[source_idx] - centers[target_idx])
+                )
+                candidates.append(
+                    {
+                        "image_index": target_idx,
+                        "axis_angle": angle,
+                        "distance": distance,
+                        "projected_overlap": finite_score(
+                            frame_detail, "projected_overlap"
+                        ),
+                        "projected_grid_coverage": finite_score(
+                            frame_detail, "projected_grid_coverage"
+                        ),
+                        "projected_visible_ratio": finite_score(
+                            frame_detail, "projected_visible_ratio"
+                        ),
+                        "dino_similarity": finite_score(
+                            frame_detail, "dino_similarity", -np.inf
+                        ),
+                    }
+                )
+
+        pair_order = sorted(
+            candidates,
+            key=lambda item: (
+                -item["projected_overlap"],
+                -item["projected_grid_coverage"],
+                -item["projected_visible_ratio"],
+                -item["dino_similarity"],
+                item["axis_angle"],
+                item["distance"],
+                item["image_index"],
+            ),
+        )
+        for item in pair_order[:max_pair_neighbors]:
+            pair_set.add(tuple(sorted((source_idx, int(item["image_index"])))))
+
+        group_order = sorted(
+            candidates,
+            key=lambda item: (
+                item["axis_angle"] >= float(group_rotation_threshold_degrees),
+                -item["projected_overlap"],
+                -item["projected_grid_coverage"],
+                -item["projected_visible_ratio"],
+                -item["dino_similarity"],
+                item["axis_angle"],
+                item["distance"],
+                item["image_index"],
+            ),
+        )[:max_group_neighbors]
+        if group_order:
+            groups.append(
+                [source_idx, *[int(item["image_index"]) for item in group_order]]
+            )
+            valid = sum(
+                item["axis_angle"] < float(group_rotation_threshold_degrees)
+                for item in group_order
+            )
+            valid_neighbor_counts.append(int(valid))
+            unfiltered_neighbor_counts.append(int(len(group_order) - valid))
+
+    pairs = np.asarray(sorted(pair_set), dtype=np.int64).reshape(-1, 2)
+
+    def numeric_summary(values):
+        values = np.asarray(values, dtype=np.float64)
+        if values.size == 0:
+            return {"min": 0, "median": 0.0, "mean": 0.0, "max": 0}
+        return {
+            "min": int(values.min()),
+            "median": float(np.median(values)),
+            "mean": float(values.mean()),
+            "max": int(values.max()),
+        }
+
+    group_sizes = [len(group) for group in groups]
+    group_neighbors = [len(group) - 1 for group in groups]
+    stats = {
+        "strategy": "rig_center_depth_projected_overlap",
+        "candidate_pool": "center_pose_union_global_center_dino",
+        "depth_semantics": (
+            "true round_trip projected overlap on center-center frame pairs; "
+            "known rig viewing-axis expansion for non-center sensors"
+        ),
+        "neighbor_order": (
+            "rotation_valid_then_projected_overlap_grid_visible_dino_geometry"
+        ),
+        "max_pair_neighbors": max_pair_neighbors,
+        "max_neighbors": max_group_neighbors,
+        "max_axis_angle_degrees": float(max_axis_angle_degrees),
+        "pose_rotation_threshold": float(group_rotation_threshold_degrees),
+        "num_groups": len(groups),
+        "group_size": numeric_summary(group_sizes),
+        "neighbors": numeric_summary(group_neighbors),
+        "missing_centers": sorted(
+            set(range(metadata.num_images)) - {int(group[0]) for group in groups}
+        ),
+        "selected_rotation_valid_neighbors": numeric_summary(
+            valid_neighbor_counts
+        ),
+        "selected_unfiltered_neighbors": numeric_summary(
+            unfiltered_neighbor_counts
+        ),
+    }
+    return pairs, groups, stats
 
 
 def build_rig_pose_pairs(

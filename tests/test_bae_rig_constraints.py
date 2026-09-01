@@ -167,6 +167,47 @@ def test_five_camera_rig_uses_one_pose_block_per_frame():
     )
 
 
+def test_five_sensor_cameras_share_one_global_focal_parameter_block():
+    reconstruction, _config, sensor_transforms = _fake_reconstruction()
+    image_names = [image.name for image in reconstruction.images.values()]
+    image_frame_indices = [0] * 5 + [1] * 5
+    image_sensor_indices = list(range(5)) * 2
+    config = build_bae_rig_config(
+        image_names,
+        image_frame_indices,
+        image_sensor_indices,
+        sensor_transforms,
+        shared_focal=True,
+    )
+    problem = bae_solver._build_bae_problem(
+        reconstruction,
+        virtual_reconstruction=None,
+        negative_depth_observations={},
+        bae_root=REPO_ROOT / "third_party" / "bae" / "bae",
+        include_virtual=False,
+        rig_config=config,
+    )
+
+    assert config["shared_focal"] is True
+    assert problem.intrinsics.shape == (1, 3)
+    assert problem.intrinsics_camera_ids == [[1, 2, 3, 4, 5]]
+    np.testing.assert_array_equal(problem.intrinsics_indices, 0)
+
+    optimized_intrinsics = problem.intrinsics.copy()
+    optimized_intrinsics[0, 0] = 640.0
+    bae_solver._write_optimized_reconstruction(
+        reconstruction,
+        virtual_reconstruction=None,
+        problem=problem,
+        optimized_camera_params=problem.camera_params,
+        optimized_points=problem.points_3d,
+        optimized_intrinsics=optimized_intrinsics,
+    )
+    assert {
+        float(camera.params[0]) for camera in reconstruction.cameras.values()
+    } == {640.0}
+
+
 def test_fixed_sensor_relatives_survive_rig_pose_update_and_writeback():
     reconstruction, _config, sensor_transforms, problem = _build_problem(
         native_rig=False

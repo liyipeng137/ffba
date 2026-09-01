@@ -611,7 +611,8 @@ def prepare_dataset(args: argparse.Namespace) -> Path:
         )
         _verify_outputs(staging_dir, frames, face_size)
 
-        focal_pixels = face_size / 2.0
+        # e2c uses linspace endpoints, so boundary pixel centers define HFOV.
+        focal_pixels = (face_size - 1.0) / 2.0
         manifest = {
             "schema_version": 2,
             "source": {
@@ -641,8 +642,9 @@ def prepare_dataset(args: argparse.Namespace) -> Path:
                 "vfov_degrees": 90.0,
                 "fx_pixels": focal_pixels,
                 "fy_pixels": focal_pixels,
-                "cx_pixels": face_size / 2.0,
-                "cy_pixels": face_size / 2.0,
+                "cx_pixels": focal_pixels,
+                "cy_pixels": focal_pixels,
+                "pixel_center_convention": "pytorch360convert_linspace_endpoints",
                 "interpolation": args.interpolation,
                 "device": str(device),
                 "batch_size": args.batch_size,

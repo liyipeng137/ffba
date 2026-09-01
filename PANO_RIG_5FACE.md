@@ -89,15 +89,19 @@ Stage A loads only `center/` and runs Pi3X/MERG3R to estimate one coarse
 
 1. loads and preprocesses all five faces;
 2. expands each center pose with the fixed `sensor_from_rig` matrices;
-3. constructs a cross-frame, frustum-aware pair graph for all five faces;
-4. runs SIFT and VGGSfM with every face eligible as a tracking group center;
+3. ranks cross-frame candidates with center depth round-trip projected
+   overlap over the pose/global-DINO candidate union;
+4. expands those frame scores into frustum-aware five-face pairs and VGGSfM
+   groups, with every face eligible as a tracking center;
 5. merges prior and SIFT databases and triangulates tracks;
 6. runs BAE with one optimizable SE(3) block per rig timestamp.
 
 The rig extrinsics are registered as fixed tensors in BAE. A timestamp's five
 image observations share one pose index. Gauge fixing operates on rig frames,
-not independent face images. Intrinsics are represented per sensor, so all
-timestamps of one face share a camera record.
+not independent face images. COLMAP retains one camera record per sensor,
+while BAE maps all five sensor cameras to one global focal parameter block.
+The fixed principal point comes from the exact e2c endpoint convention:
+`f=(W-1)/2`, `cx=cy=(W-1)/2` for an unresized 90-degree square face.
 
 Weakly textured faces can legitimately finish with zero selected 3D
 observations after triangulation and reprojection filtering. They still remain
@@ -141,5 +145,6 @@ pytest -q \
 ```
 
 The tests cover sampling and face mapping, exact cubemap rotations, pair graph
-coverage, native COLMAP rig round trips, shared BAE pose indices, multi-sensor
-intrinsics, gauge fixing, rig pose writeback, and the non-rig compatibility path.
+coverage, center-depth rig pair/group expansion, native COLMAP rig round
+trips, shared BAE pose indices, global focal sharing, exact e2c intrinsics,
+gauge fixing, rig pose writeback, and the non-rig compatibility path.
