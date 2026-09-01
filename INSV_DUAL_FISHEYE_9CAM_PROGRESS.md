@@ -1,5 +1,10 @@
 # INSV 双鱼眼 9-camera Rig：进展记录与实施计划
 
+> 当前可执行代码、两份 prepare manifest、ERP Cubemap5 基线和 Fish9
+> 未实现清单的权威交接入口是
+> [DUAL_FISHEYE_9CAM_HANDOFF.md](DUAL_FISHEYE_9CAM_HANDOFF.md)。本文保留为
+> INSV 字段调查和历史设计记录；若状态冲突，以新交接文档为准。
+
 更新日期：2026-08-31
 
 本文记录从原始 INSV 双鱼眼视频生成无拼接、去畸变的 pinhole 输入，并接入完整 FFBA/BAE rig 流程的当前结论。为避免把猜测写成事实，文中使用以下状态：

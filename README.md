@@ -7,6 +7,10 @@
 > `rig_from_world`，五个 `sensor_from_rig` 为硬固定约束。完整契约和
 > 可运行命令见 [PANO_RIG_5FACE.md](PANO_RIG_5FACE.md)。
 
+> 双鱼眼 INSV/paired-frame 九视图准备约定、当前已实现边界和下一步
+> Fish9 接线顺序见
+> [DUAL_FISHEYE_9CAM_HANDOFF.md](DUAL_FISHEYE_9CAM_HANDOFF.md)。
+
 从已拼接的 2:1 ERP 全景视频准备五面输入：
 
 ```bash
