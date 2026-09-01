@@ -594,9 +594,10 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
     rig = coarse_state.rig
     if rig is None:
         raise ValueError("The pano branch requires explicit rig metadata")
-    if not config.stop_before_bae:
-        raise NotImplementedError(
-            "Pano rig BAE is not implemented yet; keep --stop-before-bae enabled"
+    if not config.stop_before_bae and config.ba_backend != "bae":
+        raise ValueError(
+            "Full cubemap rig refinement requires --ba_backend=bae so the "
+            "five sensor poses share one optimized rig pose per timestamp"
         )
 
     t_start = time.time()
@@ -948,7 +949,10 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
         virtual_predictions_dict = None
         stats["virtual_tracks"] = {
             "enabled": False,
-            "reason": "pano v1 stops before BAE and has center-only depth",
+            "reason": (
+                "Rig-aware BAE uses real SIFT/VGGSfM tracks; only the center "
+                "face has feed-forward depth"
+            ),
         }
         stats["timing"]["virtual_tracks"] = 0.0
         _debug(args, "Skipping virtual tracks for BAE SP refinement")
@@ -1060,8 +1064,10 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
     stats["pre_bae_reconstruction"]["max_projection_center_spread"] = pose_audit[
         "max_projection_center_spread"
     ]
-    stats["pre_bae_reconstruction"]["max_absolute_yaw_error_degrees"] = pose_audit[
-        "max_absolute_yaw_error_degrees"
+    stats["pre_bae_reconstruction"][
+        "max_absolute_orientation_error_degrees"
+    ] = pose_audit[
+        "max_absolute_orientation_error_degrees"
     ]
 
     if config.stop_before_bae:
@@ -1138,6 +1144,24 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
         f"bae_huber_delta={args.bae_huber_delta}, "
         f"final_bae_huber_delta={args.final_bae_huber_delta}",
     )
+    sensor_from_rig_by_sensor = []
+    for rotation in rig.sensor_from_rig_rotations:
+        transform = np.eye(4, dtype=np.float64)
+        transform[:3, :3] = np.asarray(rotation, dtype=np.float64)
+        sensor_from_rig_by_sensor.append(transform)
+    bae_rig_config = ref.build_bae_rig_config(
+        image_names,
+        rig.image_frame_indices,
+        rig.image_sensor_indices,
+        sensor_from_rig_by_sensor,
+    )
+    stats["bae_rig_config"] = {
+        "enabled": True,
+        "num_rig_frames": int(rig.num_frames),
+        "num_images": int(rig.num_images),
+        "num_sensors": int(len(rig.sensor_names)),
+        "pose_semantics": bae_rig_config["pose_semantics"],
+    }
     t0 = time.time()
     (
         reconstruction,
@@ -1156,6 +1180,8 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
         virtual_predictions_dict,
         features,
         output_dir / "database_merged.db",
+        bae_rig_config=bae_rig_config,
+        rig_seed_reconstruction=pre_bae_reconstruction,
     )
     stats["timing"]["augmented_refinement"] = time.time() - t0
     stats["augmented_refinement"] = augmented_stats
@@ -1168,6 +1194,39 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
         virtual_dir = output_dir / "virtual_gluemap_aba"
         virtual_dir.mkdir(parents=True, exist_ok=True)
         virtual_reconstruction.write(str(virtual_dir))
+
+    final_images_by_name = {
+        image.name: image for image in reconstruction.images.values()
+    }
+    missing_final_images = [
+        image_name
+        for image_name in image_names
+        if image_name not in final_images_by_name
+    ]
+    if missing_final_images:
+        raise ValueError(
+            "Final BAE reconstruction is missing rig images: "
+            f"{missing_final_images[:5]}"
+        )
+    final_extrinsic = np.asarray(
+        [
+            np.asarray(final_images_by_name[name].cam_from_world().matrix())
+            for name in image_names
+        ],
+        dtype=np.float64,
+    )
+    post_bae_pose_audit = build_pose_audit(final_extrinsic, rig)
+    post_bae_pose_audit_path = output_dir / "post_bae_rig_pose_audit.json"
+    _write_json(post_bae_pose_audit_path, post_bae_pose_audit)
+    stats["post_bae_rig_pose_audit"] = {
+        "path": str(post_bae_pose_audit_path),
+        "max_projection_center_spread": post_bae_pose_audit[
+            "max_projection_center_spread"
+        ],
+        "max_absolute_orientation_error_degrees": post_bae_pose_audit[
+            "max_absolute_orientation_error_degrees"
+        ],
+    }
 
     stats["timing"]["total"] = time.time() - t_start
     stats["output"] = {
@@ -1192,7 +1251,7 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
 
     return GluemapSpvRefineResult(
         image_names=image_names,
-        extrinsic=extrinsic,
+        extrinsic=final_extrinsic,
         pairs=pairs,
         intrinsic=intrinsic,
         intrinsics_mapping=intrinsics_mapping,

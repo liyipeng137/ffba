@@ -17,6 +17,7 @@ from utils.pano_rig import (
     intrinsics_for_image_size,
     intrinsics_from_pinhole_crop,
     make_pano_rig_metadata,
+    sensor_from_rig_rotation,
     write_rig_reconstruction,
 )
 
@@ -27,7 +28,7 @@ def _center_poses(num_frames):
     return poses[:, :3]
 
 
-def test_expand_center_pose_produces_colocated_yawed_views():
+def test_expand_center_pose_matches_e2c_five_face_orientations():
     metadata = make_pano_rig_metadata(["000.png", "001.png"])
     expanded = expand_center_extrinsics(_center_poses(2), metadata)
     rotations = expanded[:, :3, :3]
@@ -35,61 +36,79 @@ def test_expand_center_pose_produces_colocated_yawed_views():
     centers = np.einsum("nij,nj->ni", -rotations.transpose(0, 2, 1), translations)
     axes = rotations.transpose(0, 2, 1)[:, :, 2]
 
-    np.testing.assert_allclose(centers[:3], np.zeros((3, 3)), atol=1e-12)
+    np.testing.assert_allclose(centers[:5], np.zeros((5, 3)), atol=1e-12)
     np.testing.assert_allclose(
-        centers[3:], np.repeat([[1.0, 0.0, 0.0]], 3, axis=0), atol=1e-12
+        centers[5:], np.repeat([[1.0, 0.0, 0.0]], 5, axis=0), atol=1e-12
     )
     np.testing.assert_allclose(
-        axes[:3],
-        [
-            [-np.sqrt(3) / 2, 0.0, 0.5],
-            [0.0, 0.0, 1.0],
-            [np.sqrt(3) / 2, 0.0, 0.5],
-        ],
+        axes[:5],
+        [[0, 0, 1], [-1, 0, 0], [1, 0, 0], [0, -1, 0], [0, 1, 0]],
         atol=1e-12,
     )
+    assert metadata.sensor_names == ("center", "left", "right", "up", "down")
+    assert metadata.center_image_indices == [0, 5]
+    assert metadata.to_dict()["image_order"] == "frame_major_center_left_right_up_down"
     audit = build_pose_audit(expanded, metadata)
     assert audit["max_projection_center_spread"] < 1e-12
-    assert audit["max_absolute_yaw_error_degrees"] < 1e-12
+    assert audit["max_absolute_orientation_error_degrees"] < 1e-12
 
 
-def test_rig_pairs_exclude_same_frame_and_cover_adjacent_sensors():
+def test_e2c_up_down_pixel_orientation_is_not_yaw_only():
+    expected = {
+        "center": [[1, 0, 0], [0, 1, 0], [0, 0, 1]],
+        "left": [[0, 0, 1], [0, 1, 0], [-1, 0, 0]],
+        "right": [[0, 0, -1], [0, 1, 0], [1, 0, 0]],
+        "up": [[1, 0, 0], [0, 0, 1], [0, -1, 0]],
+        "down": [[1, 0, 0], [0, 0, -1], [0, 1, 0]],
+    }
+    for sensor_name, matrix in expected.items():
+        np.testing.assert_array_equal(sensor_from_rig_rotation(sensor_name), matrix)
+
+    camera_top = np.array([0.0, -1.0, 1.0])
+    up_top_in_rig = sensor_from_rig_rotation("up").T @ camera_top
+    down_top_in_rig = sensor_from_rig_rotation("down").T @ camera_top
+    np.testing.assert_array_equal(up_top_in_rig, [0.0, -1.0, -1.0])
+    np.testing.assert_array_equal(down_top_in_rig, [0.0, 1.0, 1.0])
+
+
+def test_rig_pairs_exclude_same_frame_include_90_and_exclude_opposites():
     metadata = make_pano_rig_metadata([f"{idx:03d}.png" for idx in range(5)])
     expanded = expand_center_extrinsics(_center_poses(5), metadata)
     pairs = build_rig_pose_pairs(
-        expanded,
-        metadata,
-        max_neighbors=6,
-        max_axis_angle_degrees=85.0,
+        expanded, metadata, max_neighbors=10, max_axis_angle_degrees=95.0
     )
     frame_indices = np.asarray(metadata.image_frame_indices)
     sensor_indices = np.asarray(metadata.image_sensor_indices)
     assert pairs.shape[1] == 2
     assert np.all(frame_indices[pairs[:, 0]] != frame_indices[pairs[:, 1]])
-    assert not np.any(
-        (sensor_indices[pairs[:, 0]] == 0) & (sensor_indices[pairs[:, 1]] == 2)
-    )
+    pair_sensors = {
+        frozenset((sensor_indices[first], sensor_indices[second]))
+        for first, second in pairs
+    }
+    assert frozenset((1, 2)) not in pair_sensors
+    assert frozenset((3, 4)) not in pair_sensors
     center_image_idx = metadata.center_image_indices[2]
     neighbors = set(
         pairs[pairs[:, 0] == center_image_idx, 1].tolist()
         + pairs[pairs[:, 1] == center_image_idx, 0].tolist()
     )
-    assert {sensor_indices[idx] for idx in neighbors} == {0, 1, 2}
+    assert {sensor_indices[idx] for idx in neighbors} == {0, 1, 2, 3, 4}
 
 
-def test_center_filter_keeps_or_drops_complete_triplets():
+def test_center_filter_keeps_or_drops_complete_five_face_frames():
     metadata = make_pano_rig_metadata(["000.png", "001.png", "002.png"])
     kept_frames, kept_images = center_driven_keep_indices(
         metadata, [12, 3, 20], threshold=10
     )
     np.testing.assert_array_equal(kept_frames, [0, 2])
-    np.testing.assert_array_equal(kept_images, [0, 1, 2, 6, 7, 8])
+    np.testing.assert_array_equal(kept_images, [0, 1, 2, 3, 4, 10, 11, 12, 13, 14])
 
     filtered = filter_metadata(metadata, kept_frames)
     assert filtered.frame_names == ["000.png", "002.png"]
     assert filtered.frame_source_indices == [0, 2]
-    assert filtered.image_frame_indices == [0, 0, 0, 1, 1, 1]
-    assert filtered.image_sensor_indices == [0, 1, 2, 0, 1, 2]
+    assert filtered.image_frame_indices == [0] * 5 + [1] * 5
+    assert filtered.image_sensor_indices == [0, 1, 2, 3, 4] * 2
+    assert filtered.sensor_from_rig_rotations == metadata.sensor_from_rig_rotations
 
 
 def test_intrinsics_account_for_resize_and_crop():
@@ -113,7 +132,7 @@ def test_intrinsics_account_for_resize_and_crop():
     )
 
 
-def test_intrinsics_for_16_by_9_image_with_110_degree_hfov():
+def test_intrinsics_helper_preserves_non_cubemap_behavior():
     intrinsic = intrinsics_for_image_size((1080, 1920), 110.0)
     focal = 1920 / (2.0 * np.tan(np.deg2rad(110.0) / 2.0))
     np.testing.assert_allclose(
@@ -122,12 +141,19 @@ def test_intrinsics_for_16_by_9_image_with_110_degree_hfov():
     )
 
 
+def test_standard_square_cubemap_intrinsics_are_90_degrees():
+    intrinsic = intrinsics_for_image_size((512, 512), 90.0)
+    np.testing.assert_allclose(
+        intrinsic, [[256, 0, 256], [0, 256, 256], [0, 0, 1]], atol=1e-12
+    )
+
+
 def test_pycolmap_rig_reconstruction_and_database_round_trip(tmp_path):
     pycolmap = pytest.importorskip("pycolmap")
     metadata = make_pano_rig_metadata(["000.png", "001.png"])
     center_extrinsic = _center_poses(2)
     intrinsic = np.array([[50.0, 0.0, 50.0], [0.0, 50.0, 50.0], [0, 0, 1]])
-    sensor_intrinsics = [intrinsic.copy() for _ in range(3)]
+    sensor_intrinsics = [intrinsic.copy() for _ in range(5)]
 
     model_dir = tmp_path / "model"
     reconstruction = write_rig_reconstruction(
@@ -140,21 +166,21 @@ def test_pycolmap_rig_reconstruction_and_database_round_trip(tmp_path):
     )
     reloaded = pycolmap.Reconstruction(str(model_dir))
     assert len(reconstruction.rigs) == len(reloaded.rigs) == 1
-    assert len(reloaded.cameras) == 3
+    assert len(reloaded.cameras) == 5
     assert len(reloaded.frames) == 2
-    assert len(reloaded.images) == 6
+    assert len(reloaded.images) == 10
     for frame_idx in range(2):
         centers = [
-            reloaded.images[frame_idx * 3 + sensor_idx + 1].projection_center()
-            for sensor_idx in range(3)
+            reloaded.images[frame_idx * 5 + sensor_idx + 1].projection_center()
+            for sensor_idx in range(5)
         ]
         np.testing.assert_allclose(
-            centers, np.repeat([centers[0]], 3, axis=0), atol=1e-12
+            centers, np.repeat([centers[0]], 5, axis=0), atol=1e-12
         )
 
     database_path = tmp_path / "database.db"
     database = pycolmap.Database.open(str(database_path))
-    for camera_id in range(1, 4):
+    for camera_id in range(1, 6):
         database.write_camera(
             pycolmap.Camera(
                 camera_id=camera_id,
@@ -188,7 +214,7 @@ def test_pycolmap_rig_reconstruction_and_database_round_trip(tmp_path):
         assert database.num_rigs() == 1
         assert database.num_frames() == 2
         images = sorted(database.read_all_images(), key=lambda image: image.image_id)
-        assert [image.frame_id for image in images] == [1, 1, 1, 2, 2, 2]
-        assert [image.camera_id for image in images] == [1, 2, 3, 1, 2, 3]
+        assert [image.frame_id for image in images] == [1, 1, 1, 1, 1, 2, 2, 2, 2, 2]
+        assert [image.camera_id for image in images] == [1, 2, 3, 4, 5, 1, 2, 3, 4, 5]
     finally:
         database.close()

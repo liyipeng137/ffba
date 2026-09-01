@@ -1,8 +1,8 @@
-"""Fixed three-view panorama rig helpers for the pano pipeline branch.
+"""Fixed five-face cubemap rig helpers for the pano pipeline branch.
 
-The first implementation intentionally models only co-located perspective
-views at yaw angles ``[-60, 0, +60]``.  Images are ordered frame-major:
-left, center, right for every source timestamp.
+The rig uses the Front/Left/Right/Up/Down face orientation produced by
+``pytorch360convert.e2c``. Images are ordered frame-major, with the stable
+sensor order center, left, right, up, down for every source timestamp.
 """
 
 from __future__ import annotations
@@ -13,9 +13,22 @@ from pathlib import Path
 import numpy as np
 
 
-SENSOR_NAMES = ("left", "center", "right")
-SENSOR_YAWS_DEGREES = (-60.0, 0.0, 60.0)
-CENTER_SENSOR_INDEX = 1
+SENSOR_NAMES = ("center", "left", "right", "up", "down")
+SENSOR_CUBEMAP_FACES = ("Front", "Left", "Right", "Up", "Down")
+SENSOR_YAWS_DEGREES = (0.0, -90.0, 90.0, 0.0, 0.0)
+CENTER_SENSOR_INDEX = 0
+CUBEMAP_FOV_DEGREES = 90.0
+
+# OpenCV camera coordinates are +x right, +y down, +z forward. These complete
+# sensor_from_rig rotations reproduce pytorch360convert.e2c's face pixel
+# orientations, including the otherwise ambiguous roll of the Up/Down faces.
+SENSOR_FROM_RIG_ROTATIONS = (
+    ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)),  # Front
+    ((0.0, 0.0, 1.0), (0.0, 1.0, 0.0), (-1.0, 0.0, 0.0)),  # Left
+    ((0.0, 0.0, -1.0), (0.0, 1.0, 0.0), (1.0, 0.0, 0.0)),  # Right
+    ((1.0, 0.0, 0.0), (0.0, 0.0, 1.0), (0.0, -1.0, 0.0)),  # Up
+    ((1.0, 0.0, 0.0), (0.0, 0.0, -1.0), (0.0, 1.0, 0.0)),  # Down
+)
 
 
 @dataclass(frozen=True)
@@ -26,9 +39,14 @@ class PanoRigMetadata:
     image_sensor_indices: list[int]
     image_names: list[str]
     sensor_names: tuple[str, ...] = SENSOR_NAMES
+    sensor_cubemap_faces: tuple[str, ...] = SENSOR_CUBEMAP_FACES
     sensor_yaws_degrees: tuple[float, ...] = SENSOR_YAWS_DEGREES
+    sensor_from_rig_rotations: tuple[tuple[tuple[float, ...], ...], ...] = (
+        SENSOR_FROM_RIG_ROTATIONS
+    )
     center_sensor_index: int = CENTER_SENSOR_INDEX
-    hfov_degrees: float = 110.0
+    hfov_degrees: float = CUBEMAP_FOV_DEGREES
+    vfov_degrees: float = CUBEMAP_FOV_DEGREES
 
     @property
     def num_frames(self) -> int:
@@ -51,12 +69,17 @@ class PanoRigMetadata:
         payload["center_image_indices"] = self.center_image_indices
         payload["num_frames"] = self.num_frames
         payload["num_images"] = self.num_images
-        payload["image_order"] = "frame_major_left_center_right"
+        payload["image_order"] = "frame_major_center_left_right_up_down"
+        payload["sensor_order"] = list(self.sensor_names)
+        payload["cubemap_face_order"] = list(self.sensor_cubemap_faces)
+        payload["rig_reference_sensor"] = self.sensor_names[self.center_sensor_index]
+        payload["rotation_semantics"] = "sensor_from_rig"
+        payload["face_geometry"] = "square_90_degree_hfov_vfov"
         payload["translation_model"] = "co_located_zero_baseline"
         return payload
 
 
-def make_pano_rig_metadata(frame_names, hfov_degrees=110.0):
+def make_pano_rig_metadata(frame_names, hfov_degrees=CUBEMAP_FOV_DEGREES):
     frame_names = [str(name) for name in frame_names]
     if not frame_names:
         raise ValueError("A pano rig requires at least one frame")
@@ -81,7 +104,23 @@ def make_pano_rig_metadata(frame_names, hfov_degrees=110.0):
         image_sensor_indices=image_sensor_indices,
         image_names=image_names,
         hfov_degrees=float(hfov_degrees),
+        vfov_degrees=float(hfov_degrees),
     )
+
+
+def sensor_from_rig_rotation(sensor):
+    """Return one e2c-compatible ``sensor_from_rig`` rotation matrix."""
+
+    if isinstance(sensor, str):
+        try:
+            sensor_idx = SENSOR_NAMES.index(sensor)
+        except ValueError as exc:
+            raise ValueError(f"Unknown pano rig sensor: {sensor}") from exc
+    else:
+        sensor_idx = int(sensor)
+    if not 0 <= sensor_idx < len(SENSOR_FROM_RIG_ROTATIONS):
+        raise ValueError(f"Pano rig sensor index out of range: {sensor_idx}")
+    return np.asarray(SENSOR_FROM_RIG_ROTATIONS[sensor_idx], dtype=np.float64)
 
 
 def yaw_sensor_from_rig(yaw_degrees):
@@ -121,9 +160,9 @@ def expand_center_extrinsics(center_extrinsic, metadata):
     center_w2c[:, :3, :4] = center_extrinsic[:, :3, :4]
     expanded = []
     for frame_idx in range(metadata.num_frames):
-        for yaw_degrees in metadata.sensor_yaws_degrees:
+        for rotation in metadata.sensor_from_rig_rotations:
             sensor_from_rig = np.eye(4, dtype=np.float64)
-            sensor_from_rig[:3, :3] = yaw_sensor_from_rig(yaw_degrees)
+            sensor_from_rig[:3, :3] = np.asarray(rotation, dtype=np.float64)
             expanded.append((sensor_from_rig @ center_w2c[frame_idx])[:3, :4])
     return np.asarray(expanded, dtype=np.float64)
 
@@ -266,7 +305,7 @@ def build_pose_audit(extrinsic, metadata):
     axes = rotations.transpose(0, 2, 1)[:, :, 2]
     frame_entries = []
     center_spreads = []
-    yaw_errors = []
+    orientation_errors = []
     sensors_per_frame = len(metadata.sensor_names)
     for frame_idx in range(metadata.num_frames):
         first = frame_idx * sensors_per_frame
@@ -277,6 +316,7 @@ def build_pose_audit(extrinsic, metadata):
         center_spreads.append(spread)
         sensor_entries = []
         center_axis = frame_axes[metadata.center_sensor_index]
+        center_rotation = rotations[first + metadata.center_sensor_index]
         for sensor_idx, sensor_name in enumerate(metadata.sensor_names):
             measured_angle = float(
                 np.rad2deg(
@@ -285,13 +325,28 @@ def build_pose_audit(extrinsic, metadata):
                     )
                 )
             )
-            expected_angle = abs(float(metadata.sensor_yaws_degrees[sensor_idx]))
-            yaw_error = abs(measured_angle - expected_angle)
-            yaw_errors.append(yaw_error)
+            measured_sensor_from_rig = rotations[first + sensor_idx] @ center_rotation.T
+            expected_sensor_from_rig = np.asarray(
+                metadata.sensor_from_rig_rotations[sensor_idx], dtype=np.float64
+            )
+            rotation_delta = measured_sensor_from_rig @ expected_sensor_from_rig.T
+            orientation_errors.append(
+                float(
+                    np.rad2deg(
+                        np.arccos(
+                            np.clip(
+                                (np.trace(rotation_delta) - 1.0) * 0.5, -1.0, 1.0
+                            )
+                        )
+                    )
+                )
+            )
             sensor_entries.append(
                 {
                     "sensor": sensor_name,
+                    "cubemap_face": metadata.sensor_cubemap_faces[sensor_idx],
                     "yaw_degrees": float(metadata.sensor_yaws_degrees[sensor_idx]),
+                    "sensor_from_rig_rotation": expected_sensor_from_rig.tolist(),
                     "image_name": metadata.image_names[first + sensor_idx],
                     "projection_center": frame_centers[sensor_idx].tolist(),
                     "viewing_direction": frame_axes[sensor_idx].tolist(),
@@ -312,7 +367,9 @@ def build_pose_audit(extrinsic, metadata):
         "num_frames": metadata.num_frames,
         "num_images": metadata.num_images,
         "max_projection_center_spread": float(max(center_spreads, default=0.0)),
-        "max_absolute_yaw_error_degrees": float(max(yaw_errors, default=0.0)),
+        "max_absolute_orientation_error_degrees": float(
+            max(orientation_errors, default=0.0)
+        ),
         "frames": frame_entries,
     }
 
@@ -358,9 +415,12 @@ def filter_metadata(metadata, kept_frame_indices):
         image_sensor_indices=image_sensor_indices,
         image_names=image_names,
         sensor_names=metadata.sensor_names,
+        sensor_cubemap_faces=metadata.sensor_cubemap_faces,
         sensor_yaws_degrees=metadata.sensor_yaws_degrees,
+        sensor_from_rig_rotations=metadata.sensor_from_rig_rotations,
         center_sensor_index=metadata.center_sensor_index,
         hfov_degrees=metadata.hfov_degrees,
+        vfov_degrees=metadata.vfov_degrees,
     )
 
 
@@ -369,12 +429,12 @@ def _make_pycolmap_rig(pycolmap, metadata, rig_id=1):
     rig.rig_id = int(rig_id)
     center_camera_id = metadata.center_sensor_index + 1
     rig.add_ref_sensor(pycolmap.sensor_t(pycolmap.SensorType.CAMERA, center_camera_id))
-    for sensor_idx, yaw_degrees in enumerate(metadata.sensor_yaws_degrees):
+    for sensor_idx, rotation in enumerate(metadata.sensor_from_rig_rotations):
         camera_id = sensor_idx + 1
         if sensor_idx == metadata.center_sensor_index:
             continue
         matrix = np.column_stack(
-            [yaw_sensor_from_rig(yaw_degrees), np.zeros(3, dtype=np.float64)]
+            [np.asarray(rotation, dtype=np.float64), np.zeros(3, dtype=np.float64)]
         )
         rig.add_sensor(
             pycolmap.sensor_t(pycolmap.SensorType.CAMERA, camera_id),
@@ -454,7 +514,7 @@ def configure_rig_database(
     metadata,
     camera_model="SIMPLE_PINHOLE",
 ):
-    """Replace trivial database frames with one fixed three-sensor rig."""
+    """Replace trivial database frames with one fixed five-sensor rig."""
 
     import pycolmap  # noqa: PLC0415
 

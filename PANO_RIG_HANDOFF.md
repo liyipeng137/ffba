@@ -1,5 +1,10 @@
 # Panorama Rig Pipeline: Design and Progress
 
+> Historical note: this file documents the earlier three-face, pre-BAE
+> milestone. It is retained for implementation history only. The active
+> five-face input contract and rig-aware BAE workflow are documented in
+> [PANO_RIG_5FACE.md](PANO_RIG_5FACE.md).
+
 Last updated: 2026-08-28  
 Branch: `codex/pano-rig`  
 Branch base: `1f919d7` (`Tune final refinement with a separate BAE Huber delta`)
@@ -60,6 +65,32 @@ The contract is:
 At least two complete triplets are required. The default run mode is
 `--stop-before-bae`; `--no-stop-before-bae` intentionally raises because the
 rig-aware BAE implementation is the next milestone.
+
+## Preparing input from an ERP video
+
+Use `scripts/prepare_pano_rig_from_erp.py` when the source is a stitched 2:1
+equirectangular panorama video. The script uniformly samples source frames and
+generates all three synchronized pinhole views in one FFmpeg filter graph.
+
+```bash
+python scripts/prepare_pano_rig_from_erp.py \
+  --input /kiri/dataset/local_test_erp.mp4 \
+  --output-dir /kiri/dataset/local_test_pano_rig_50 \
+  --num-frames 50
+```
+
+Defaults match this branch's input contract: PNG output, `1920x1080`, HFOV
+`110°`, and yaw `left=-60°`, `center=0°`, `right=+60°`. The vertical FOV is
+derived from the horizontal FOV and aspect ratio (`77.55°` for the default), so
+the generated views have square pixels. FFmpeg yaw is used directly: negative
+yaw samples decreasing ERP x (left), and positive yaw samples increasing ERP x
+(right).
+
+The script refuses to reuse an existing output directory, constructs the data
+in a temporary sibling directory, verifies every triplet and image size, then
+renames it into place. `pano_rig_manifest.json` records the exact decoded source
+frame indices, timestamps, projection parameters, intrinsics, yaw convention,
+and FFmpeg filter graph.
 
 The default test command is:
 

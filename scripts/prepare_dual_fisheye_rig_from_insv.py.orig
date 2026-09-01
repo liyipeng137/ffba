@@ -1,0 +1,1557 @@
+#!/usr/bin/env python3
+"""Prepare nine pinhole views directly from an Insta360 dual-fisheye INSV.
+
+The script reads the two synchronized HEVC streams and the embedded INSV v3
+``offset_v3`` calibration.  Every output pixel is sampled from exactly one
+physical fisheye stream; no ERP conversion, stitching, optical flow, or
+cross-lens blending is performed.
+
+The default layout contains ``front_center`` plus four diagonal views from
+each physical lens.  All outputs are square 90-degree pinhole images.  Unless
+``--diagonal-tilt-degrees`` is given, the largest octahedron-like tilt that
+keeps the complete square projection inside a configurable source-rim margin
+is selected automatically.
+
+The Insta360 projection below follows the public Gyroflow implementation:
+https://github.com/gyroflow/gyroflow/blob/master/src/core/stabilization/distortion_models/insta360.rs
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import math
+import shutil
+import struct
+import subprocess
+import uuid
+from dataclasses import asdict, dataclass
+from fractions import Fraction
+from pathlib import Path
+from typing import BinaryIO, Iterable
+
+import cv2
+import numpy as np
+from PIL import Image, ImageDraw
+
+
+INSV_MAGIC = b"8db42d694ccc418790edff439fe026bf"
+INSV_HEADER_SIZE = 32 + 4 + 4 + 32
+MANIFEST_NAME = "dual_fisheye_rig_manifest.json"
+REPORT_NAME = "prepare_report.json"
+SENSOR_NAMES = (
+    "front_center",
+    "front_ul",
+    "front_ur",
+    "front_dl",
+    "front_dr",
+    "back_ul",
+    "back_ur",
+    "back_dl",
+    "back_dr",
+)
+DIAGONAL_SIGNS = {
+    "ul": (-1.0, -1.0),
+    "ur": (1.0, -1.0),
+    "dl": (-1.0, 1.0),
+    "dr": (1.0, 1.0),
+}
+OCTAHEDRAL_TILT_DEGREES = math.degrees(math.acos(1.0 / math.sqrt(3.0)))
+
+
+@dataclass(frozen=True)
+class RawLensCalibration:
+    lens_index: int
+    xi: float
+    fx: float
+    fy: float
+    cx: float
+    cy: float
+    yaw_degrees: float
+    pitch_degrees: float
+    roll_degrees: float
+    tx: float
+    ty: float
+    tz: float
+    k1: float
+    k2: float
+    k3: float
+    p1: float
+    p2: float
+    combined_width: float
+    combined_height: float
+    lens_type: int
+
+
+@dataclass(frozen=True)
+class EncodedLensCalibration:
+    lens_index: int
+    width: int
+    height: int
+    xi: float
+    fx: float
+    fy: float
+    cx: float
+    cy: float
+    k1: float
+    k2: float
+    k3: float
+    p1: float
+    p2: float
+    circular_support_radius_pixels: float
+
+
+@dataclass(frozen=True)
+class SensorGeometry:
+    name: str
+    role: str
+    stream_ordinal: int
+    lens_index: int
+    quadrant: str | None
+    tilt_degrees: float
+    azimuth_degrees: float
+    roll_degrees: float
+    view_to_lens_rotation: tuple[tuple[float, ...], ...]
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Sample a dual-fisheye INSV and create synchronized "
+            "front-center plus eight single-lens 90-degree pinhole views."
+        )
+    )
+    parser.add_argument("--input", type=Path, required=True, help="Input INSV")
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        required=True,
+        help="New output directory; it must not already exist",
+    )
+    parser.add_argument(
+        "--num-frames",
+        type=int,
+        default=50,
+        help="Number of synchronized timestamps sampled uniformly (default: 50)",
+    )
+    parser.add_argument(
+        "--face-size",
+        type=int,
+        default=1024,
+        help="Square pinhole output size (default: 1024)",
+    )
+    parser.add_argument(
+        "--front-stream",
+        type=int,
+        default=0,
+        help="FFmpeg video-stream ordinal used as front (default: 0)",
+    )
+    parser.add_argument(
+        "--back-stream",
+        type=int,
+        default=1,
+        help="FFmpeg video-stream ordinal used as back (default: 1)",
+    )
+    parser.add_argument(
+        "--diagonal-tilt-degrees",
+        type=float,
+        default=None,
+        help=(
+            "Fixed diagonal tilt from each fisheye optical axis. By default, "
+            "search downward from the exact octahedral 54.7356 degrees."
+        ),
+    )
+    parser.add_argument(
+        "--minimum-diagonal-tilt-degrees",
+        type=float,
+        default=30.0,
+        help="Minimum tilt considered by automatic layout search (default: 30)",
+    )
+    parser.add_argument(
+        "--tilt-search-step-degrees",
+        type=float,
+        default=0.5,
+        help="Automatic tilt-search step (default: 0.5 degrees)",
+    )
+    parser.add_argument(
+        "--rim-margin-pixels",
+        type=float,
+        default=64.0,
+        help=(
+            "Required radial margin from the calibrated fisheye circle during "
+            "automatic layout selection (default: 64 source pixels)"
+        ),
+    )
+    parser.add_argument(
+        "--roll-search-step-degrees",
+        type=float,
+        default=2.0,
+        help="Per-view roll search step in [0, 90) (default: 2 degrees)",
+    )
+    parser.add_argument(
+        "--start-time",
+        type=float,
+        default=None,
+        help="Optional inclusive source start time in seconds",
+    )
+    parser.add_argument(
+        "--end-time",
+        type=float,
+        default=None,
+        help="Optional inclusive source end time in seconds",
+    )
+    parser.add_argument(
+        "--interpolation",
+        choices=("nearest", "linear", "cubic", "lanczos"),
+        default="linear",
+        help="OpenCV remap interpolation (default: linear)",
+    )
+    parser.add_argument(
+        "--save-source-frames",
+        action="store_true",
+        help="Also save the selected 3840x3840 fisheye frames",
+    )
+    parser.add_argument("--ffmpeg", default="ffmpeg")
+    parser.add_argument("--ffprobe", default="ffprobe")
+    return parser.parse_args()
+
+
+def _run_json(argv: list[str]) -> dict:
+    completed = subprocess.run(
+        argv,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    return json.loads(completed.stdout)
+
+
+def _tool_version(tool: str) -> str:
+    completed = subprocess.run(
+        [tool, "-version"],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    return completed.stdout.splitlines()[0]
+
+
+def _parse_rate(value: str | None) -> float | None:
+    if not value or value == "0/0":
+        return None
+    try:
+        return float(Fraction(value))
+    except (ValueError, ZeroDivisionError):
+        return None
+
+
+def _optional_float(value: object) -> float | None:
+    if value in (None, "", "N/A"):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _declared_timestamps(stream: dict) -> tuple[list[float], float]:
+    try:
+        frame_count = int(stream.get("nb_frames", 0))
+    except (TypeError, ValueError):
+        frame_count = 0
+    average_fps = _parse_rate(stream.get("avg_frame_rate"))
+    nominal_fps = _parse_rate(stream.get("r_frame_rate"))
+    fps = average_fps or nominal_fps
+    if frame_count <= 0 or fps is None:
+        raise RuntimeError(
+            "INSV video streams must expose nb_frames and a valid frame rate; "
+            "per-frame VFR fallback is intentionally not used for synchronized "
+            "dual-stream preparation"
+        )
+    if nominal_fps is not None and average_fps is not None and not math.isclose(
+        nominal_fps, average_fps, rel_tol=1e-5, abs_tol=1e-6
+    ):
+        raise RuntimeError(
+            "Variable-rate or rate-mismatched INSV streams are not supported: "
+            f"r_frame_rate={nominal_fps}, avg_frame_rate={average_fps}"
+        )
+    start = _optional_float(stream.get("start_time")) or 0.0
+    return [start + frame_idx / fps for frame_idx in range(frame_count)], fps
+
+
+def probe_dual_video(
+    input_path: Path,
+    ffprobe: str,
+    front_stream: int,
+    back_stream: int,
+) -> dict:
+    payload = _run_json(
+        [
+            ffprobe,
+            "-v",
+            "error",
+            "-select_streams",
+            "v",
+            "-show_entries",
+            (
+                "stream=index,codec_name,codec_tag_string,width,height,pix_fmt,"
+                "color_range,color_space,r_frame_rate,avg_frame_rate,nb_frames,"
+                "duration,start_time:format=duration,size,tags"
+            ),
+            "-of",
+            "json",
+            str(input_path),
+        ]
+    )
+    streams = payload.get("streams", [])
+    if len(streams) < 2:
+        raise RuntimeError(f"Expected at least two INSV video streams, got {len(streams)}")
+    if front_stream == back_stream:
+        raise ValueError("--front-stream and --back-stream must be different")
+    for ordinal in (front_stream, back_stream):
+        if not 0 <= ordinal < len(streams):
+            raise ValueError(
+                f"Video stream ordinal {ordinal} is unavailable; file has {len(streams)}"
+            )
+    selected = [streams[front_stream], streams[back_stream]]
+    for stream in selected:
+        width = int(stream.get("width", 0))
+        height = int(stream.get("height", 0))
+        if width <= 0 or height <= 0 or width != height:
+            raise RuntimeError(
+                f"Expected square fisheye streams, got {width}x{height}"
+            )
+    if (selected[0]["width"], selected[0]["height"]) != (
+        selected[1]["width"],
+        selected[1]["height"],
+    ):
+        raise RuntimeError("Front/back INSV stream dimensions differ")
+
+    front_timestamps, front_fps = _declared_timestamps(selected[0])
+    back_timestamps, back_fps = _declared_timestamps(selected[1])
+    if len(front_timestamps) != len(back_timestamps):
+        raise RuntimeError(
+            "Front/back frame counts differ: "
+            f"{len(front_timestamps)} vs {len(back_timestamps)}"
+        )
+    if not math.isclose(front_fps, back_fps, rel_tol=0.0, abs_tol=1e-9):
+        raise RuntimeError(f"Front/back FPS differ: {front_fps} vs {back_fps}")
+    max_timestamp_delta = max(
+        (
+            abs(front_timestamp - back_timestamp)
+            for front_timestamp, back_timestamp in zip(
+                front_timestamps, back_timestamps, strict=True
+            )
+        ),
+        default=0.0,
+    )
+    if max_timestamp_delta > 1e-7:
+        raise RuntimeError(
+            "Front/back generated timestamps are not synchronized: "
+            f"max delta={max_timestamp_delta} seconds"
+        )
+    return {
+        "all_video_streams": streams,
+        "front_stream": selected[0],
+        "back_stream": selected[1],
+        "front_stream_ordinal": front_stream,
+        "back_stream_ordinal": back_stream,
+        "timestamps": front_timestamps,
+        "fps": front_fps,
+        "timestamp_source": "stream_nb_frames_and_average_fps_cfr",
+        "max_generated_timestamp_delta_seconds": max_timestamp_delta,
+        "format": payload.get("format", {}),
+    }
+
+
+def uniform_sample_positions(item_count: int, sample_count: int) -> list[int]:
+    if item_count <= 0:
+        raise ValueError("item_count must be positive")
+    if sample_count <= 0:
+        raise ValueError("sample_count must be positive")
+    if sample_count > item_count:
+        raise ValueError(
+            f"Cannot sample {sample_count} unique items from only {item_count}"
+        )
+    return [
+        ((2 * index + 1) * item_count) // (2 * sample_count)
+        for index in range(sample_count)
+    ]
+
+
+def choose_source_frames(
+    timestamps: list[float],
+    num_frames: int,
+    start_time: float | None,
+    end_time: float | None,
+) -> list[dict]:
+    if start_time is not None and start_time < 0:
+        raise ValueError("--start-time must be non-negative")
+    if end_time is not None and end_time < 0:
+        raise ValueError("--end-time must be non-negative")
+    if start_time is not None and end_time is not None and start_time > end_time:
+        raise ValueError("--start-time must not exceed --end-time")
+    eligible = [
+        frame_idx
+        for frame_idx, timestamp in enumerate(timestamps)
+        if (start_time is None or timestamp >= start_time)
+        and (end_time is None or timestamp <= end_time)
+    ]
+    if not eligible:
+        raise ValueError("The requested time range contains no source video frames")
+    positions = uniform_sample_positions(len(eligible), num_frames)
+    frames = []
+    for output_idx, position in enumerate(positions):
+        source_frame_idx = eligible[position]
+        output_name = f"{output_idx:06d}.png"
+        frames.append(
+            {
+                "output_index": output_idx,
+                "output_name": output_name,
+                "source_frame_index": source_frame_idx,
+                "source_timestamp_seconds": timestamps[source_frame_idx],
+                "sensor_paths": {
+                    name: f"{name}/{output_name}" for name in SENSOR_NAMES
+                },
+            }
+        )
+    return frames
+
+
+def _decode_varint(data: bytes, position: int) -> tuple[int, int]:
+    value = 0
+    shift = 0
+    while position < len(data) and shift < 70:
+        byte = data[position]
+        position += 1
+        value |= (byte & 0x7F) << shift
+        if byte < 0x80:
+            return value, position
+        shift += 7
+    raise ValueError("Malformed protobuf varint")
+
+
+def parse_protobuf_fields(data: bytes) -> dict[int, list[tuple[int, object]]]:
+    """Parse protobuf wire values without requiring generated message classes."""
+    fields: dict[int, list[tuple[int, object]]] = {}
+    position = 0
+    while position < len(data):
+        key, position = _decode_varint(data, position)
+        field_number = key >> 3
+        wire_type = key & 0x07
+        if field_number <= 0:
+            raise ValueError("Invalid protobuf field number")
+        if wire_type == 0:
+            value, position = _decode_varint(data, position)
+        elif wire_type == 1:
+            if position + 8 > len(data):
+                raise ValueError("Truncated protobuf fixed64")
+            value = data[position : position + 8]
+            position += 8
+        elif wire_type == 2:
+            size, position = _decode_varint(data, position)
+            if position + size > len(data):
+                raise ValueError("Truncated protobuf length-delimited field")
+            value = data[position : position + size]
+            position += size
+        elif wire_type == 5:
+            if position + 4 > len(data):
+                raise ValueError("Truncated protobuf fixed32")
+            value = data[position : position + 4]
+            position += 4
+        else:
+            raise ValueError(f"Unsupported protobuf wire type: {wire_type}")
+        fields.setdefault(field_number, []).append((wire_type, value))
+    return fields
+
+
+def _protobuf_last(fields: dict, field_number: int, wire_type: int):
+    entries = fields.get(field_number, [])
+    for entry_wire_type, value in reversed(entries):
+        if entry_wire_type == wire_type:
+            return value
+    return None
+
+
+def _protobuf_string(fields: dict, field_number: int) -> str | None:
+    value = _protobuf_last(fields, field_number, 2)
+    if value is None:
+        return None
+    return bytes(value).decode("utf-8", errors="strict")
+
+
+def _protobuf_nested_uints(fields: dict, field_number: int) -> dict[int, int]:
+    value = _protobuf_last(fields, field_number, 2)
+    if value is None:
+        return {}
+    nested = parse_protobuf_fields(bytes(value))
+    return {
+        key: int(entry[0][1])
+        for key, entry in nested.items()
+        if entry and entry[0][0] == 0
+    }
+
+
+def parse_insv_extra_metadata(data: bytes) -> dict:
+    fields = parse_protobuf_fields(data)
+    rolling_raw = _protobuf_last(fields, 25, 1)
+    rolling_shutter = (
+        struct.unpack("<d", bytes(rolling_raw))[0]
+        if rolling_raw is not None
+        else None
+    )
+    dimension = _protobuf_nested_uints(fields, 19)
+    crop = _protobuf_nested_uints(fields, 27)
+    resolution = _protobuf_nested_uints(fields, 44)
+    return {
+        "camera_type": _protobuf_string(fields, 2),
+        "firmware_version": _protobuf_string(fields, 3),
+        "file_type": _protobuf_string(fields, 4),
+        "offset": _protobuf_string(fields, 5),
+        "original_offset": _protobuf_string(fields, 17),
+        "offset_v2": _protobuf_string(fields, 53),
+        "offset_v3": _protobuf_string(fields, 54),
+        "original_offset_v2": _protobuf_string(fields, 55),
+        "original_offset_v3": _protobuf_string(fields, 56),
+        "dimension": {"x": dimension.get(1), "y": dimension.get(2)},
+        "frame_rate": _protobuf_last(fields, 20, 0),
+        "first_frame_timestamp": _protobuf_last(fields, 24, 0),
+        "rolling_shutter_time": rolling_shutter,
+        "window_crop_info": {
+            "src_width": crop.get(1),
+            "src_height": crop.get(2),
+            "dst_width": crop.get(3),
+            "dst_height": crop.get(4),
+        },
+        "resolution_size": {"x": resolution.get(1), "y": resolution.get(2)},
+        "is_raw_gyro": bool(_protobuf_last(fields, 62, 0) or False),
+        "video_pts_type": _protobuf_last(fields, 64, 0),
+    }
+
+
+def read_insv_metadata(input_path: Path) -> dict:
+    file_size = input_path.stat().st_size
+    if file_size < INSV_HEADER_SIZE + 6:
+        raise RuntimeError("File is too small to contain an INSV v3 trailer")
+    with input_path.open("rb") as stream:
+        stream.seek(-INSV_HEADER_SIZE, 2)
+        header = stream.read(INSV_HEADER_SIZE)
+        if header[-len(INSV_MAGIC) :] != INSV_MAGIC:
+            raise RuntimeError("INSV v3 trailer magic is missing")
+        extra_size = struct.unpack_from("<I", header, 32)[0]
+        version = struct.unpack_from("<I", header, 36)[0]
+        if extra_size <= INSV_HEADER_SIZE or extra_size > file_size:
+            raise RuntimeError(f"Invalid INSV extra size: {extra_size}")
+        extra_start = file_size - extra_size
+
+        offsets_trailer_position = file_size - INSV_HEADER_SIZE - 6
+        stream.seek(offsets_trailer_position)
+        offsets_format, offsets_id, offsets_size = struct.unpack("<BBI", stream.read(6))
+        if offsets_id != 0:
+            raise RuntimeError(
+                f"Expected INSV offsets record id 0, got {offsets_id}"
+            )
+        offsets_data_position = offsets_trailer_position - offsets_size
+        if offsets_data_position < extra_start:
+            raise RuntimeError("INSV offsets record exceeds private trailer")
+        stream.seek(offsets_data_position)
+        offsets_data = stream.read(offsets_size)
+        if len(offsets_data) % 10 != 0:
+            raise RuntimeError("INSV offsets table size is not divisible by 10")
+        records = {}
+        for position in range(0, len(offsets_data), 10):
+            record_id, record_format, record_size, record_offset = struct.unpack_from(
+                "<BBII", offsets_data, position
+            )
+            if record_id > 0:
+                records[int(record_id)] = {
+                    "format": int(record_format),
+                    "size": int(record_size),
+                    "offset": int(record_offset),
+                }
+        if 1 not in records:
+            raise RuntimeError("INSV metadata record id 1 is missing")
+        metadata_record = records[1]
+        metadata_position = extra_start + metadata_record["offset"]
+        stream.seek(metadata_position)
+        metadata_data = stream.read(metadata_record["size"])
+        trailer = stream.read(6)
+        if len(metadata_data) != metadata_record["size"] or len(trailer) != 6:
+            raise RuntimeError("INSV metadata record is truncated")
+        record_format, record_id, record_size = struct.unpack("<BBI", trailer)
+        if record_id != 1 or record_size != metadata_record["size"]:
+            raise RuntimeError("INSV metadata record trailer does not match offsets table")
+        if record_format not in {0, 1, 2}:
+            raise RuntimeError(f"Unexpected INSV metadata format: {record_format}")
+    metadata = parse_insv_extra_metadata(metadata_data)
+    metadata["insv_version"] = int(version)
+    metadata["extra_size_bytes"] = int(extra_size)
+    metadata["offsets_record_format"] = int(offsets_format)
+    metadata["record_catalog"] = {
+        str(record_id): record for record_id, record in sorted(records.items())
+    }
+    metadata["metadata_record_sha256"] = hashlib.sha256(metadata_data).hexdigest()
+    return metadata
+
+
+def parse_offset_v3(value: str) -> tuple[list[RawLensCalibration], int]:
+    tokens = [token for token in value.strip().split("_") if token != ""]
+    if not tokens:
+        raise ValueError("offset_v3 is empty")
+    try:
+        lens_count = int(float(tokens[0]))
+    except ValueError as exc:
+        raise ValueError("offset_v3 lens count is invalid") from exc
+    fields_per_lens = 19
+    expected = 1 + lens_count * fields_per_lens + 1
+    if len(tokens) != expected:
+        raise ValueError(
+            f"offset_v3 expected {expected} numeric tokens for {lens_count} lenses, "
+            f"got {len(tokens)}"
+        )
+    lenses = []
+    for lens_index in range(lens_count):
+        start = 1 + lens_index * fields_per_lens
+        values = [float(token) for token in tokens[start : start + fields_per_lens]]
+        lenses.append(
+            RawLensCalibration(
+                lens_index=lens_index,
+                xi=values[0],
+                fx=values[1],
+                fy=values[2],
+                cx=values[3],
+                cy=values[4],
+                yaw_degrees=values[5],
+                pitch_degrees=values[6],
+                roll_degrees=values[7],
+                tx=values[8],
+                ty=values[9],
+                tz=values[10],
+                k1=values[11],
+                k2=values[12],
+                k3=values[13],
+                p1=values[14],
+                p2=values[15],
+                combined_width=values[16],
+                combined_height=values[17],
+                lens_type=int(round(values[18])),
+            )
+        )
+    flag = int(float(tokens[-1]))
+    return lenses, flag
+
+
+def scale_lens_calibration_to_stream(
+    raw: RawLensCalibration,
+    *,
+    lens_count: int,
+    stream_width: int,
+    stream_height: int,
+    crop_info: dict,
+) -> EncodedLensCalibration:
+    src_width = int(crop_info.get("src_width") or 0)
+    src_height = int(crop_info.get("src_height") or 0)
+    dst_width = int(crop_info.get("dst_width") or 0)
+    dst_height = int(crop_info.get("dst_height") or 0)
+    if min(src_width, src_height, dst_width, dst_height) <= 0:
+        raise ValueError(f"Invalid INSV window_crop_info: {crop_info}")
+    local_calibration_width = raw.combined_width / lens_count
+    local_cx = raw.cx - raw.lens_index * local_calibration_width
+    if not 0.0 <= local_cx <= local_calibration_width:
+        raise ValueError(
+            f"Lens {raw.lens_index} local cx is outside calibration canvas: {local_cx}"
+        )
+
+    # This matches telemetry-parser/Gyroflow's X4/X5 lens-profile conversion:
+    # focal length follows the 5376->5312 crop scale, while the principal point
+    # is scaled from the complete per-lens 5376 calibration canvas.
+    fx = raw.fx * stream_width / dst_width
+    fy = raw.fy * stream_height / dst_height
+    cx = local_cx * stream_width / src_width
+    cy = raw.cy * stream_height / src_height
+    support_radius = min(cx, cy, stream_width - 1.0 - cx, stream_height - 1.0 - cy)
+    if support_radius <= 0:
+        raise ValueError(f"Lens {raw.lens_index} has invalid encoded principal point")
+    return EncodedLensCalibration(
+        lens_index=raw.lens_index,
+        width=stream_width,
+        height=stream_height,
+        xi=raw.xi,
+        fx=fx,
+        fy=fy,
+        cx=cx,
+        cy=cy,
+        k1=raw.k1,
+        k2=raw.k2,
+        k3=raw.k3,
+        p1=raw.p1,
+        p2=raw.p2,
+        circular_support_radius_pixels=support_radius,
+    )
+
+
+def pinhole_intrinsics(face_size: int, fov_degrees: float = 90.0) -> np.ndarray:
+    if face_size <= 0:
+        raise ValueError("face_size must be positive")
+    if not 0.0 < fov_degrees < 180.0:
+        raise ValueError("fov_degrees must be in (0, 180)")
+    focal = face_size / (2.0 * math.tan(math.radians(fov_degrees) / 2.0))
+    # COLMAP uses pixel centers at x+0.5/y+0.5, hence cx=width/2.
+    principal = face_size / 2.0
+    return np.array(
+        [[focal, 0.0, principal], [0.0, focal, principal], [0.0, 0.0, 1.0]],
+        dtype=np.float64,
+    )
+
+
+def _normalize(vector: np.ndarray) -> np.ndarray:
+    norm = float(np.linalg.norm(vector))
+    if norm <= 1e-12:
+        raise ValueError("Cannot normalize a zero vector")
+    return vector / norm
+
+
+def diagonal_direction(
+    quadrant: str,
+    tilt_degrees: float,
+) -> tuple[np.ndarray, float]:
+    if quadrant not in DIAGONAL_SIGNS:
+        raise ValueError(f"Unknown diagonal quadrant: {quadrant}")
+    x_sign, y_sign = DIAGONAL_SIGNS[quadrant]
+    tilt = math.radians(float(tilt_degrees))
+    azimuth = math.atan2(y_sign, x_sign)
+    direction = np.array(
+        [
+            math.sin(tilt) * math.cos(azimuth),
+            math.sin(tilt) * math.sin(azimuth),
+            math.cos(tilt),
+        ],
+        dtype=np.float64,
+    )
+    return _normalize(direction), math.degrees(azimuth)
+
+
+def view_to_lens_rotation(direction: np.ndarray, roll_degrees: float) -> np.ndarray:
+    """Return a rotation whose columns are view right/down/forward in lens axes."""
+    forward = _normalize(np.asarray(direction, dtype=np.float64))
+    reference_down = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+    right = np.cross(reference_down, forward)
+    if np.linalg.norm(right) < 1e-8:
+        reference_down = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+        right = np.cross(reference_down, forward)
+    right = _normalize(right)
+    down = _normalize(np.cross(forward, right))
+    base = np.column_stack([right, down, forward])
+    angle = math.radians(float(roll_degrees))
+    cosine = math.cos(angle)
+    sine = math.sin(angle)
+    local_roll = np.array(
+        [[cosine, -sine, 0.0], [sine, cosine, 0.0], [0.0, 0.0, 1.0]],
+        dtype=np.float64,
+    )
+    rotation = base @ local_roll
+    if not np.allclose(rotation.T @ rotation, np.eye(3), atol=1e-10):
+        raise RuntimeError("view_to_lens rotation is not orthonormal")
+    if np.linalg.det(rotation) < 0.999999:
+        raise RuntimeError("view_to_lens rotation is not right handed")
+    return rotation
+
+
+def boundary_pinhole_rays(samples_per_edge: int = 129) -> np.ndarray:
+    if samples_per_edge < 2:
+        raise ValueError("samples_per_edge must be at least 2")
+    values = np.linspace(-1.0, 1.0, samples_per_edge, dtype=np.float64)
+    edges = [
+        np.column_stack([values, np.full_like(values, -1.0)]),
+        np.column_stack([values, np.full_like(values, 1.0)]),
+        np.column_stack([np.full_like(values, -1.0), values]),
+        np.column_stack([np.full_like(values, 1.0), values]),
+    ]
+    points = np.concatenate(edges, axis=0)
+    rays = np.column_stack([points, np.ones(len(points), dtype=np.float64)])
+    return rays / np.linalg.norm(rays, axis=1, keepdims=True)
+
+
+def project_insta360(
+    rays_lens: np.ndarray,
+    calibration: EncodedLensCalibration,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    rays = np.asarray(rays_lens, dtype=np.float64)
+    if rays.shape[-1] != 3:
+        raise ValueError(f"Expected (...,3) rays, got {rays.shape}")
+    lengths = np.linalg.norm(rays, axis=-1)
+    nx = rays[..., 0] / lengths
+    ny = rays[..., 1] / lengths
+    nz = rays[..., 2] / lengths
+    denominator = nz + calibration.xi
+    denominator_valid = np.abs(denominator) > 1e-9
+    x = np.divide(nx, denominator, out=np.zeros_like(nx), where=denominator_valid)
+    y = np.divide(ny, denominator, out=np.zeros_like(ny), where=denominator_valid)
+    r2 = x * x + y * y
+    r4 = r2 * r2
+    r6 = r4 * r2
+    radial = 1.0 + calibration.k1 * r2 + calibration.k2 * r4 + calibration.k3 * r6
+    distorted_x = (
+        x * radial
+        + 2.0 * calibration.p1 * x * y
+        + calibration.p2 * (r2 + 2.0 * x * x)
+    )
+    distorted_y = (
+        y * radial
+        + 2.0 * calibration.p2 * x * y
+        + calibration.p1 * (r2 + 2.0 * y * y)
+    )
+    map_x = calibration.fx * distorted_x + calibration.cx
+    map_y = calibration.fy * distorted_y + calibration.cy
+    finite = np.isfinite(map_x) & np.isfinite(map_y) & denominator_valid
+    return map_x, map_y, finite
+
+
+def projection_margin_pixels(
+    rays_view: np.ndarray,
+    rotation: np.ndarray,
+    calibration: EncodedLensCalibration,
+) -> tuple[float, float]:
+    rays_lens = np.asarray(rays_view, dtype=np.float64) @ rotation.T
+    map_x, map_y, finite = project_insta360(rays_lens, calibration)
+    if not bool(np.all(finite)):
+        return -math.inf, -math.inf
+    radial_distance = np.hypot(map_x - calibration.cx, map_y - calibration.cy)
+    radial_margin = float(
+        calibration.circular_support_radius_pixels - np.max(radial_distance)
+    )
+    frame_margin = float(
+        min(
+            np.min(map_x),
+            np.min(map_y),
+            np.min((calibration.width - 1.0) - map_x),
+            np.min((calibration.height - 1.0) - map_y),
+        )
+    )
+    return radial_margin, frame_margin
+
+
+def optimize_roll_for_margin(
+    direction: np.ndarray,
+    calibration: EncodedLensCalibration,
+    *,
+    roll_step_degrees: float,
+    boundary_rays: np.ndarray | None = None,
+) -> tuple[float, dict]:
+    if roll_step_degrees <= 0.0 or roll_step_degrees > 45.0:
+        raise ValueError("roll_step_degrees must be in (0, 45]")
+    if boundary_rays is None:
+        boundary_rays = boundary_pinhole_rays()
+    candidates = np.arange(-45.0, 45.0, roll_step_degrees, dtype=np.float64)
+    if not np.any(np.isclose(candidates, 0.0)):
+        candidates = np.sort(np.append(candidates, 0.0))
+    best = None
+    for roll in candidates:
+        rotation = view_to_lens_rotation(direction, float(roll))
+        radial_margin, frame_margin = projection_margin_pixels(
+            boundary_rays, rotation, calibration
+        )
+        score = min(radial_margin, frame_margin)
+        candidate = {
+            "roll_degrees": float(roll),
+            "radial_margin_pixels": radial_margin,
+            "frame_margin_pixels": frame_margin,
+            "minimum_margin_pixels": score,
+        }
+        if best is None or (score, -abs(float(roll))) > (
+            best["minimum_margin_pixels"],
+            -abs(best["roll_degrees"]),
+        ):
+            best = candidate
+    assert best is not None
+    return float(best["roll_degrees"]), best
+
+
+def choose_layout(
+    calibrations: dict[int, EncodedLensCalibration],
+    front_stream: int,
+    back_stream: int,
+    *,
+    requested_tilt_degrees: float | None,
+    minimum_tilt_degrees: float,
+    tilt_step_degrees: float,
+    rim_margin_pixels: float,
+    roll_step_degrees: float,
+) -> tuple[float, dict[tuple[int, str], dict], dict]:
+    if minimum_tilt_degrees <= 0.0 or minimum_tilt_degrees >= 90.0:
+        raise ValueError("minimum_tilt_degrees must be in (0, 90)")
+    if tilt_step_degrees <= 0.0:
+        raise ValueError("tilt_step_degrees must be positive")
+    if rim_margin_pixels < 0.0:
+        raise ValueError("rim_margin_pixels must be non-negative")
+    if requested_tilt_degrees is not None:
+        if not 0.0 < requested_tilt_degrees < 90.0:
+            raise ValueError("diagonal tilt must be in (0, 90)")
+        tilts = [float(requested_tilt_degrees)]
+        mode = "explicit"
+    else:
+        tilts = []
+        value = OCTAHEDRAL_TILT_DEGREES
+        while value >= minimum_tilt_degrees - 1e-9:
+            tilts.append(float(value))
+            value -= tilt_step_degrees
+        mode = "automatic_largest_tilt_with_required_rim_margin"
+    boundary = boundary_pinhole_rays()
+    evaluations = []
+    selected = None
+    for tilt in tilts:
+        per_sensor: dict[tuple[int, str], dict] = {}
+        minimum_margin = math.inf
+        for stream_ordinal in (front_stream, back_stream):
+            calibration = calibrations[stream_ordinal]
+            for quadrant in DIAGONAL_SIGNS:
+                direction, azimuth = diagonal_direction(quadrant, tilt)
+                roll, stats = optimize_roll_for_margin(
+                    direction,
+                    calibration,
+                    roll_step_degrees=roll_step_degrees,
+                    boundary_rays=boundary,
+                )
+                entry = {
+                    **stats,
+                    "stream_ordinal": stream_ordinal,
+                    "lens_index": calibration.lens_index,
+                    "quadrant": quadrant,
+                    "azimuth_degrees": azimuth,
+                    "direction_lens": direction.tolist(),
+                    "roll_degrees": roll,
+                }
+                per_sensor[(stream_ordinal, quadrant)] = entry
+                minimum_margin = min(minimum_margin, stats["minimum_margin_pixels"])
+        evaluations.append(
+            {
+                "tilt_degrees": tilt,
+                "minimum_margin_pixels": minimum_margin,
+            }
+        )
+        if requested_tilt_degrees is not None or minimum_margin >= rim_margin_pixels:
+            selected = (tilt, per_sensor, minimum_margin)
+            break
+    if selected is None:
+        raise RuntimeError(
+            "No diagonal tilt satisfied the requested fisheye rim margin: "
+            f"minimum_tilt={minimum_tilt_degrees}, margin={rim_margin_pixels}px"
+        )
+    tilt, per_sensor, minimum_margin = selected
+    summary = {
+        "mode": mode,
+        "exact_octahedral_tilt_degrees": OCTAHEDRAL_TILT_DEGREES,
+        "selected_tilt_degrees": tilt,
+        "required_rim_margin_pixels": rim_margin_pixels,
+        "selected_minimum_margin_pixels": minimum_margin,
+        "tilt_search_step_degrees": tilt_step_degrees,
+        "roll_search_step_degrees": roll_step_degrees,
+        "evaluations": evaluations,
+        "explicit_tilt_meets_requested_margin": minimum_margin >= rim_margin_pixels,
+    }
+    return tilt, per_sensor, summary
+
+
+def make_sensor_geometries(
+    *,
+    front_stream: int,
+    back_stream: int,
+    calibrations: dict[int, EncodedLensCalibration],
+    tilt_degrees: float,
+    layout_entries: dict[tuple[int, str], dict],
+) -> list[SensorGeometry]:
+    geometries = [
+        SensorGeometry(
+            name="front_center",
+            role="feed_forward_reference",
+            stream_ordinal=front_stream,
+            lens_index=calibrations[front_stream].lens_index,
+            quadrant=None,
+            tilt_degrees=0.0,
+            azimuth_degrees=0.0,
+            roll_degrees=0.0,
+            view_to_lens_rotation=tuple(
+                tuple(float(value) for value in row) for row in np.eye(3)
+            ),
+        )
+    ]
+    for role, stream_ordinal in (("front", front_stream), ("back", back_stream)):
+        for quadrant in DIAGONAL_SIGNS:
+            entry = layout_entries[(stream_ordinal, quadrant)]
+            direction, azimuth = diagonal_direction(quadrant, tilt_degrees)
+            rotation = view_to_lens_rotation(direction, entry["roll_degrees"])
+            geometries.append(
+                SensorGeometry(
+                    name=f"{role}_{quadrant}",
+                    role="rig_supplementary",
+                    stream_ordinal=stream_ordinal,
+                    lens_index=calibrations[stream_ordinal].lens_index,
+                    quadrant=quadrant,
+                    tilt_degrees=tilt_degrees,
+                    azimuth_degrees=azimuth,
+                    roll_degrees=entry["roll_degrees"],
+                    view_to_lens_rotation=tuple(
+                        tuple(float(value) for value in row) for row in rotation
+                    ),
+                )
+            )
+    if tuple(geometry.name for geometry in geometries) != SENSOR_NAMES:
+        raise RuntimeError("Internal sensor ordering does not match SENSOR_NAMES")
+    return geometries
+
+
+def build_remap(
+    face_size: int,
+    geometry: SensorGeometry,
+    calibration: EncodedLensCalibration,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
+    intrinsics = pinhole_intrinsics(face_size, 90.0)
+    coordinates = np.arange(face_size, dtype=np.float64) + 0.5
+    normalized = (coordinates - intrinsics[0, 2]) / intrinsics[0, 0]
+    grid_x, grid_y = np.meshgrid(normalized, normalized)
+    rays_view = np.stack([grid_x, grid_y, np.ones_like(grid_x)], axis=-1)
+    rays_view /= np.linalg.norm(rays_view, axis=-1, keepdims=True)
+    rotation = np.asarray(geometry.view_to_lens_rotation, dtype=np.float64)
+    rays_lens = rays_view @ rotation.T
+    map_x, map_y, finite = project_insta360(rays_lens, calibration)
+    radial_distance = np.hypot(map_x - calibration.cx, map_y - calibration.cy)
+    radial_margin = calibration.circular_support_radius_pixels - radial_distance
+    valid = (
+        finite
+        & (map_x >= 0.0)
+        & (map_x <= calibration.width - 1.0)
+        & (map_y >= 0.0)
+        & (map_y <= calibration.height - 1.0)
+        & (radial_margin >= 0.0)
+    )
+    stats = {
+        "valid_pixel_count": int(np.count_nonzero(valid)),
+        "total_pixel_count": int(valid.size),
+        "valid_pixel_ratio": float(np.mean(valid)),
+        "minimum_radial_margin_pixels": float(np.min(radial_margin[finite])),
+        "p01_radial_margin_pixels": float(np.percentile(radial_margin[finite], 1.0)),
+        "median_radial_margin_pixels": float(np.median(radial_margin[finite])),
+        "maximum_source_radius_pixels": float(np.max(radial_distance[finite])),
+    }
+    return (
+        map_x.astype(np.float32),
+        map_y.astype(np.float32),
+        valid.astype(np.uint8) * 255,
+        stats,
+    )
+
+
+def build_decode_command(
+    ffmpeg: str,
+    input_path: Path,
+    stream_ordinal: int,
+    source_frame_indices: list[int],
+) -> list[str]:
+    if not source_frame_indices:
+        raise ValueError("At least one source frame index is required")
+    select_expression = "+".join(
+        f"eq(n\\,{frame_idx})" for frame_idx in source_frame_indices
+    )
+    return [
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-nostdin",
+        "-i",
+        str(input_path),
+        "-map",
+        f"0:v:{stream_ordinal}",
+        "-an",
+        "-sn",
+        "-dn",
+        "-vf",
+        f"select='{select_expression}'",
+        "-vsync",
+        "0",
+        "-pix_fmt",
+        "bgr24",
+        "-f",
+        "rawvideo",
+        "pipe:1",
+    ]
+
+
+def _read_exact(stream: BinaryIO, byte_count: int) -> bytes:
+    chunks = bytearray()
+    while len(chunks) < byte_count:
+        chunk = stream.read(byte_count - len(chunks))
+        if not chunk:
+            break
+        chunks.extend(chunk)
+    return bytes(chunks)
+
+
+def _interpolation_flag(name: str) -> int:
+    return {
+        "nearest": cv2.INTER_NEAREST,
+        "linear": cv2.INTER_LINEAR,
+        "cubic": cv2.INTER_CUBIC,
+        "lanczos": cv2.INTER_LANCZOS4,
+    }[name]
+
+
+def _decode_and_project_stream(
+    *,
+    input_path: Path,
+    staging_dir: Path,
+    stream_ordinal: int,
+    frames: list[dict],
+    source_width: int,
+    source_height: int,
+    sensors: list[SensorGeometry],
+    remaps: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]],
+    interpolation: str,
+    save_source_frames: bool,
+    ffmpeg: str,
+) -> list[str]:
+    command = build_decode_command(
+        ffmpeg,
+        input_path,
+        stream_ordinal,
+        [frame["source_frame_index"] for frame in frames],
+    )
+    bytes_per_frame = source_width * source_height * 3
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    assert process.stdout is not None
+    assert process.stderr is not None
+    stream_sensors = [
+        sensor for sensor in sensors if sensor.stream_ordinal == stream_ordinal
+    ]
+    interpolation_flag = _interpolation_flag(interpolation)
+    try:
+        for frame in frames:
+            raw = _read_exact(process.stdout, bytes_per_frame)
+            if len(raw) != bytes_per_frame:
+                stderr = process.stderr.read().decode(errors="replace")
+                raise RuntimeError(
+                    "FFmpeg ended before all selected dual-fisheye frames were "
+                    f"decoded: expected {bytes_per_frame} bytes, got {len(raw)}. "
+                    f"{stderr}"
+                )
+            source = np.frombuffer(raw, dtype=np.uint8).reshape(
+                source_height, source_width, 3
+            )
+            if save_source_frames:
+                role = "front" if sensor_role(stream_ordinal, sensors) == "front" else "back"
+                source_path = staging_dir / f"fisheye_{role}" / frame["output_name"]
+                if not cv2.imwrite(str(source_path), source):
+                    raise RuntimeError(f"Failed to write source frame: {source_path}")
+            for sensor in stream_sensors:
+                map_x, map_y, valid_mask = remaps[sensor.name]
+                output = cv2.remap(
+                    source,
+                    map_x,
+                    map_y,
+                    interpolation=interpolation_flag,
+                    borderMode=cv2.BORDER_CONSTANT,
+                    borderValue=(0, 0, 0),
+                )
+                output[valid_mask == 0] = 0
+                output_path = staging_dir / sensor.name / frame["output_name"]
+                if not cv2.imwrite(str(output_path), output):
+                    raise RuntimeError(f"Failed to write pinhole image: {output_path}")
+        if process.stdout.read(1):
+            raise RuntimeError("FFmpeg decoded more frames than were selected")
+        stderr = process.stderr.read().decode(errors="replace")
+        return_code = process.wait()
+        if return_code != 0:
+            raise subprocess.CalledProcessError(return_code, command, stderr=stderr)
+    except BaseException:
+        if process.poll() is None:
+            process.terminate()
+        process.communicate()
+        raise
+    return command
+
+
+def sensor_role(stream_ordinal: int, sensors: Iterable[SensorGeometry]) -> str:
+    names = [sensor.name for sensor in sensors if sensor.stream_ordinal == stream_ordinal]
+    if any(name.startswith("front_") for name in names):
+        return "front"
+    if any(name.startswith("back_") for name in names):
+        return "back"
+    raise ValueError(f"No sensor role for stream ordinal {stream_ordinal}")
+
+
+def _verify_outputs(
+    staging_dir: Path,
+    frames: list[dict],
+    face_size: int,
+    save_source_frames: bool,
+    source_size: tuple[int, int],
+):
+    expected_names = [frame["output_name"] for frame in frames]
+    for sensor_name in SENSOR_NAMES:
+        paths = sorted((staging_dir / sensor_name).glob("*.png"))
+        if [path.name for path in paths] != expected_names:
+            raise RuntimeError(f"Unexpected output set for sensor {sensor_name}")
+        for path in paths:
+            with Image.open(path) as image:
+                if image.size != (face_size, face_size):
+                    raise RuntimeError(f"Unexpected output image size: {path}")
+    if save_source_frames:
+        for role in ("front", "back"):
+            paths = sorted((staging_dir / f"fisheye_{role}").glob("*.png"))
+            if [path.name for path in paths] != expected_names:
+                raise RuntimeError(f"Unexpected saved fisheye set for {role}")
+            with Image.open(paths[0]) as image:
+                if image.size != source_size:
+                    raise RuntimeError(f"Unexpected saved fisheye size: {paths[0]}")
+
+
+def _write_preview(staging_dir: Path, output_name: str, face_size: int):
+    tile_size = min(320, face_size)
+    label_height = 28
+    canvas = Image.new("RGB", (tile_size * 3, (tile_size + label_height) * 3))
+    draw = ImageDraw.Draw(canvas)
+    for index, sensor_name in enumerate(SENSOR_NAMES):
+        row, column = divmod(index, 3)
+        with Image.open(staging_dir / sensor_name / output_name).convert("RGB") as image:
+            image.thumbnail((tile_size, tile_size), Image.Resampling.LANCZOS)
+            x = column * tile_size
+            y = row * (tile_size + label_height)
+            canvas.paste(image, (x, y))
+            draw.rectangle((x, y + tile_size, x + tile_size, y + tile_size + label_height), fill="black")
+            draw.text((x + 6, y + tile_size + 6), sensor_name, fill="white")
+    preview_dir = staging_dir / "previews"
+    preview_dir.mkdir(exist_ok=True)
+    canvas.save(preview_dir / "first_frame_9view_contact_sheet.jpg", quality=92)
+
+
+def _duration_seconds(probe: dict) -> float | None:
+    return _optional_float(probe["format"].get("duration")) or _optional_float(
+        probe["front_stream"].get("duration")
+    )
+
+
+def _safe_stream_payload(stream: dict) -> dict:
+    return {
+        key: value
+        for key, value in stream.items()
+        if key
+        in {
+            "index",
+            "codec_name",
+            "codec_tag_string",
+            "width",
+            "height",
+            "pix_fmt",
+            "color_range",
+            "color_space",
+            "r_frame_rate",
+            "avg_frame_rate",
+            "nb_frames",
+            "duration",
+            "start_time",
+        }
+    }
+
+
+def prepare_dataset(args: argparse.Namespace) -> Path:
+    input_path = args.input.expanduser().resolve()
+    output_dir = args.output_dir.expanduser().resolve()
+    if not input_path.is_file():
+        raise FileNotFoundError(f"INSV not found: {input_path}")
+    if output_dir.exists():
+        raise FileExistsError(
+            f"Output directory already exists; choose a new path: {output_dir}"
+        )
+    if args.num_frames <= 0:
+        raise ValueError("--num-frames must be positive")
+    if args.face_size <= 0:
+        raise ValueError("--face-size must be positive")
+
+    probe = probe_dual_video(
+        input_path, args.ffprobe, args.front_stream, args.back_stream
+    )
+    metadata = read_insv_metadata(input_path)
+    if not metadata.get("offset_v3"):
+        raise RuntimeError("INSV metadata does not contain offset_v3 calibration")
+    raw_lenses, offset_flag = parse_offset_v3(metadata["offset_v3"])
+    if len(raw_lenses) != 2:
+        raise RuntimeError(f"Expected two offset_v3 lenses, got {len(raw_lenses)}")
+    if max(args.front_stream, args.back_stream) >= len(raw_lenses):
+        raise ValueError(
+            "Selected stream ordinal cannot be mapped to an offset_v3 lens block"
+        )
+    source_width = int(probe["front_stream"]["width"])
+    source_height = int(probe["front_stream"]["height"])
+    calibrations = {
+        stream_ordinal: scale_lens_calibration_to_stream(
+            raw_lenses[stream_ordinal],
+            lens_count=len(raw_lenses),
+            stream_width=source_width,
+            stream_height=source_height,
+            crop_info=metadata["window_crop_info"],
+        )
+        for stream_ordinal in (args.front_stream, args.back_stream)
+    }
+    tilt, layout_entries, layout_summary = choose_layout(
+        calibrations,
+        args.front_stream,
+        args.back_stream,
+        requested_tilt_degrees=args.diagonal_tilt_degrees,
+        minimum_tilt_degrees=args.minimum_diagonal_tilt_degrees,
+        tilt_step_degrees=args.tilt_search_step_degrees,
+        rim_margin_pixels=args.rim_margin_pixels,
+        roll_step_degrees=args.roll_search_step_degrees,
+    )
+    sensors = make_sensor_geometries(
+        front_stream=args.front_stream,
+        back_stream=args.back_stream,
+        calibrations=calibrations,
+        tilt_degrees=tilt,
+        layout_entries=layout_entries,
+    )
+    frames = choose_source_frames(
+        probe["timestamps"], args.num_frames, args.start_time, args.end_time
+    )
+
+    remaps = {}
+    remap_stats = {}
+    masks = {}
+    for sensor in sensors:
+        map_x, map_y, mask, stats = build_remap(
+            args.face_size, sensor, calibrations[sensor.stream_ordinal]
+        )
+        remaps[sensor.name] = (map_x, map_y, mask)
+        masks[sensor.name] = mask
+        remap_stats[sensor.name] = stats
+
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
+    staging_dir = output_dir.parent / f".{output_dir.name}.tmp-{uuid.uuid4().hex}"
+    try:
+        for sensor_name in SENSOR_NAMES:
+            (staging_dir / sensor_name).mkdir(parents=True, exist_ok=False)
+        (staging_dir / "masks").mkdir(parents=True, exist_ok=False)
+        if args.save_source_frames:
+            (staging_dir / "fisheye_front").mkdir(parents=True, exist_ok=False)
+            (staging_dir / "fisheye_back").mkdir(parents=True, exist_ok=False)
+        for sensor_name, mask in masks.items():
+            mask_path = staging_dir / "masks" / f"{sensor_name}.png"
+            if not cv2.imwrite(str(mask_path), mask):
+                raise RuntimeError(f"Failed to write mask: {mask_path}")
+
+        print(
+            f"Preparing {len(frames)} synchronized 9-view frames from {input_path}",
+            flush=True,
+        )
+        print(
+            f"Output={args.face_size}x{args.face_size}, FOV=90x90 degrees, "
+            f"diagonal_tilt={tilt:.4f} degrees, "
+            f"layout_min_margin={layout_summary['selected_minimum_margin_pixels']:.2f}px",
+            flush=True,
+        )
+        decode_commands = {}
+        for stream_ordinal in (args.front_stream, args.back_stream):
+            role = "front" if stream_ordinal == args.front_stream else "back"
+            print(f"Decoding/projecting {role} stream v:{stream_ordinal}", flush=True)
+            decode_commands[role] = _decode_and_project_stream(
+                input_path=input_path,
+                staging_dir=staging_dir,
+                stream_ordinal=stream_ordinal,
+                frames=frames,
+                source_width=source_width,
+                source_height=source_height,
+                sensors=sensors,
+                remaps=remaps,
+                interpolation=args.interpolation,
+                save_source_frames=args.save_source_frames,
+                ffmpeg=args.ffmpeg,
+            )
+        _verify_outputs(
+            staging_dir,
+            frames,
+            args.face_size,
+            args.save_source_frames,
+            (source_width, source_height),
+        )
+        _write_preview(staging_dir, frames[0]["output_name"], args.face_size)
+
+        pinhole_k = pinhole_intrinsics(args.face_size).tolist()
+        raw_baseline = np.array(
+            [
+                raw_lenses[1].tx - raw_lenses[0].tx,
+                raw_lenses[1].ty - raw_lenses[0].ty,
+                raw_lenses[1].tz - raw_lenses[0].tz,
+            ],
+            dtype=np.float64,
+        )
+        raw_baseline_norm = float(np.linalg.norm(raw_baseline))
+        baseline_direction = (
+            (raw_baseline / raw_baseline_norm).tolist()
+            if raw_baseline_norm > 0.0
+            else None
+        )
+        sensor_payloads = []
+        for sensor in sensors:
+            payload = asdict(sensor)
+            payload["output_intrinsics"] = pinhole_k
+            payload["output_distortion"] = []
+            payload["output_camera_model"] = "PINHOLE"
+            payload["hfov_degrees"] = 90.0
+            payload["vfov_degrees"] = 90.0
+            payload["mask_path"] = f"masks/{sensor.name}.png"
+            payload["remap_stats"] = remap_stats[sensor.name]
+            payload["physical_center_group"] = (
+                "front" if sensor.name.startswith("front_") else "back"
+            )
+            payload["pixel_source_policy"] = "single_fisheye_only_no_blending"
+            sensor_payloads.append(payload)
+
+        metadata_public = {
+            key: value
+            for key, value in metadata.items()
+            if key
+            not in {
+                "offset",
+                "offset_v2",
+                "offset_v3",
+                "original_offset",
+                "original_offset_v2",
+                "original_offset_v3",
+            }
+        }
+        manifest = {
+            "schema_version": 1,
+            "source": {
+                "path": str(input_path),
+                "size_bytes": input_path.stat().st_size,
+                "camera_type": metadata.get("camera_type"),
+                "firmware_version": metadata.get("firmware_version"),
+                "front_stream_ordinal": args.front_stream,
+                "back_stream_ordinal": args.back_stream,
+                "front_stream": _safe_stream_payload(probe["front_stream"]),
+                "back_stream": _safe_stream_payload(probe["back_stream"]),
+                "source_frame_count": len(probe["timestamps"]),
+                "fps": probe["fps"],
+                "duration_seconds": _duration_seconds(probe),
+                "timestamp_source": probe["timestamp_source"],
+                "max_generated_timestamp_delta_seconds": probe[
+                    "max_generated_timestamp_delta_seconds"
+                ],
+                "front_back_semantics_status": "user_default_stream0_front_unverified",
+            },
+            "insv_metadata": metadata_public,
+            "calibration": {
+                "source": "embedded_offset_v3",
+                "offset_v3_sha256": hashlib.sha256(
+                    metadata["offset_v3"].encode("utf-8")
+                ).hexdigest(),
+                "offset_v3_flag": offset_flag,
+                "raw_lenses": [asdict(lens) for lens in raw_lenses],
+                "encoded_lenses_by_stream": {
+                    str(stream): asdict(calibration)
+                    for stream, calibration in calibrations.items()
+                },
+                "projection_model": "insta360_unified_xi_radtan",
+                "distortion_order": ["k1", "k2", "k3", "p1", "p2", "xi"],
+                "principal_point_scaling": (
+                    "telemetry-parser X4/X5 convention: focal uses dst crop "
+                    "scale; principal point uses complete per-lens source canvas"
+                ),
+                "raw_lens1_minus_lens0_translation": raw_baseline.tolist(),
+                "raw_baseline_norm": raw_baseline_norm,
+                "raw_baseline_direction": baseline_direction,
+                "translation_unit_status": "unverified",
+                "euler_order_and_axis_status": "unverified_not_applied_to_pixel_remap",
+            },
+            "sampling": {
+                "strategy": "uniform_midpoint_bins_over_synchronized_source_frames",
+                "requested_frame_count": args.num_frames,
+                "output_frame_count": len(frames),
+                "start_time_seconds": args.start_time,
+                "end_time_seconds": args.end_time,
+            },
+            "layout": {
+                "name": "dual_fisheye_octahedron_like_8_plus_front_center",
+                "sensor_order": list(SENSOR_NAMES),
+                "num_virtual_cameras": len(SENSOR_NAMES),
+                "num_physical_center_groups": 2,
+                "output_width": args.face_size,
+                "output_height": args.face_size,
+                "image_format": "png",
+                "hfov_degrees": 90.0,
+                "vfov_degrees": 90.0,
+                "pinhole_intrinsics": pinhole_k,
+                "diagonal_layout_search": layout_summary,
+                "center_hole_policy": "allowed",
+                "fisheye_rim_policy": (
+                    "maximize diagonal tilt subject to configured source-rim margin"
+                ),
+                "invalid_pixel_policy": "black_with_explicit_static_mask_no_cross_lens_fill",
+                "coordinate_convention": (
+                    "lens/view OpenCV axes: +x right, +y down, +z optical forward; "
+                    "view_to_lens_rotation left-multiplies view rays"
+                ),
+                "sensors": sensor_payloads,
+            },
+            "frames": frames,
+            "tools": {
+                "ffmpeg": _tool_version(args.ffmpeg),
+                "ffprobe": _tool_version(args.ffprobe),
+                "opencv": cv2.__version__,
+                "numpy": np.__version__,
+                "ffmpeg_role": "dual-stream frame selection and decode only",
+                "decode_commands": decode_commands,
+                "projection": "native_numpy_insta360_model_plus_opencv_remap",
+                "interpolation": args.interpolation,
+            },
+        }
+        (staging_dir / MANIFEST_NAME).write_text(
+            json.dumps(manifest, indent=2, ensure_ascii=False) + "\n"
+        )
+        report = {
+            "source": str(input_path),
+            "output": str(output_dir),
+            "frames": len(frames),
+            "face_size": args.face_size,
+            "fov_degrees": 90.0,
+            "selected_diagonal_tilt_degrees": tilt,
+            "selected_layout_minimum_margin_pixels": layout_summary[
+                "selected_minimum_margin_pixels"
+            ],
+            "required_rim_margin_pixels": args.rim_margin_pixels,
+            "minimum_sensor_valid_pixel_ratio": min(
+                stats["valid_pixel_ratio"] for stats in remap_stats.values()
+            ),
+            "sensor_remap_stats": remap_stats,
+            "front_back_semantics_verified": False,
+            "warnings": [
+                "stream 0/1 front/back semantics still require visual verification",
+                "offset_v3 translation units and Euler convention are stored but not assumed",
+                "rolling-shutter correction is not applied in this preparation version",
+            ],
+        }
+        (staging_dir / REPORT_NAME).write_text(
+            json.dumps(report, indent=2, ensure_ascii=False) + "\n"
+        )
+        staging_dir.rename(output_dir)
+    except BaseException:
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        raise
+
+    print(f"Prepared dual-fisheye 9-view dataset: {output_dir}", flush=True)
+    print(f"Manifest: {output_dir / MANIFEST_NAME}", flush=True)
+    print(
+        f"Preview: {output_dir / 'previews' / 'first_frame_9view_contact_sheet.jpg'}",
+        flush=True,
+    )
+    return output_dir
+
+
+def main():
+    prepare_dataset(parse_args())
+
+
+if __name__ == "__main__":
+    main()

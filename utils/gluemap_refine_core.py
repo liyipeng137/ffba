@@ -3222,6 +3222,77 @@ def _bae_huber_delta_for_iteration(args, outer_iter):
     return float(getattr(args, "bae_huber_delta", 1.0))
 
 
+def build_bae_rig_config(
+    image_names,
+    image_frame_indices,
+    image_sensor_indices,
+    sensor_from_rig_by_sensor,
+):
+    """Build BAE's pipeline-independent hard-rig pose configuration.
+
+    All image keys are names, so reconstruction image IDs may be reassigned by
+    COLMAP without invalidating the mapping. ``sensor_from_rig_by_sensor`` may
+    be a sequence indexed by sensor index or a mapping keyed by sensor index.
+    Each transform must be 3x4 or homogeneous 4x4.
+    """
+    image_names = [str(name) for name in image_names]
+    image_frame_indices = [int(value) for value in image_frame_indices]
+    image_sensor_indices = [int(value) for value in image_sensor_indices]
+    if not (
+        len(image_names)
+        == len(image_frame_indices)
+        == len(image_sensor_indices)
+    ):
+        raise ValueError(
+            "BAE rig image names, frame indices, and sensor indices must "
+            "have equal length"
+        )
+    if len(set(image_names)) != len(image_names):
+        raise ValueError("BAE rig image names must be unique")
+
+    image_to_frame = {}
+    image_to_sensor = {}
+    image_to_sensor_from_rig = {}
+    for image_name, frame_idx, sensor_idx in zip(
+        image_names,
+        image_frame_indices,
+        image_sensor_indices,
+        strict=True,
+    ):
+        try:
+            transform = sensor_from_rig_by_sensor[sensor_idx]
+        except (IndexError, KeyError, TypeError) as exc:
+            raise ValueError(
+                f"Missing sensor_from_rig for sensor index {sensor_idx}"
+            ) from exc
+        transform = np.asarray(transform, dtype=np.float64)
+        if transform.shape == (3, 4):
+            homogeneous = np.eye(4, dtype=np.float64)
+            homogeneous[:3, :4] = transform
+            transform = homogeneous
+        if transform.shape != (4, 4):
+            raise ValueError(
+                "sensor_from_rig must have shape (3,4) or (4,4), got "
+                f"{transform.shape} for sensor {sensor_idx}"
+            )
+        if not np.isfinite(transform).all():
+            raise ValueError(
+                f"sensor_from_rig for sensor {sensor_idx} is non-finite"
+            )
+        image_to_frame[image_name] = frame_idx
+        image_to_sensor[image_name] = sensor_idx
+        image_to_sensor_from_rig[image_name] = transform.copy()
+
+    return {
+        "image_to_frame": image_to_frame,
+        "image_to_sensor": image_to_sensor,
+        "image_to_sensor_from_rig": image_to_sensor_from_rig,
+        "pose_semantics": (
+            "sensor_from_world = sensor_from_rig @ rig_from_world"
+        ),
+    }
+
+
 def run_merg3r_augmented_refinement_loop(
     args,
     pycolmap,
@@ -3235,6 +3306,8 @@ def run_merg3r_augmented_refinement_loop(
     virtual_predictions_dict,
     features,
     database_path,
+    bae_rig_config=None,
+    rig_seed_reconstruction=None,
 ):
     from gluemap.controllers.augmented_bundle_adjustment import (  # noqa: PLC0415
         IterativeBAOptions,
@@ -3379,16 +3452,38 @@ def run_merg3r_augmented_refinement_loop(
         keypoints_per_image = load_database_keypoints_per_image(
             database_path, image_names
         )
-        seed_reconstruction = build_seed_reconstruction_for_ba(
-            rotations,
-            centers,
-            global_intrinsics,
-            intrinsics_mapping,
-            keypoints_per_image,
-            image_sizes=image_shapes,
-            images_list=image_names,
-            camera_model=camera_model,
-        )
+        if rig_seed_reconstruction is None:
+            seed_reconstruction = build_seed_reconstruction_for_ba(
+                rotations,
+                centers,
+                global_intrinsics,
+                intrinsics_mapping,
+                keypoints_per_image,
+                image_sizes=image_shapes,
+                images_list=image_names,
+                camera_model=camera_model,
+            )
+            seed_structure = "trivial_per_image_frames"
+        else:
+            seed_reconstruction = deepcopy(rig_seed_reconstruction)
+            images_by_name = {
+                image.name: image
+                for image in seed_reconstruction.images.values()
+            }
+            if set(images_by_name) != set(image_names):
+                missing = sorted(set(image_names) - set(images_by_name))
+                extra = sorted(set(images_by_name) - set(image_names))
+                raise ValueError(
+                    "Rig seed reconstruction image names do not match the "
+                    f"refinement image set: missing={missing[:5]}, "
+                    f"extra={extra[:5]}"
+                )
+            for image_idx, image_name in enumerate(image_names):
+                image = images_by_name[image_name]
+                image.points2D.clear()
+                for xy in keypoints_per_image.get(image_idx, ()):
+                    image.points2D.append(pycolmap.Point2D(xy))
+            seed_structure = "native_shared_rig_frames"
         virtual_reconstruction = None
         negative_depth_observations = {}
         stats["setup"].update(
@@ -3396,6 +3491,7 @@ def run_merg3r_augmented_refinement_loop(
                 "virtual_tracks_enabled": False,
                 "virtual_tracks_skip_reason": "BAE uses real tracks only",
                 "seed_reconstruction_seconds": time.time() - t0,
+                "seed_structure": seed_structure,
                 "seed_keypoints": int(
                     sum(len(points) for points in keypoints_per_image.values())
                 ),
@@ -3421,6 +3517,11 @@ def run_merg3r_augmented_refinement_loop(
         bae_fix_gauge=getattr(args, "bae_fix_gauge", "two_cams"),
         bae_robust_loss=getattr(args, "bae_robust_loss", "none"),
         bae_huber_delta=getattr(args, "bae_huber_delta", 1.0),
+        bae_rig_config=(
+            bae_rig_config
+            if bae_rig_config is not None
+            else getattr(args, "bae_rig_config", None)
+        ),
         # ceres keeps its virtual-driven re-BA loop; BAE filters through every
         # scaling once but never re-runs BA (the re-BA is near-useless once
         # huber has down-weighted the outliers).

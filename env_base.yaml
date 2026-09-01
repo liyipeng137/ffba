@@ -22,6 +22,7 @@ dependencies:
 pip:
   - trimesh
   - numba
+  - pytorch360convert==0.2.3
   - xformers==v0.0.32.post1
   - git+https://github.com/pypose/pypose.git
 

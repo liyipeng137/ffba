@@ -296,6 +296,9 @@ class IterativeBAOptions:
     # loss; "huber" applies IRLS Huber weighting with bae_huber_delta (pixels).
     bae_robust_loss: str = "none"
     bae_huber_delta: float = 1.0
+    # Optional lightweight rig metadata consumed only by the BAE adapter.
+    # Required mappings: image_to_frame and image_to_sensor_from_rig.
+    bae_rig_config: object | None = None
     last_ba_summary: dict | None = None
 
 
@@ -639,6 +642,7 @@ def iterative_bundle_adjustment(
                 fix_gauge=options.bae_fix_gauge,
                 robust_loss=options.bae_robust_loss,
                 huber_delta=options.bae_huber_delta,
+                rig_config=options.bae_rig_config,
             )
         else:
             raise ValueError(

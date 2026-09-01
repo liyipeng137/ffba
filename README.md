@@ -1,10 +1,21 @@
 # FeedForwardWithBA / MERG3R + GlueMap 主流程说明
 
-> `codex/pano-rig` 分支已将正式入口切换为三路 panorama rig 输入。当前
-> `--dataset` 必须包含 `left/`、`center/`、`right/`，默认测试契约是
-> `1920x1080`、水平 FOV `110°`，并在 BAE 前停止。具体命令和约束以
-> [PANO_RIG_HANDOFF.md](PANO_RIG_HANDOFF.md) 为准；本文后续单目录示例是
-> 原管道背景资料。
+> 当前 panorama rig 入口使用五个标准 cubemap 面：
+> `center/`、`left/`、`right/`、`up/`、`down/`。每面为正方形、
+> 水平/垂直 FOV 均为 `90°`。Stage A 只对 center 前馈；Stage B 的
+> SIFT、VGGSfM、三角化和 BAE 使用全部五面。BAE 每个时间戳只优化一个
+> `rig_from_world`，五个 `sensor_from_rig` 为硬固定约束。完整契约和
+> 可运行命令见 [PANO_RIG_5FACE.md](PANO_RIG_5FACE.md)。
+
+从已拼接的 2:1 ERP 全景视频准备五面输入：
+
+```bash
+python scripts/prepare_pano_rig_from_erp.py \
+  --input /kiri/dataset/local_test_erp.mp4 \
+  --output-dir /kiri/dataset/local_test_cubemap5_50 \
+  --num-frames 50 \
+  --device cuda
+```
 
 本文档以当前主入口 [run_merg3r_gluemap_pipeline.py](run_merg3r_gluemap_pipeline.py) 为准。
 

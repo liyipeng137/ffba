@@ -20,16 +20,154 @@ class BaeProblemData:
     intrinsics: np.ndarray
     points_2d: np.ndarray
     camera_indices: np.ndarray
+    pose_indices: np.ndarray
+    intrinsics_indices: np.ndarray
+    sensor_from_rig: np.ndarray | None
     point_indices: np.ndarray
     is_negative: np.ndarray
     is_virtual: np.ndarray
     image_ids: list[int]
+    pose_ids: list
+    pose_representative_image_ids: list[int]
+    image_pose_indices: np.ndarray
     real_point_ids: list[int]
     virtual_point_ids: list[int]
     camera_id: int
+    camera_ids: list[int]
     camera_model: str
     bae_root: Path
     skipped: dict
+    rig_enabled: bool = False
+    rig_config: object | None = None
+
+
+def _config_value(config, name):
+    if isinstance(config, dict):
+        return config.get(name)
+    return getattr(config, name, None)
+
+
+def _lookup_image_config(mapping, image_id, image_name, field_name):
+    if mapping is None:
+        raise ValueError(f"BAE rig config is missing {field_name!r}")
+    for key in (image_id, str(image_id), image_name):
+        try:
+            if key in mapping:
+                return mapping[key]
+        except TypeError:
+            break
+    raise ValueError(
+        f"BAE rig config {field_name!r} has no entry for "
+        f"image_id={image_id}, image_name={image_name!r}"
+    )
+
+
+def _homogeneous_transform(transform, field_name):
+    if hasattr(transform, "matrix"):
+        transform = transform.matrix()
+    transform = np.asarray(transform, dtype=np.float64)
+    if transform.shape == (3, 4):
+        homogeneous = np.eye(4, dtype=np.float64)
+        homogeneous[:3, :4] = transform
+        transform = homogeneous
+    if transform.shape != (4, 4):
+        raise ValueError(
+            f"{field_name} must be a 3x4 or 4x4 transform, got "
+            f"shape={transform.shape}"
+        )
+    if not np.isfinite(transform).all():
+        raise ValueError(f"{field_name} contains non-finite values")
+    if not np.allclose(transform[3], [0.0, 0.0, 0.0, 1.0], atol=1e-9):
+        raise ValueError(f"{field_name} is not a homogeneous rigid transform")
+    rotation = transform[:3, :3]
+    if not np.allclose(rotation.T @ rotation, np.eye(3), atol=1e-7):
+        raise ValueError(f"{field_name} rotation is not orthonormal")
+    if not np.isclose(np.linalg.det(rotation), 1.0, atol=1e-7):
+        raise ValueError(f"{field_name} rotation determinant is not +1")
+    return transform
+
+
+def _bae_params_from_transform(transform):
+    from scipy.spatial.transform import Rotation  # noqa: PLC0415
+
+    transform = _homogeneous_transform(transform, "pose")
+    quat = Rotation.from_matrix(transform[:3, :3]).as_quat()
+    return np.concatenate([transform[:3, 3], quat], axis=0)
+
+
+def _image_sensor_from_world(image):
+    return _homogeneous_transform(image.cam_from_world(), "image.cam_from_world")
+
+
+def _resolve_rig_layout(reconstruction, used_image_ids, rig_config):
+    """Resolve exactly one optimizable rig pose per external frame."""
+    if rig_config is None:
+        identity = _bae_params_from_transform(np.eye(4, dtype=np.float64))
+        return {
+            "enabled": False,
+            "pose_ids": list(used_image_ids),
+            "pose_representative_image_ids": list(used_image_ids),
+            "image_pose_indices": np.arange(len(used_image_ids), dtype=np.int64),
+            "sensor_from_rig": np.repeat(identity[None], len(used_image_ids), axis=0),
+            "camera_params": np.stack(
+                [
+                    _pose_params_pycolmap_to_bae(
+                        reconstruction.frames[image_id].rig_from_world.params
+                    )
+                    for image_id in used_image_ids
+                ],
+                axis=0,
+            ).astype(np.float64),
+        }
+
+    image_to_frame = _config_value(rig_config, "image_to_frame")
+    image_to_sensor = _config_value(
+        rig_config, "image_to_sensor_from_rig"
+    )
+    pose_ids = []
+    pose_id_to_idx = {}
+    representative_image_ids = []
+    image_pose_indices = []
+    sensor_params = []
+    initial_rig_params = []
+    for image_id in used_image_ids:
+        image = reconstruction.images[image_id]
+        frame_id = _lookup_image_config(
+            image_to_frame, image_id, image.name, "image_to_frame"
+        )
+        try:
+            hash(frame_id)
+        except TypeError as exc:
+            raise ValueError(
+                f"BAE rig frame ID must be hashable, got {frame_id!r}"
+            ) from exc
+        sensor_transform = _homogeneous_transform(
+            _lookup_image_config(
+                image_to_sensor,
+                image_id,
+                image.name,
+                "image_to_sensor_from_rig",
+            ),
+            f"sensor_from_rig[{image.name!r}]",
+        )
+        sensor_params.append(_bae_params_from_transform(sensor_transform))
+        if frame_id not in pose_id_to_idx:
+            pose_id_to_idx[frame_id] = len(pose_ids)
+            pose_ids.append(frame_id)
+            representative_image_ids.append(image_id)
+            sensor_from_world = _image_sensor_from_world(image)
+            rig_from_world = np.linalg.inv(sensor_transform) @ sensor_from_world
+            initial_rig_params.append(_bae_params_from_transform(rig_from_world))
+        image_pose_indices.append(pose_id_to_idx[frame_id])
+
+    return {
+        "enabled": True,
+        "pose_ids": pose_ids,
+        "pose_representative_image_ids": representative_image_ids,
+        "image_pose_indices": np.asarray(image_pose_indices, dtype=np.int64),
+        "sensor_from_rig": np.asarray(sensor_params, dtype=np.float64),
+        "camera_params": np.asarray(initial_rig_params, dtype=np.float64),
+    }
 
 
 def _ensure_bae_runtime():
@@ -229,10 +367,8 @@ def _build_bae_problem(
     negative_depth_observations,
     bae_root,
     include_virtual=True,
+    rig_config=None,
 ):
-    camera_id, camera = _shared_camera(reconstruction)
-    intrinsics, camera_model = _intrinsics_from_camera(camera)
-
     real_point_ids = []
     real_point_idx = {}
     real_obs, real_skipped = _collect_real_observations(
@@ -257,15 +393,31 @@ def _build_bae_problem(
     image_id_to_compact = {
         image_id: idx for idx, image_id in enumerate(used_image_ids)
     }
-    camera_params = np.stack(
-        [
-            _pose_params_pycolmap_to_bae(
-                reconstruction.frames[image_id].rig_from_world.params
-            )
+    rig_layout = _resolve_rig_layout(
+        reconstruction, used_image_ids, rig_config
+    )
+    camera_params = rig_layout["camera_params"]
+
+    used_camera_ids = sorted(
+        {
+            int(reconstruction.images[image_id].camera_id)
             for image_id in used_image_ids
-        ],
-        axis=0,
-    ).astype(np.float64)
+        }
+    )
+    cameras = [reconstruction.cameras[camera_id] for camera_id in used_camera_ids]
+    camera_models = {camera.model_name for camera in cameras}
+    if len(camera_models) != 1:
+        raise ValueError(
+            "BAE rig images must use one camera model, got "
+            f"{sorted(camera_models)}"
+        )
+    camera_model = next(iter(camera_models))
+    intrinsics = np.stack(
+        [_intrinsics_from_camera(camera)[0] for camera in cameras], axis=0
+    )
+    camera_id_to_intrinsics = {
+        camera_id: idx for idx, camera_id in enumerate(used_camera_ids)
+    }
 
     real_points = [
         _point_xyz(reconstruction.points3D[point3D_id])
@@ -289,6 +441,16 @@ def _build_bae_problem(
     camera_indices = np.asarray(
         [image_id_to_compact[obs[0]] for obs in observations], dtype=np.int64
     )
+    pose_indices = rig_layout["image_pose_indices"][camera_indices]
+    intrinsics_indices = np.asarray(
+        [
+            camera_id_to_intrinsics[
+                int(reconstruction.images[obs[0]].camera_id)
+            ]
+            for obs in observations
+        ],
+        dtype=np.int64,
+    )
     point_indices = np.asarray(
         [obs[1] for obs in observations], dtype=np.int64
     )
@@ -302,21 +464,37 @@ def _build_bae_problem(
         intrinsics=intrinsics,
         points_2d=points_2d,
         camera_indices=camera_indices,
+        pose_indices=pose_indices,
+        intrinsics_indices=intrinsics_indices,
+        sensor_from_rig=rig_layout["sensor_from_rig"],
         point_indices=point_indices,
         is_negative=is_negative,
         is_virtual=is_virtual,
         image_ids=used_image_ids,
+        pose_ids=rig_layout["pose_ids"],
+        pose_representative_image_ids=(
+            rig_layout["pose_representative_image_ids"]
+        ),
+        image_pose_indices=rig_layout["image_pose_indices"],
         real_point_ids=real_point_ids,
         virtual_point_ids=virtual_point_ids,
-        camera_id=camera_id,
+        camera_id=used_camera_ids[0],
+        camera_ids=used_camera_ids,
         camera_model=camera_model,
         bae_root=bae_root,
         skipped=skipped,
+        rig_enabled=rig_layout["enabled"],
+        rig_config=rig_config,
     )
 
 
 def _make_bae_model(
-    runtime, camera_model, optimize_intrinsics, robust_loss="none", huber_delta=1.0
+    runtime,
+    camera_model,
+    optimize_intrinsics,
+    robust_loss="none",
+    huber_delta=1.0,
+    rig_enabled=False,
 ):
     pp = runtime.pp
     psjac = runtime.psjac
@@ -331,6 +509,34 @@ def _make_bae_model(
     ):
         points_cam = pp.SE3(camera_params[..., :7]).Act(points)
         points_cam = points_cam * point_sign
+        z = points_cam[..., 2:3]
+        valid = z > 1e-12
+        z_safe = torch.where(valid, z, torch.ones_like(z))
+
+        fx = intrinsics[..., 0:1]
+        fy = intrinsics[..., 1:2]
+        cx = intrinsics[..., 2:3]
+        cy = intrinsics[..., 3:4]
+        x = fx * points_cam[..., 0:1] / z_safe + cx
+        y = fy * points_cam[..., 1:2] / z_safe + cy
+        residual = torch.cat([x, y], dim=-1) - points_2d
+        return torch.where(
+            valid.expand_as(residual), residual, torch.zeros_like(residual)
+        )
+
+    @psjac
+    def rig_reprojection_residual_pinhole(
+        points,
+        rig_params,
+        sensor_from_rig,
+        intrinsics,
+        points_2d,
+        point_sign,
+    ):
+        sensor_from_world = pp.SE3(sensor_from_rig[..., :7]) * pp.SE3(
+            rig_params[..., :7]
+        )
+        points_cam = sensor_from_world.Act(points) * point_sign
         z = points_cam[..., 2:3]
         valid = z > 1e-12
         z_safe = torch.where(valid, z, torch.ones_like(z))
@@ -371,23 +577,67 @@ def _make_bae_model(
             valid.expand_as(residual), residual, torch.zeros_like(residual)
         )
 
+    @psjac
+    def rig_reprojection_residual_simple_pinhole(
+        points,
+        rig_params,
+        sensor_from_rig,
+        focal,
+        principal_point,
+        points_2d,
+        point_sign,
+    ):
+        sensor_from_world = pp.SE3(sensor_from_rig[..., :7]) * pp.SE3(
+            rig_params[..., :7]
+        )
+        points_cam = sensor_from_world.Act(points) * point_sign
+        z = points_cam[..., 2:3]
+        valid = z > 1e-12
+        z_safe = torch.where(valid, z, torch.ones_like(z))
+
+        f = focal[..., 0:1]
+        cx = principal_point[..., 0:1]
+        cy = principal_point[..., 1:2]
+        x = f * points_cam[..., 0:1] / z_safe + cx
+        y = f * points_cam[..., 1:2] / z_safe + cy
+        residual = torch.cat([x, y], dim=-1) - points_2d
+        return torch.where(
+            valid.expand_as(residual), residual, torch.zeros_like(residual)
+        )
+
     if camera_model == "SIMPLE_PINHOLE":
-        residual_fn = reprojection_residual_simple_pinhole
+        residual_fn = (
+            rig_reprojection_residual_simple_pinhole
+            if rig_enabled
+            else reprojection_residual_simple_pinhole
+        )
         expected_intrinsics_dim = 3
     elif camera_model == "PINHOLE":
-        residual_fn = reprojection_residual_pinhole
+        residual_fn = (
+            rig_reprojection_residual_pinhole
+            if rig_enabled
+            else reprojection_residual_pinhole
+        )
         expected_intrinsics_dim = 4
     else:
         raise ValueError(f"Unsupported BAE camera model: {camera_model}")
 
     class GluemapBaeResidual(nn.Module):
-        def __init__(self, camera_params, points_3d, intrinsics):
+        def __init__(
+            self, camera_params, points_3d, intrinsics, sensor_from_rig=None
+        ):
             super().__init__()
             self.robust_loss = robust_loss
             self.huber_delta = float(huber_delta)
             self.pose = pp.Parameter(camera_params, sjac=True)
             self.points_3d = pp.Parameter(points_3d, sjac=True)
             self.pose.trim_SE3_grad = True
+            if rig_enabled:
+                if sensor_from_rig is None:
+                    raise ValueError(
+                        "sensor_from_rig is required for rig-aware BAE"
+                    )
+                self.register_buffer("sensor_from_rig", sensor_from_rig)
             if intrinsics.dim() == 1:
                 intrinsics = intrinsics.unsqueeze(0)
             if intrinsics.shape[-1] != expected_intrinsics_dim:
@@ -425,31 +675,55 @@ def _make_bae_model(
         def _project(self, input_dict):
             points_2d = input_dict["points_2d"]
             camera_indices = input_dict["camera_indices"]
+            pose_indices = input_dict.get("pose_indices", camera_indices)
+            intrinsics_indices = input_dict.get(
+                "intrinsics_indices", torch.zeros_like(camera_indices)
+            )
             point_indices = input_dict["point_indices"]
             point_sign = input_dict["point_sign"]
 
-            zero_indices = torch.zeros_like(camera_indices)
             if camera_model == "SIMPLE_PINHOLE":
                 if optimize_intrinsics:
-                    focal = self.shared_focal[zero_indices]
-                    principal_point = self.shared_principal_point[zero_indices]
+                    focal = self.shared_focal[intrinsics_indices]
+                    principal_point = self.shared_principal_point[
+                        intrinsics_indices
+                    ]
                 else:
-                    intrinsics = self.shared_intr[zero_indices]
+                    intrinsics = self.shared_intr[intrinsics_indices]
                     focal = intrinsics[..., 0:1]
                     principal_point = intrinsics[..., 1:3]
+                if rig_enabled:
+                    return residual_fn(
+                        self.points_3d[point_indices],
+                        self.pose[pose_indices],
+                        self.sensor_from_rig[camera_indices],
+                        focal,
+                        principal_point,
+                        points_2d,
+                        point_sign,
+                    )
                 return residual_fn(
                     self.points_3d[point_indices],
-                    self.pose[camera_indices],
+                    self.pose[pose_indices],
                     focal,
                     principal_point,
                     points_2d,
                     point_sign,
                 )
 
-            intrinsics = self.shared_intr[zero_indices]
+            intrinsics = self.shared_intr[intrinsics_indices]
+            if rig_enabled:
+                return residual_fn(
+                    self.points_3d[point_indices],
+                    self.pose[pose_indices],
+                    self.sensor_from_rig[camera_indices],
+                    intrinsics,
+                    points_2d,
+                    point_sign,
+                )
             return residual_fn(
                 self.points_3d[point_indices],
-                self.pose[camera_indices],
+                self.pose[pose_indices],
                 intrinsics,
                 points_2d,
                 point_sign,
@@ -637,8 +911,11 @@ def _select_second_gauge_camera(
     num_cameras = problem.camera_params.shape[0]
     num_real_points = len(problem.real_point_ids)
     real_points_per_camera = [set() for _ in range(num_cameras)]
+    observation_pose_indices = getattr(
+        problem, "pose_indices", problem.camera_indices
+    )
     for camera_idx, point_idx in zip(
-        problem.camera_indices, problem.point_indices, strict=False
+        observation_pose_indices, problem.point_indices, strict=False
     ):
         camera_idx = int(camera_idx)
         point_idx = int(point_idx)
@@ -731,8 +1008,14 @@ def _select_second_gauge_camera(
             else None
         ),
         "selected_image_id": (
-            int(problem.image_ids[selected["camera_index"]])
-            if selected is not None and hasattr(problem, "image_ids")
+            int(problem.pose_representative_image_ids[selected["camera_index"]])
+            if selected is not None
+            and hasattr(problem, "pose_representative_image_ids")
+            else None
+        ),
+        "selected_frame_id": (
+            problem.pose_ids[selected["camera_index"]]
+            if selected is not None and hasattr(problem, "pose_ids")
             else None
         ),
         "selected_baseline_norm": (
@@ -812,6 +1095,7 @@ def _build_bae_gauge_fix(problem, fix_gauge):
         "requested": mode,
         "applied": "none",
         "fixed_images": [],
+        "fixed_frames": [],
         "fixed_points": [],
         "translation_fixed_dim": None,
         "baseline": None,
@@ -861,13 +1145,33 @@ def _build_bae_gauge_fix(problem, fix_gauge):
                     summary["applied"] = "two_cams"
                 summary["fixed_images"] = [
                     {
-                        "image_id": int(problem.image_ids[image1_idx]),
+                        "image_id": int(
+                            problem.pose_representative_image_ids[image1_idx]
+                        ),
                         "camera_index": int(image1_idx),
                         "fixed_pose_tangent_dofs": [0, 1, 2, 3, 4, 5],
                     },
                     {
-                        "image_id": int(problem.image_ids[image2_idx]),
+                        "image_id": int(
+                            problem.pose_representative_image_ids[image2_idx]
+                        ),
                         "camera_index": int(image2_idx),
+                        "fixed_pose_tangent_dofs": (
+                            [0, 1, 2, 3, 4, 5]
+                            if mode == "two_cams_full"
+                            else [int(fixed_dim)]
+                        ),
+                    },
+                ]
+                summary["fixed_frames"] = [
+                    {
+                        "frame_id": problem.pose_ids[image1_idx],
+                        "pose_index": int(image1_idx),
+                        "fixed_pose_tangent_dofs": [0, 1, 2, 3, 4, 5],
+                    },
+                    {
+                        "frame_id": problem.pose_ids[image2_idx],
+                        "pose_index": int(image2_idx),
                         "fixed_pose_tangent_dofs": (
                             [0, 1, 2, 3, 4, 5]
                             if mode == "two_cams_full"
@@ -918,10 +1222,61 @@ def _write_optimized_reconstruction(
     optimized_points,
     optimized_intrinsics=None,
 ):
-    for idx, image_id in enumerate(problem.image_ids):
-        reconstruction.frames[image_id].rig_from_world = (
-            _rigid3d_from_pycolmap_params(optimized_camera_params[idx])
+    if not problem.rig_enabled:
+        for idx, image_id in enumerate(problem.image_ids):
+            reconstruction.frames[image_id].rig_from_world = (
+                _rigid3d_from_pycolmap_params(optimized_camera_params[idx])
+            )
+    else:
+        pose_id_to_idx = {
+            pose_id: idx for idx, pose_id in enumerate(problem.pose_ids)
+        }
+        frame_images = {pose_id: [] for pose_id in problem.pose_ids}
+        image_to_frame = _config_value(problem.rig_config, "image_to_frame")
+        image_to_sensor = _config_value(
+            problem.rig_config, "image_to_sensor_from_rig"
         )
+        for image_id, image in reconstruction.images.items():
+            try:
+                pose_id = _lookup_image_config(
+                    image_to_frame,
+                    image_id,
+                    image.name,
+                    "image_to_frame",
+                )
+            except ValueError:
+                continue
+            if pose_id in frame_images:
+                frame_images[pose_id].append((int(image_id), image))
+
+        for pose_id, pose_idx in pose_id_to_idx.items():
+            images = frame_images[pose_id]
+            native_frame_ids = {int(image.frame_id) for _, image in images}
+            rig_pose = _rigid3d_from_pycolmap_params(
+                optimized_camera_params[pose_idx]
+            )
+            if len(native_frame_ids) == 1:
+                native_frame_id = next(iter(native_frame_ids))
+                reconstruction.frames[native_frame_id].rig_from_world = rig_pose
+                continue
+
+            rig_transform = _homogeneous_transform(
+                rig_pose, f"optimized_rig_from_world[{pose_id!r}]"
+            )
+            for image_id, image in images:
+                sensor_transform = _homogeneous_transform(
+                    _lookup_image_config(
+                        image_to_sensor,
+                        image_id,
+                        image.name,
+                        "image_to_sensor_from_rig",
+                    ),
+                    f"sensor_from_rig[{image.name!r}]",
+                )
+                sensor_from_world = sensor_transform @ rig_transform
+                reconstruction.frames[int(image.frame_id)].rig_from_world = (
+                    pycolmap.Rigid3d(sensor_from_world[:3, :4])
+                )
 
     num_real = len(problem.real_point_ids)
     for idx, point3D_id in enumerate(problem.real_point_ids):
@@ -930,11 +1285,18 @@ def _write_optimized_reconstruction(
         )
 
     if optimized_intrinsics is not None:
-        reconstruction.cameras[problem.camera_id].params = (
-            _camera_params_from_intrinsics(
-                problem.camera_model, optimized_intrinsics
-            )
+        optimized_intrinsics = np.asarray(
+            optimized_intrinsics, dtype=np.float64
         )
+        if optimized_intrinsics.ndim == 1:
+            optimized_intrinsics = optimized_intrinsics[None]
+        for intrinsics_idx, camera_id in enumerate(problem.camera_ids):
+            reconstruction.cameras[camera_id].params = (
+                _camera_params_from_intrinsics(
+                    problem.camera_model,
+                    optimized_intrinsics[intrinsics_idx],
+                )
+            )
 
     if virtual_reconstruction is not None:
         for offset, point3D_id in enumerate(problem.virtual_point_ids):
@@ -970,6 +1332,7 @@ def bundle_adjustment_bae(
     fix_gauge: str = "two_cams",
     robust_loss: str = "none",
     huber_delta: float = 1.0,
+    rig_config=None,
 ):
     robust_loss = (robust_loss or "none").lower()
     if robust_loss not in {"none", "huber"}:
@@ -983,6 +1346,7 @@ def bundle_adjustment_bae(
         negative_depth_observations,
         runtime.bae_root,
         include_virtual=not real_only,
+        rig_config=rig_config,
     )
     if optimize_intrinsics and problem.camera_model != "SIMPLE_PINHOLE":
         raise ValueError(
@@ -999,6 +1363,8 @@ def bundle_adjustment_bae(
         f"{int(problem.is_negative.sum())} negative obs, "
         f"optimize_intrinsics={optimize_intrinsics}, "
         f"real_only={real_only}, "
+        f"rig_enabled={problem.rig_enabled}, "
+        f"pose_blocks={problem.camera_params.shape[0]}, "
         f"fix_gauge={fix_gauge}, "
         f"robust_loss={robust_loss}, "
         f"huber_delta={huber_delta if robust_loss == 'huber' else None}"
@@ -1012,6 +1378,14 @@ def bundle_adjustment_bae(
         ),
         "camera_indices": torch.tensor(
             problem.camera_indices, dtype=torch.int64, device=torch_device
+        ),
+        "pose_indices": torch.tensor(
+            problem.pose_indices, dtype=torch.int64, device=torch_device
+        ),
+        "intrinsics_indices": torch.tensor(
+            problem.intrinsics_indices,
+            dtype=torch.int64,
+            device=torch_device,
         ),
         "point_indices": torch.tensor(
             problem.point_indices, dtype=torch.int64, device=torch_device
@@ -1031,6 +1405,13 @@ def bundle_adjustment_bae(
     intrinsics = torch.tensor(
         problem.intrinsics, dtype=dtype, device=torch_device
     )
+    sensor_from_rig = (
+        torch.tensor(
+            problem.sensor_from_rig, dtype=dtype, device=torch_device
+        )
+        if problem.rig_enabled
+        else None
+    )
 
     model_cls = _make_bae_model(
         runtime,
@@ -1038,10 +1419,14 @@ def bundle_adjustment_bae(
         optimize_intrinsics,
         robust_loss=robust_loss,
         huber_delta=huber_delta,
+        rig_enabled=problem.rig_enabled,
     )
-    model = model_cls(camera_params.clone(), points_3d.clone(), intrinsics).to(
-        torch_device
-    )
+    model = model_cls(
+        camera_params.clone(),
+        points_3d.clone(),
+        intrinsics,
+        sensor_from_rig=sensor_from_rig,
+    ).to(torch_device)
     pose_fixed_mask, point_fixed_mask, gauge_summary = _build_bae_gauge_fix(
         problem, fix_gauge
     )
@@ -1116,9 +1501,7 @@ def bundle_adjustment_bae(
 
     optimized_camera_params = model.pose.detach().cpu().numpy()
     optimized_points = model.points_3d.detach().cpu().numpy()
-    optimized_intrinsics = (
-        model.optimized_intrinsics().detach().cpu().numpy().reshape(-1)
-    )
+    optimized_intrinsics = model.optimized_intrinsics().detach().cpu().numpy()
     intrinsics_initial = _intrinsics_as_list(problem.intrinsics)
     intrinsics_final = _intrinsics_as_list(optimized_intrinsics)
     pose_drift = _pose_drift_summary(
@@ -1138,7 +1521,14 @@ def bundle_adjustment_bae(
         "bae_root": str(problem.bae_root),
         "device": str(torch_device),
         "num_iterations": int(max_num_iterations),
-        "num_cameras": int(problem.camera_params.shape[0]),
+        "num_cameras": int(len(problem.image_ids)),
+        "num_images": int(len(problem.image_ids)),
+        "num_pose_blocks": int(problem.camera_params.shape[0]),
+        "num_rig_frames": (
+            int(problem.camera_params.shape[0]) if problem.rig_enabled else None
+        ),
+        "rig_enabled": bool(problem.rig_enabled),
+        "num_intrinsics_blocks": int(problem.intrinsics.shape[0]),
         "num_points_real": int(len(problem.real_point_ids)),
         "num_points_virtual": int(len(problem.virtual_point_ids)),
         "num_observations_real": int((~problem.is_virtual).sum()),
@@ -1209,6 +1599,8 @@ def bundle_adjustment_bae(
     # earlier round that succeeded. del + gc breaks the optimizer<->model
     # reference cycle so empty_cache can actually return the blocks to CUDA.
     del optimizer, model, input_dict, camera_params, points_3d, intrinsics
+    if sensor_from_rig is not None:
+        del sensor_from_rig
     gc.collect()
     if torch_device.type == "cuda" and torch.cuda.is_available():
         torch.cuda.empty_cache()
