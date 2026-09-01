@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import importlib.metadata
 import json
+import math
 import shutil
 import subprocess
 import sys
@@ -20,6 +21,7 @@ from prepare_pano_rig_from_erp import (  # noqa: E402
     build_decode_command,
     choose_source_frames,
     default_face_size,
+    perspective_output_size,
     prepare_dataset,
     uniform_sample_positions,
 )
@@ -75,6 +77,21 @@ def test_standard_five_face_mapping_is_explicit():
         ("down", "Down", 5),
     ]
     assert default_face_size(4320) == 1080
+
+
+def test_overlap3_dimensions_keep_one_square_pixel_focal():
+    width, height, focal = perspective_output_size(
+        1080, 110.0, 100.0, output_height=1282
+    )
+    assert (width, height) == (1536, 1282)
+    assert focal == pytest.approx(537.443, abs=0.01)
+    assert (width - 1) / (2 * focal) == pytest.approx(
+        math.tan(math.radians(55.0)), rel=2e-3
+    )
+    aligned_width, aligned_height, _ = perspective_output_size(
+        1080, 110.0, 100.0, dimension_multiple=4
+    )
+    assert (aligned_width, aligned_height) == (1548, 1292)
 
 
 def test_decode_command_uses_ffmpeg_only_for_selected_raw_frames(tmp_path: Path):
@@ -224,3 +241,83 @@ def test_end_to_end_outputs_five_standard_cubemap_faces(tmp_path: Path):
     assert len(manifest["frames"]) == 3
     assert all("source_frame_index" in frame for frame in manifest["frames"])
     assert all("source_timestamp_seconds" in frame for frame in manifest["frames"])
+
+
+@pytest.mark.skipif(
+    shutil.which("ffmpeg") is None
+    or shutil.which("ffprobe") is None
+    or not _conversion_backend_available(),
+    reason="FFmpeg and pytorch360convert==0.2.3 with PyTorch are required",
+)
+def test_end_to_end_outputs_three_overlapping_perspective_views(tmp_path: Path):
+    panorama = tmp_path / "directional.png"
+    image = Image.new("RGB", (360, 180))
+    image.putdata(
+        [
+            (round(x * 255 / 359), round(y * 255 / 179), 32)
+            for y in range(180)
+            for x in range(360)
+        ]
+    )
+    image.save(panorama)
+    source = tmp_path / "directional.mkv"
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-v",
+            "error",
+            "-loop",
+            "1",
+            "-framerate",
+            "5",
+            "-i",
+            str(panorama),
+            "-t",
+            "0.4",
+            "-c:v",
+            "png",
+            str(source),
+        ],
+        check=True,
+    )
+    output = tmp_path / "overlap3"
+    args = argparse.Namespace(
+        input=source,
+        output_dir=output,
+        layout="overlap3",
+        num_frames=1,
+        face_size=90,
+        output_height=500,
+        hfov_degrees=110.0,
+        vfov_degrees=100.0,
+        batch_size=1,
+        device="cpu",
+        start_time=None,
+        end_time=None,
+        interpolation="nearest",
+        ffmpeg="ffmpeg",
+        ffprobe="ffprobe",
+    )
+    prepare_dataset(args)
+
+    for name in ("center", "left", "right"):
+        with Image.open(output / name / "000000.png") as view:
+            assert view.size == (599, 500)
+    assert not (output / "up").exists()
+    assert not (output / "down").exists()
+
+    center_pixels = {}
+    for name in ("center", "left", "right"):
+        with Image.open(output / name / "000000.png").convert("RGB") as view:
+            center_pixels[name] = view.getpixel((299, 250))
+    assert center_pixels["left"][0] < center_pixels["center"][0]
+    assert center_pixels["center"][0] < center_pixels["right"][0]
+
+    manifest = json.loads((output / "pano_rig_manifest.json").read_text())
+    assert manifest["rig"]["layout"] == "overlap3"
+    assert manifest["rig"]["sensor_order"] == ["center", "left", "right"]
+    assert manifest["output"]["hfov_degrees"] == 110.0
+    assert manifest["output"]["vfov_degrees"] == 100.0
+    assert manifest["output"]["fx_pixels"] == pytest.approx(
+        manifest["output"]["fy_pixels"], rel=2e-3
+    )

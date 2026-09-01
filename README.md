@@ -1,23 +1,25 @@
 # FeedForwardWithBA / MERG3R + GlueMap 主流程说明
 
-> 当前 panorama rig 入口使用五个标准 cubemap 面：
-> `center/`、`left/`、`right/`、`up/`、`down/`。每面为正方形、
-> 水平/垂直 FOV 均为 `90°`。Stage A 只对 center 前馈；Stage B 的
-> SIFT、VGGSfM、三角化和 BAE 使用全部五面。BAE 每个时间戳只优化一个
-> `rig_from_world`，五个 `sensor_from_rig` 为硬固定约束。完整契约和
-> 可运行命令见 [PANO_RIG_5FACE.md](PANO_RIG_5FACE.md)。
+> 当前 panorama rig 入口支持两种 manifest 驱动布局：旧的五面
+> `Cubemap5`，以及用于质量消融的三面 `Overlap3`。Overlap3 只使用
+> `center/left/right`，视轴为 `0/-90/+90°`，HFOV/VFOV 为
+> `110°/100°`，相邻水平视图约有 20° 重叠。Stage A 始终只对 center
+> 前馈；Stage B 使用 manifest 声明的全部视图。新实验契约和命令见
+> [PANO_RIG_OVERLAP3.md](PANO_RIG_OVERLAP3.md)，旧五面契约见
+> [PANO_RIG_5FACE.md](PANO_RIG_5FACE.md)。
 
 > 双鱼眼 INSV/paired-frame 九视图准备约定、当前已实现边界和下一步
 > Fish9 接线顺序见
 > [DUAL_FISHEYE_9CAM_HANDOFF.md](DUAL_FISHEYE_9CAM_HANDOFF.md)。
 
-从已拼接的 2:1 ERP 全景视频准备五面输入：
+从已拼接的 2:1 ERP 全景视频准备三面重叠输入：
 
 ```bash
 python scripts/prepare_pano_rig_from_erp.py \
   --input /kiri/dataset/local_test_erp.mp4 \
-  --output-dir /kiri/dataset/local_test_cubemap5_50 \
-  --num-frames 50 \
+  --output-dir /kiri/dataset/local_test_overlap3_150 \
+  --layout overlap3 \
+  --num-frames 150 \
   --device cuda
 ```
 
@@ -443,10 +445,10 @@ vggsfm_group_audit/
     groups/
 ```
 
-Cubemap5 的 projected-overlap 候选池在 Stage A 的全部 center 帧上构建：
+Pano rig 的 projected-overlap 候选池在 Stage A 的全部 center 帧上构建：
 rotation-valid pose candidates 与全局 center DINO top-k 取并集，再用两端
 真实 center depth 的 low-resolution round-trip reprojection overlap 排序。
-随后按五个面的固定视轴扩展成 sensor pairs/groups；不会给非 center 面复制
+随后按 manifest 中的固定视轴扩展成 sensor pairs/groups；不会给非 center 面复制
 或伪造 depth。
 
 正式 refinement 使用 projected-overlap group：
@@ -477,6 +479,10 @@ python run_merg3r_gluemap_pipeline.py \
 | `--num_images` | `-1` | 限制图片数量，`-1` 表示全部 |
 | `--subsample` | `1` | 按顺序采样图片 |
 | `--multi_dirs` | off | 递归读取多级图片目录 |
+| `--pano_hfov_degrees` | manifest | 可选 HFOV 校验；不再覆盖 prepare manifest |
+| `--pano_vfov_degrees` | manifest | 可选 VFOV 校验；不再覆盖 prepare manifest |
+| `--pano_pair_max_axis_angle` | layout 自动 | Cubemap5 为95°，Overlap3 为105° |
+| `--pano_group_max_axis_angle` | layout 自动 | Cubemap5 沿用 pose 阈值，Overlap3 为105° |
 | `--image_pyramid` | on | 启用 low/high 两阶段图片 |
 | `--stage1_downscale_n` | `4` | low 图相对原图的下采样基数 |
 | `--stage1_multiple` | `14` | low 图裁剪到该倍数 |

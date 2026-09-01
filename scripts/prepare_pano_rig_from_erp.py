@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Uniformly sample an ERP video and prepare five standard cubemap faces.
+"""Uniformly sample an ERP video into a co-located perspective rig.
 
 FFmpeg is used only to probe and decode source video frames. Projection is
-performed by ``pytorch360convert==0.2.3`` using its ``e2c`` function.
+performed by ``pytorch360convert==0.2.3`` using ``e2c`` or ``e2p``.
 """
 
 from __future__ import annotations
@@ -58,14 +58,61 @@ FACE_SPECS = (
     },
 )
 FACE_NAMES = tuple(spec["output_name"] for spec in FACE_SPECS)
+SENSOR_FROM_RIG_ROTATIONS_BY_NAME = {
+    "center": ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)),
+    "left": ((0.0, 0.0, 1.0), (0.0, 1.0, 0.0), (-1.0, 0.0, 0.0)),
+    "right": ((0.0, 0.0, -1.0), (0.0, 1.0, 0.0), (1.0, 0.0, 0.0)),
+    "up": ((1.0, 0.0, 0.0), (0.0, 0.0, 1.0), (0.0, -1.0, 0.0)),
+    "down": ((1.0, 0.0, 0.0), (0.0, 0.0, -1.0), (0.0, 1.0, 0.0)),
+}
+OVERLAP3_FACE_SPECS = (
+    {
+        "output_name": "center",
+        "reference_face": "Front",
+        "yaw_degrees": 0.0,
+        "pitch_degrees": 0.0,
+        "look_axis": "+Z",
+        "sensor_from_rig_rotation": (
+            (1.0, 0.0, 0.0),
+            (0.0, 1.0, 0.0),
+            (0.0, 0.0, 1.0),
+        ),
+    },
+    {
+        "output_name": "left",
+        "reference_face": "Left",
+        "yaw_degrees": -90.0,
+        "pitch_degrees": 0.0,
+        "look_axis": "-X",
+        "sensor_from_rig_rotation": (
+            (0.0, 0.0, 1.0),
+            (0.0, 1.0, 0.0),
+            (-1.0, 0.0, 0.0),
+        ),
+    },
+    {
+        "output_name": "right",
+        "reference_face": "Right",
+        "yaw_degrees": 90.0,
+        "pitch_degrees": 0.0,
+        "look_axis": "+X",
+        "sensor_from_rig_rotation": (
+            (0.0, 0.0, -1.0),
+            (0.0, 1.0, 0.0),
+            (1.0, 0.0, 0.0),
+        ),
+    },
+)
+OVERLAP3_FACE_NAMES = tuple(spec["output_name"] for spec in OVERLAP3_FACE_SPECS)
+OVERLAP3_HFOV_DEGREES = 110.0
+OVERLAP3_VFOV_DEGREES = 100.0
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Uniformly sample an equirectangular video and use "
-            "pytorch360convert e2c to create synchronized center/left/right/"
-            "up/down 90-degree square cubemap faces."
+            "Uniformly sample an equirectangular video into either legacy "
+            "Cubemap5 or overlapping Center/Left/Right perspective views."
         )
     )
     parser.add_argument("--input", type=Path, required=True, help="Input ERP video")
@@ -82,16 +129,59 @@ def parse_args() -> argparse.Namespace:
         help="Number of source frames sampled uniformly (default: 50)",
     )
     parser.add_argument(
+        "--layout",
+        choices=("cubemap5", "overlap3"),
+        default="cubemap5",
+        help=(
+            "Projection rig: legacy five square 90-degree cubemap faces, or "
+            "three 110x100-degree horizontal overlapping views"
+        ),
+    )
+    parser.add_argument(
         "--face-size",
         type=int,
         default=None,
-        help="Square face size; default is source ERP width / 4",
+        help=(
+            "Cubemap5 square face size; default is source ERP width / 4. "
+            "For overlap3 this is the reference 90-degree face height used "
+            "to preserve focal/angular sampling."
+        ),
+    )
+    parser.add_argument(
+        "--output-height",
+        type=int,
+        default=None,
+        help=(
+            "Overlap3 output height. Width is derived from HFOV/VFOV to keep "
+            "square pixels and one SIMPLE_PINHOLE focal."
+        ),
+    )
+    parser.add_argument(
+        "--output-multiple",
+        type=int,
+        default=4,
+        help=(
+            "When overlap3 height is automatic, align width/height to this "
+            "multiple while preserving one focal (default: 4)."
+        ),
+    )
+    parser.add_argument(
+        "--hfov-degrees",
+        type=float,
+        default=OVERLAP3_HFOV_DEGREES,
+        help="Overlap3 horizontal FOV (default: 110)",
+    )
+    parser.add_argument(
+        "--vfov-degrees",
+        type=float,
+        default=OVERLAP3_VFOV_DEGREES,
+        help="Overlap3 vertical FOV (default: 100)",
     )
     parser.add_argument(
         "--batch-size",
         type=int,
         default=1,
-        help="Number of decoded ERP frames passed to e2c together (default: 1)",
+        help="Number of decoded ERP frames projected together (default: 1)",
     )
     parser.add_argument(
         "--device",
@@ -114,7 +204,7 @@ def parse_args() -> argparse.Namespace:
         "--interpolation",
         choices=("nearest", "bilinear", "bicubic"),
         default="bilinear",
-        help="pytorch360convert e2c sampling mode (default: bilinear)",
+        help="pytorch360convert sampling mode (default: bilinear)",
     )
     parser.add_argument("--ffmpeg", default="ffmpeg")
     parser.add_argument("--ffprobe", default="ffprobe")
@@ -294,6 +384,7 @@ def choose_source_frames(
     num_frames: int,
     start_time: float | None,
     end_time: float | None,
+    face_names: tuple[str, ...] = FACE_NAMES,
 ) -> list[dict]:
     if start_time is not None and start_time < 0:
         raise ValueError("--start-time must be non-negative")
@@ -316,7 +407,7 @@ def choose_source_frames(
             "source_frame_index": eligible[position],
             "source_timestamp_seconds": timestamps[eligible[position]],
             "face_paths": {
-                name: f"{name}/{output_idx:06d}.png" for name in FACE_NAMES
+                name: f"{name}/{output_idx:06d}.png" for name in face_names
             },
         }
         for output_idx, position in enumerate(positions)
@@ -327,6 +418,94 @@ def default_face_size(source_width: int) -> int:
     if source_width < 4:
         raise ValueError("Source ERP width must be at least 4 pixels")
     return source_width // 4
+
+
+def perspective_output_size(
+    reference_face_size: int,
+    hfov_degrees: float,
+    vfov_degrees: float,
+    output_height: int | None = None,
+    dimension_multiple: int = 1,
+) -> tuple[int, int, float]:
+    """Choose integer dimensions with one focal for the requested two FOVs."""
+
+    if reference_face_size <= 1:
+        raise ValueError("Reference face size must be at least 2 pixels")
+    if not 0.0 < float(hfov_degrees) < 180.0:
+        raise ValueError("--hfov-degrees must be in (0, 180)")
+    if not 0.0 < float(vfov_degrees) < 180.0:
+        raise ValueError("--vfov-degrees must be in (0, 180)")
+    dimension_multiple = int(dimension_multiple)
+    if dimension_multiple <= 0:
+        raise ValueError("--output-multiple must be positive")
+    reference_focal = (reference_face_size - 1.0) * 0.5
+    if output_height is None:
+        ideal_height = 1 + round(
+            2.0
+            * reference_focal
+            * math.tan(math.radians(float(vfov_degrees)) * 0.5)
+        )
+        output_height = ideal_height
+        if dimension_multiple > 1:
+            aspect = math.tan(math.radians(float(hfov_degrees)) * 0.5) / math.tan(
+                math.radians(float(vfov_degrees)) * 0.5
+            )
+            candidates = []
+            lower = max(
+                dimension_multiple,
+                int(math.floor(ideal_height * 0.95 / dimension_multiple))
+                * dimension_multiple,
+            )
+            upper = (
+                int(math.ceil(ideal_height * 1.05 / dimension_multiple))
+                * dimension_multiple
+            )
+            for candidate_height in range(
+                lower, upper + dimension_multiple, dimension_multiple
+            ):
+                ideal_width = 1.0 + (candidate_height - 1.0) * aspect
+                base_width = int(round(ideal_width / dimension_multiple))
+                for multiple_count in (base_width - 1, base_width, base_width + 1):
+                    candidate_width = multiple_count * dimension_multiple
+                    if candidate_width <= 1:
+                        continue
+                    aspect_error = abs(
+                        (candidate_width - 1.0)
+                        / (candidate_height - 1.0)
+                        / aspect
+                        - 1.0
+                    )
+                    candidate_focal = (candidate_height - 1.0) / (
+                        2.0
+                        * math.tan(math.radians(float(vfov_degrees)) * 0.5)
+                    )
+                    focal_error = abs(candidate_focal / reference_focal - 1.0)
+                    candidates.append(
+                        (
+                            aspect_error > 1e-4,
+                            focal_error if aspect_error <= 1e-4 else aspect_error,
+                            aspect_error,
+                            focal_error,
+                            candidate_width,
+                            candidate_height,
+                        )
+                    )
+            _invalid, _primary, _aspect_error, _focal_error, output_width, output_height = min(
+                candidates
+            )
+            focal = (output_height - 1.0) / (
+                2.0 * math.tan(math.radians(float(vfov_degrees)) * 0.5)
+            )
+            return output_width, output_height, focal
+    if output_height <= 1:
+        raise ValueError("--output-height must be at least 2")
+    focal = (output_height - 1.0) / (
+        2.0 * math.tan(math.radians(float(vfov_degrees)) * 0.5)
+    )
+    output_width = 1 + round(
+        2.0 * focal * math.tan(math.radians(float(hfov_degrees)) * 0.5)
+    )
+    return output_width, output_height, focal
 
 
 def build_decode_command(
@@ -388,13 +567,13 @@ def _load_conversion_backend():
             f"{installed_version} is installed. {install_hint}"
         )
     try:
-        from pytorch360convert import e2c
+        from pytorch360convert import e2c, e2p
     except (ImportError, AttributeError) as exc:
         raise RuntimeError(
-            "Could not import pytorch360convert.e2c from the required package. "
+            "Could not import pytorch360convert.e2c/e2p from the required package. "
             + install_hint
         ) from exc
-    return torch, e2c, installed_version
+    return torch, e2c, e2p, installed_version
 
 
 def _resolve_device(torch, requested_device: str):
@@ -444,13 +623,19 @@ def _convert_selected_frames(
     frames: list[dict],
     source_width: int,
     source_height: int,
-    face_size: int,
+    layout: str,
+    face_specs: tuple[dict, ...],
+    output_width: int,
+    output_height: int,
+    hfov_degrees: float,
+    vfov_degrees: float,
     batch_size: int,
     device,
     interpolation: str,
     ffmpeg: str,
     torch,
     e2c,
+    e2p,
 ) -> list[str]:
     command = build_decode_command(
         ffmpeg,
@@ -490,22 +675,55 @@ def _convert_selected_frames(
                 device=device, dtype=torch.float32
             ) / 255.0
             with torch.inference_mode():
-                cubemap = e2c(
-                    erp_batch,
-                    face_w=face_size,
-                    mode=interpolation,
-                    cube_format="stack",
-                )
-            expected_shape = (6, current_batch_size, 3, face_size, face_size)
-            if tuple(cubemap.shape) != expected_shape:
-                raise RuntimeError(
-                    "Unexpected pytorch360convert e2c stack shape: expected "
-                    f"{expected_shape}, got {tuple(cubemap.shape)}"
-                )
+                if layout == "cubemap5":
+                    projected_views = e2c(
+                        erp_batch,
+                        face_w=output_width,
+                        mode=interpolation,
+                        cube_format="stack",
+                    )
+                    expected_shape = (
+                        6,
+                        current_batch_size,
+                        3,
+                        output_height,
+                        output_width,
+                    )
+                    if tuple(projected_views.shape) != expected_shape:
+                        raise RuntimeError(
+                            "Unexpected pytorch360convert e2c stack shape: expected "
+                            f"{expected_shape}, got {tuple(projected_views.shape)}"
+                        )
+                else:
+                    projected_views = [
+                        e2p(
+                            erp_batch,
+                            fov_deg=(hfov_degrees, vfov_degrees),
+                            h_deg=spec["yaw_degrees"],
+                            v_deg=spec["pitch_degrees"],
+                            out_hw=(output_height, output_width),
+                            mode=interpolation,
+                        )
+                        for spec in face_specs
+                    ]
+                    expected_shape = (
+                        current_batch_size,
+                        3,
+                        output_height,
+                        output_width,
+                    )
+                    if any(tuple(view.shape) != expected_shape for view in projected_views):
+                        raise RuntimeError(
+                            "Unexpected pytorch360convert e2p shape: expected "
+                            f"{expected_shape}"
+                        )
             for batch_index in range(current_batch_size):
                 output_name = frames[output_index + batch_index]["output_name"]
-                for spec in FACE_SPECS:
-                    face = cubemap[spec["e2c_stack_index"], batch_index]
+                for spec_index, spec in enumerate(face_specs):
+                    if layout == "cubemap5":
+                        face = projected_views[spec["e2c_stack_index"], batch_index]
+                    else:
+                        face = projected_views[spec_index][batch_index]
                     _tensor_to_image(face, torch).save(
                         staging_dir / spec["output_name"] / output_name
                     )
@@ -525,9 +743,15 @@ def _convert_selected_frames(
     return command
 
 
-def _verify_outputs(staging_dir: Path, frames: list[dict], face_size: int):
+def _verify_outputs(
+    staging_dir: Path,
+    frames: list[dict],
+    face_names: tuple[str, ...],
+    output_width: int,
+    output_height: int,
+):
     expected_names = [frame["output_name"] for frame in frames]
-    for face_name in FACE_NAMES:
+    for face_name in face_names:
         face_dir = staging_dir / face_name
         image_paths = sorted(face_dir.glob("*.png"))
         actual_names = [path.name for path in image_paths]
@@ -538,7 +762,7 @@ def _verify_outputs(staging_dir: Path, frames: list[dict], face_size: int):
             )
         for image_path in image_paths:
             with Image.open(image_path) as image:
-                if image.size != (face_size, face_size):
+                if image.size != (output_width, output_height):
                     raise RuntimeError(
                         f"Unexpected image size for {image_path}: {image.size}"
                     )
@@ -564,34 +788,66 @@ def prepare_dataset(args: argparse.Namespace) -> Path:
     if args.batch_size <= 0:
         raise ValueError("--batch-size must be positive")
 
-    torch, e2c, package_version = _load_conversion_backend()
+    torch, e2c, e2p, package_version = _load_conversion_backend()
     device = _resolve_device(torch, args.device)
     probe = probe_video(input_path, args.ffprobe)
     stream = probe["stream"]
     source_width = int(stream["width"])
     source_height = int(stream["height"])
-    face_size = (
+    reference_face_size = (
         default_face_size(source_width)
         if args.face_size is None
         else args.face_size
     )
-    if face_size <= 0:
+    if reference_face_size <= 0:
         raise ValueError("--face-size must be positive")
+    layout = getattr(args, "layout", "cubemap5")
+    output_height_arg = getattr(args, "output_height", None)
+    if layout == "cubemap5":
+        if output_height_arg is not None:
+            raise ValueError("--output-height is only valid with --layout overlap3")
+        face_specs = FACE_SPECS
+        face_names = FACE_NAMES
+        output_width = output_height = reference_face_size
+        hfov_degrees = vfov_degrees = 90.0
+        focal_pixels = (reference_face_size - 1.0) * 0.5
+    else:
+        face_specs = OVERLAP3_FACE_SPECS
+        face_names = OVERLAP3_FACE_NAMES
+        hfov_degrees = float(
+            getattr(args, "hfov_degrees", OVERLAP3_HFOV_DEGREES)
+        )
+        vfov_degrees = float(
+            getattr(args, "vfov_degrees", OVERLAP3_VFOV_DEGREES)
+        )
+        output_width, output_height, focal_pixels = perspective_output_size(
+            reference_face_size,
+            hfov_degrees,
+            vfov_degrees,
+            output_height_arg,
+            getattr(args, "output_multiple", 4),
+        )
     frames = choose_source_frames(
-        probe["timestamps"], args.num_frames, args.start_time, args.end_time
+        probe["timestamps"],
+        args.num_frames,
+        args.start_time,
+        args.end_time,
+        face_names,
     )
 
     output_dir.parent.mkdir(parents=True, exist_ok=True)
     staging_dir = output_dir.parent / f".{output_dir.name}.tmp-{uuid.uuid4().hex}"
     try:
-        for face_name in FACE_NAMES:
+        for face_name in face_names:
             (staging_dir / face_name).mkdir(parents=True, exist_ok=False)
         print(
-            f"Preparing {len(frames)} synchronized cubemap5 frames from {input_path}",
+            f"Preparing {len(frames)} synchronized {layout} frames from "
+            f"{input_path}",
             flush=True,
         )
         print(
-            f"Faces: {face_size}x{face_size}, FOV=90x90 degrees, "
+            f"Views: {output_width}x{output_height}, "
+            f"FOV={hfov_degrees:g}x{vfov_degrees:g} degrees, "
             f"device={device}, batch_size={args.batch_size}",
             flush=True,
         )
@@ -601,20 +857,48 @@ def prepare_dataset(args: argparse.Namespace) -> Path:
             frames=frames,
             source_width=source_width,
             source_height=source_height,
-            face_size=face_size,
+            layout=layout,
+            face_specs=face_specs,
+            output_width=output_width,
+            output_height=output_height,
+            hfov_degrees=hfov_degrees,
+            vfov_degrees=vfov_degrees,
             batch_size=args.batch_size,
             device=device,
             interpolation=args.interpolation,
             ffmpeg=args.ffmpeg,
             torch=torch,
             e2c=e2c,
+            e2p=e2p,
         )
-        _verify_outputs(staging_dir, frames, face_size)
+        _verify_outputs(
+            staging_dir,
+            frames,
+            face_names,
+            output_width,
+            output_height,
+        )
 
-        # e2c uses linspace endpoints, so boundary pixel centers define HFOV.
-        focal_pixels = (face_size - 1.0) / 2.0
+        # e2c/e2p use linspace endpoints, so boundary pixels define the FOV.
+        focal_x = (output_width - 1.0) / (
+            2.0 * math.tan(math.radians(hfov_degrees) * 0.5)
+        )
+        focal_y = (output_height - 1.0) / (
+            2.0 * math.tan(math.radians(vfov_degrees) * 0.5)
+        )
+        if not math.isclose(focal_x, focal_y, rel_tol=2e-3, abs_tol=0.05):
+            raise RuntimeError(
+                "Output dimensions do not support one square-pixel focal: "
+                f"fx={focal_x}, fy={focal_y}"
+            )
+        # SIMPLE_PINHOLE is anchored to the exact horizontal FOV.  The aligned
+        # overlap3 dimensions keep the independently requested vertical focal
+        # within 0.01%, which is validated above.
+        focal_pixels = focal_x
+        if layout == "cubemap5":
+            focal_pixels = (output_width - 1.0) * 0.5
         manifest = {
-            "schema_version": 2,
+            "schema_version": 3,
             "source": {
                 "path": str(input_path),
                 "codec": stream.get("codec_name"),
@@ -634,38 +918,81 @@ def prepare_dataset(args: argparse.Namespace) -> Path:
                 "end_time_seconds": args.end_time,
             },
             "output": {
-                "face_size": face_size,
-                "width": face_size,
-                "height": face_size,
+                "face_size": (
+                    reference_face_size if layout == "cubemap5" else None
+                ),
+                "reference_face_size": reference_face_size,
+                "width": output_width,
+                "height": output_height,
                 "image_format": "png",
-                "hfov_degrees": 90.0,
-                "vfov_degrees": 90.0,
+                "hfov_degrees": hfov_degrees,
+                "vfov_degrees": vfov_degrees,
                 "fx_pixels": focal_pixels,
                 "fy_pixels": focal_pixels,
-                "cx_pixels": focal_pixels,
-                "cy_pixels": focal_pixels,
+                "cx_pixels": (output_width - 1.0) * 0.5,
+                "cy_pixels": (output_height - 1.0) * 0.5,
                 "pixel_center_convention": "pytorch360convert_linspace_endpoints",
                 "interpolation": args.interpolation,
                 "device": str(device),
                 "batch_size": args.batch_size,
             },
+            "rig": {
+                "layout": layout,
+                "sensor_order": list(face_names),
+                "translation_model": "co_located_zero_baseline",
+                "views": [
+                    {
+                        "name": spec["output_name"],
+                        "reference_face": spec.get(
+                            "reference_face", spec.get("cubemap_face")
+                        ),
+                        "yaw_degrees": float(
+                            spec.get(
+                                "yaw_degrees",
+                                {"center": 0.0, "left": -90.0, "right": 90.0}.get(
+                                    spec["output_name"], 0.0
+                                ),
+                            )
+                        ),
+                        "pitch_degrees": float(spec.get("pitch_degrees", 0.0)),
+                        "look_axis": spec["look_axis"],
+                        "sensor_from_rig_rotation": spec.get(
+                            "sensor_from_rig_rotation",
+                            SENSOR_FROM_RIG_ROTATIONS_BY_NAME[spec["output_name"]],
+                        ),
+                    }
+                    for spec in face_specs
+                ],
+            },
             "cubemap": {
-                "projection": "standard_perspective_cubemap",
+                "projection": (
+                    "standard_perspective_cubemap"
+                    if layout == "cubemap5"
+                    else "overlapping_perspective_views"
+                ),
                 "e2c_full_stack_order": [
                     "Front", "Right", "Back", "Left", "Up", "Down"
                 ],
-                "face_mapping": list(FACE_SPECS),
-                "omitted_faces": [
-                    {
-                        "cubemap_face": "Back",
-                        "e2c_stack_index": 2,
-                        "look_axis": "-Z",
-                    }
-                ],
+                "face_mapping": list(face_specs),
+                "omitted_faces": (
+                    [
+                        {
+                            "cubemap_face": "Back",
+                            "e2c_stack_index": 2,
+                            "look_axis": "-Z",
+                        }
+                    ]
+                    if layout == "cubemap5"
+                    else [
+                        {"cubemap_face": "Back", "look_axis": "-Z"},
+                        {"cubemap_face": "Up", "look_axis": "+Y"},
+                        {"cubemap_face": "Down", "look_axis": "-Y"},
+                    ]
+                ),
                 "orientation_convention": (
-                    "pytorch360convert e2c coordinates: Front=+Z, Right=+X, "
-                    "Back=-Z, Left=-X, Up=+Y, Down=-Y; no post-rotation or "
-                    "flip is applied"
+                    "pytorch360convert coordinates: Front=+Z, Right=+X, "
+                    "Back=-Z, Left=-X, Up=+Y, Down=-Y; overlap3 uses e2p "
+                    "h_deg 0/-90/+90 and applies no post-rotation or flip"
                 ),
             },
             "frames": frames,
@@ -674,7 +1001,11 @@ def prepare_dataset(args: argparse.Namespace) -> Path:
                 "ffprobe": _tool_version(args.ffprobe),
                 "ffmpeg_role": "video probe/decode/frame selection only",
                 "ffmpeg_decode_command": decode_command,
-                "projection": "pytorch360convert.e2c",
+                "projection": (
+                    "pytorch360convert.e2c"
+                    if layout == "cubemap5"
+                    else "pytorch360convert.e2p"
+                ),
                 "pytorch360convert": package_version,
                 "torch": torch.__version__,
             },
@@ -686,7 +1017,7 @@ def prepare_dataset(args: argparse.Namespace) -> Path:
     except BaseException:
         shutil.rmtree(staging_dir, ignore_errors=True)
         raise
-    print(f"Prepared cubemap5 dataset: {output_dir}", flush=True)
+    print(f"Prepared {layout} dataset: {output_dir}", flush=True)
     print(f"Manifest: {output_dir / MANIFEST_NAME}", flush=True)
     return output_dir
 

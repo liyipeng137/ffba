@@ -1,3 +1,4 @@
+import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,7 +18,9 @@ from utils.pano_rig import (
     filter_metadata,
     intrinsics_for_image_size,
     intrinsics_from_pinhole_crop,
+    load_pano_rig_metadata,
     make_pano_rig_metadata,
+    make_overlap3_metadata,
     sensor_from_rig_rotation,
     write_rig_reconstruction,
 )
@@ -52,6 +55,58 @@ def test_expand_center_pose_matches_e2c_five_face_orientations():
     audit = build_pose_audit(expanded, metadata)
     assert audit["max_projection_center_spread"] < 1e-12
     assert audit["max_absolute_orientation_error_degrees"] < 1e-12
+
+
+def test_overlap3_metadata_keeps_orthogonal_axes_and_dynamic_frame_width():
+    metadata = make_overlap3_metadata(["000.png", "001.png"])
+    expanded = expand_center_extrinsics(_center_poses(2), metadata)
+    axes = expanded[:, :3, :3].transpose(0, 2, 1)[:, :, 2]
+    assert metadata.sensor_names == ("center", "left", "right")
+    assert metadata.hfov_degrees == 110.0
+    assert metadata.vfov_degrees == 100.0
+    assert metadata.center_image_indices == [0, 3]
+    np.testing.assert_allclose(
+        axes[:3], [[0, 0, 1], [-1, 0, 0], [1, 0, 0]], atol=1e-12
+    )
+
+
+def test_load_overlap3_manifest_is_authoritative(tmp_path):
+    manifest = {
+        "schema_version": 3,
+        "output": {"hfov_degrees": 110.0, "vfov_degrees": 100.0},
+        "rig": {
+            "sensor_order": ["center", "left", "right"],
+            "views": [
+                {
+                    "name": name,
+                    "reference_face": face,
+                    "yaw_degrees": yaw,
+                    "sensor_from_rig_rotation": rotation,
+                }
+                for name, face, yaw, rotation in zip(
+                    ("center", "left", "right"),
+                    ("Front", "Left", "Right"),
+                    (0.0, -90.0, 90.0),
+                    (
+                        ((1, 0, 0), (0, 1, 0), (0, 0, 1)),
+                        ((0, 0, 1), (0, 1, 0), (-1, 0, 0)),
+                        ((0, 0, -1), (0, 1, 0), (1, 0, 0)),
+                    ),
+                    strict=True,
+                )
+            ],
+        },
+    }
+    for name in ("center", "left", "right"):
+        (tmp_path / name).mkdir()
+    (tmp_path / "pano_rig_manifest.json").write_text(json.dumps(manifest))
+    metadata = load_pano_rig_metadata(tmp_path, ["000.png", "001.png"])
+    assert metadata.sensor_names == ("center", "left", "right")
+    assert metadata.num_images == 6
+    with pytest.raises(ValueError, match="disagrees with manifest HFOV"):
+        load_pano_rig_metadata(
+            tmp_path, ["000.png"], hfov_override=90.0
+        )
 
 
 def test_e2c_up_down_pixel_orientation_is_not_yaw_only():
@@ -135,6 +190,45 @@ def test_rig_projected_overlap_expansion_uses_depth_rank_and_face_geometry():
     assert group_by_center[0] == [0, 5, 10]
     assert stats["strategy"] == "rig_center_depth_projected_overlap"
     assert stats["selected_rotation_valid_neighbors"]["max"] == 2
+
+
+def test_overlap3_105_degree_groups_use_adjacent_overlapping_views():
+    metadata = make_overlap3_metadata(["000.png", "001.png", "002.png"])
+    expanded = expand_center_extrinsics(_center_poses(3), metadata)
+    details = {
+        0: [
+            {"image_index": 1, "projected_overlap": 0.9},
+            {"image_index": 2, "projected_overlap": 0.7},
+        ],
+        1: [
+            {"image_index": 0, "projected_overlap": 0.9},
+            {"image_index": 2, "projected_overlap": 0.7},
+        ],
+        2: [
+            {"image_index": 1, "projected_overlap": 0.9},
+            {"image_index": 0, "projected_overlap": 0.7},
+        ],
+    }
+    pairs, groups, stats = build_rig_projected_overlap_selection(
+        expanded,
+        metadata,
+        details,
+        max_pair_neighbors=6,
+        max_group_neighbors=3,
+        max_axis_angle_degrees=105.0,
+        group_rotation_threshold_degrees=105.0,
+    )
+    sensor_indices = np.asarray(metadata.image_sensor_indices)
+    sensor_pairs = {
+        frozenset((sensor_indices[first], sensor_indices[second]))
+        for first, second in pairs
+    }
+    assert frozenset((0, 1)) in sensor_pairs
+    assert frozenset((0, 2)) in sensor_pairs
+    assert frozenset((1, 2)) not in sensor_pairs
+    group_by_center = {group[0]: group for group in groups}
+    assert {sensor_indices[idx] for idx in group_by_center[0][1:]} == {0, 1, 2}
+    assert stats["selected_unfiltered_neighbors"]["max"] == 0
 
 
 def test_center_filter_keeps_or_drops_complete_five_face_frames():

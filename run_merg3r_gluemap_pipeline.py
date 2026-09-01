@@ -23,14 +23,12 @@ from utils.image_pyramid import (
     scale_intrinsics_with_pyramid_records,
 )
 from utils.pano_rig import (
-    CUBEMAP_FOV_DEGREES,
     PanoRigMetadata,
-    SENSOR_NAMES,
     build_rig_projected_overlap_selection,
     expand_center_extrinsics,
     intrinsics_for_image_size,
     intrinsics_from_pinhole_crop,
-    make_pano_rig_metadata,
+    load_pano_rig_metadata,
 )
 from utils.gluemap_spv_refine import (
     CAMERA_MODEL as PIPELINE_CAMERA_MODEL,
@@ -89,17 +87,38 @@ def parse_args():
     parser.add_argument(
         "--pano_hfov_degrees",
         type=float,
-        default=CUBEMAP_FOV_DEGREES,
-        help="Standard square cubemap faces use HFOV=VFOV=90 degrees.",
+        default=None,
+        help=(
+            "Optional HFOV assertion for pano inputs. The prepared manifest "
+            "is authoritative when present."
+        ),
+    )
+    parser.add_argument(
+        "--pano_vfov_degrees",
+        type=float,
+        default=None,
+        help=(
+            "Optional VFOV assertion for pano inputs. The prepared manifest "
+            "is authoritative when present."
+        ),
     )
     parser.add_argument(
         "--pano_pair_max_axis_angle",
         type=float,
-        default=95.0,
+        default=None,
         help=(
             "Maximum viewing-axis angle for cross-frame rig pair candidates. "
-            "The default connects adjacent 90-degree cubemap faces but not "
-            "opposite 180-degree faces."
+            "Defaults to 95 degrees for Cubemap5 and 105 for overlap3."
+        ),
+    )
+    parser.add_argument(
+        "--pano_group_max_axis_angle",
+        type=float,
+        default=None,
+        help=(
+            "Viewing-axis angle treated as rotation-valid for pano VGGSfM "
+            "groups. Defaults to --pair_pose_rotation_threshold for Cubemap5 "
+            "and 105 degrees for overlap3."
         ),
     )
     parser.add_argument(
@@ -266,7 +285,7 @@ def parse_args():
     parser.add_argument(
         "--bae_max_observations",
         type=int,
-        default=0,
+        default=2000000,
         help=(
             "Maximum real observations passed to each BAE round. Values <= 0 "
             "disable the budget. When exceeded, whole real tracks are pruned "
@@ -647,11 +666,42 @@ def _pyramid_intrinsics(result, hfov_degrees):
     return np.asarray(low_intrinsics), np.asarray(high_intrinsics)
 
 
+def _validate_source_fov_for_simple_pinhole(
+    image_size_wh,
+    hfov_degrees,
+    vfov_degrees,
+    tolerance_degrees=0.1,
+):
+    width, height = (int(value) for value in image_size_wh)
+    focal = (width - 1.0) / (
+        2.0 * np.tan(np.deg2rad(float(hfov_degrees)) * 0.5)
+    )
+    implied_vfov = float(
+        2.0 * np.rad2deg(np.arctan((height - 1.0) / (2.0 * focal)))
+    )
+    if not np.isclose(
+        implied_vfov,
+        float(vfov_degrees),
+        atol=float(tolerance_degrees),
+        rtol=0.0,
+    ):
+        raise ValueError(
+            "Prepared image dimensions/FOV do not support square pixels and "
+            "SIMPLE_PINHOLE shared focal: "
+            f"size={width}x{height}, HFOV={hfov_degrees}, "
+            f"manifest VFOV={vfov_degrees}, implied VFOV={implied_vfov:.6f}"
+        )
+
+
 def prepare_pano_stage_b(args, output_dir, center_state):
     if args.multi_dirs:
-        raise ValueError("Cubemap pano mode does not support --multi_dirs")
-    if not np.isclose(args.pano_hfov_degrees, CUBEMAP_FOV_DEGREES):
-        raise ValueError("Standard cubemap faces require --pano_hfov_degrees=90")
+        raise ValueError("Pano rig mode does not support --multi_dirs")
+    preliminary_metadata = load_pano_rig_metadata(
+        args.dataset,
+        ["placeholder.png"],
+        hfov_override=args.pano_hfov_degrees,
+        vfov_override=args.pano_vfov_degrees,
+    )
     stage2_scale_factor = (
         None if args.stage2_scale_factor == 0 else args.stage2_scale_factor
     )
@@ -659,12 +709,11 @@ def prepare_pano_stage_b(args, output_dir, center_state):
     sensor_low_intrinsics = []
     sensor_high_intrinsics = []
     all_sensor_frame_names = {}
-    for sensor_name in SENSOR_NAMES:
+    for sensor_name in preliminary_metadata.sensor_names:
         sensor_dir = Path(args.dataset) / sensor_name
         if not sensor_dir.is_dir():
             raise ValueError(
-                "Pano input must contain center/, left/, right/, up/, down/; missing "
-                f"{sensor_dir}"
+                f"Pano input is missing manifest-declared sensor directory {sensor_dir}"
             )
         all_sensor_frame_names[sensor_name] = [
             path.name for path in iter_image_files(sensor_dir, recursive=False)
@@ -681,7 +730,9 @@ def prepare_pano_stage_b(args, output_dir, center_state):
                 subsample=args.subsample,
                 num_images=args.num_images,
             )
-            low_k, high_k = _pyramid_intrinsics(result, args.pano_hfov_degrees)
+            low_k, high_k = _pyramid_intrinsics(
+                result, preliminary_metadata.hfov_degrees
+            )
         else:
             high_images, image_names = load_image_tensors_from_dir(
                 sensor_dir,
@@ -698,7 +749,7 @@ def prepare_pano_stage_b(args, output_dir, center_state):
                 manifest_path=None,
             )
             intrinsic = intrinsics_for_image_size(
-                high_images.shape[-2:], args.pano_hfov_degrees
+                high_images.shape[-2:], preliminary_metadata.hfov_degrees
             )
             low_k = np.repeat(intrinsic[None], len(image_names), axis=0)
             high_k = low_k.copy()
@@ -708,7 +759,7 @@ def prepare_pano_stage_b(args, output_dir, center_state):
 
     if not all_sensor_frame_names["center"]:
         raise ValueError("Pano input directories contain no supported images")
-    for sensor_name in SENSOR_NAMES[1:]:
+    for sensor_name in preliminary_metadata.sensor_names[1:]:
         if all_sensor_frame_names[sensor_name] != all_sensor_frame_names["center"]:
             raise ValueError(
                 f"{sensor_name}/ must contain exactly the same image basenames "
@@ -720,16 +771,21 @@ def prepare_pano_stage_b(args, output_dir, center_state):
             for result in sensor_results
             for record in result.records
         }
-        if len(source_sizes) != 1 or any(
-            width != height for width, height in source_sizes
-        ):
+        if len(source_sizes) != 1:
             raise ValueError(
-                "All cubemap source faces must have identical square dimensions, got "
+                "All pano source views must have identical dimensions, got "
                 f"{sorted(source_sizes)}"
             )
+        _validate_source_fov_for_simple_pinhole(
+            next(iter(source_sizes)),
+            preliminary_metadata.hfov_degrees,
+            preliminary_metadata.vfov_degrees,
+        )
 
     frame_names = [Path(name).name for name in sensor_results[0].image_names]
-    for sensor_name, result in zip(SENSOR_NAMES, sensor_results, strict=True):
+    for sensor_name, result in zip(
+        preliminary_metadata.sensor_names, sensor_results, strict=True
+    ):
         names = [Path(name).name for name in result.image_names]
         if names != frame_names:
             raise ValueError(
@@ -739,9 +795,14 @@ def prepare_pano_stage_b(args, output_dir, center_state):
     if frame_names != [Path(name).name for name in center_state.high_image_names]:
         raise ValueError("Stage A center frames do not match Stage B center frames")
 
-    metadata = make_pano_rig_metadata(frame_names, args.pano_hfov_degrees)
+    metadata = load_pano_rig_metadata(
+        args.dataset,
+        frame_names,
+        hfov_override=args.pano_hfov_degrees,
+        vfov_override=args.pano_vfov_degrees,
+    )
     if metadata.num_frames < 2:
-        raise ValueError("Cubemap pano mode requires at least two synchronized frames")
+        raise ValueError("Pano rig mode requires at least two synchronized frames")
     high_images = torch.stack(
         [
             sensor_results[sensor_idx].high_images[frame_idx]
@@ -754,16 +815,36 @@ def prepare_pano_stage_b(args, output_dir, center_state):
     if (
         len(high_shapes) != 1
         or len(low_shapes) != 1
-        or any(height != width for height, width in high_shapes | low_shapes)
     ):
         raise ValueError(
-            "All cubemap sensors must have identical square processed shapes: "
+            "All pano sensors must have identical processed shapes: "
             f"low={sorted(low_shapes)}, high={sorted(high_shapes)}"
         )
     high_image_size_hw = next(iter(high_shapes))
     low_image_size_hw = next(iter(low_shapes))
+    if not args.image_pyramid:
+        _validate_source_fov_for_simple_pinhole(
+            (high_image_size_hw[1], high_image_size_hw[0]),
+            metadata.hfov_degrees,
+            metadata.vfov_degrees,
+        )
     if center_state.raw_depth.shape[0] != metadata.num_frames:
         raise ValueError("Stage A center depth count does not match pano frames")
+
+    is_overlap3 = (
+        metadata.sensor_names == ("center", "left", "right")
+        and metadata.hfov_degrees > 90.0
+    )
+    pair_max_axis_angle = (
+        float(args.pano_pair_max_axis_angle)
+        if args.pano_pair_max_axis_angle is not None
+        else (105.0 if is_overlap3 else 95.0)
+    )
+    group_max_axis_angle = (
+        float(args.pano_group_max_axis_angle)
+        if args.pano_group_max_axis_angle is not None
+        else (105.0 if is_overlap3 else float(args.pair_pose_rotation_threshold))
+    )
 
     extrinsic = expand_center_extrinsics(center_state.extrinsic, metadata).astype(
         np.float32
@@ -819,10 +900,8 @@ def prepare_pano_stage_b(args, output_dir, center_state):
             frame_candidate_details,
             max_pair_neighbors=args.pair_k_pose,
             max_group_neighbors=args.neighbors_per_center,
-            max_axis_angle_degrees=args.pano_pair_max_axis_angle,
-            group_rotation_threshold_degrees=(
-                args.pair_pose_rotation_threshold
-            ),
+            max_axis_angle_degrees=pair_max_axis_angle,
+            group_rotation_threshold_degrees=group_max_axis_angle,
         )
     )
     pair_graph_stats = summarize_pair_graph(pairs, metadata.num_images)
@@ -875,11 +954,11 @@ def write_pano_stage_b_summary(output_dir, args, state):
         "input_contract": {
             "directories": list(state.rig.sensor_names),
             "matching": "identical unique basenames in all directories",
-            "source_images": "identical square cubemap faces",
-            "hfov_degrees": float(args.pano_hfov_degrees),
+            "source_images": "identical-size perspective rig views",
+            "hfov_degrees": float(state.rig.hfov_degrees),
             "vfov_degrees": float(state.rig.vfov_degrees),
             "sensor_order": list(state.rig.sensor_names),
-            "cubemap_face_order": list(state.rig.sensor_cubemap_faces),
+            "reference_face_order": list(state.rig.sensor_cubemap_faces),
             "sensor_from_rig_rotations": state.rig.to_dict()[
                 "sensor_from_rig_rotations"
             ],
@@ -892,7 +971,9 @@ def write_pano_stage_b_summary(output_dir, args, state):
             "strategy": "center_depth_projected_overlap_plus_rig_geometry",
             "same_frame_pairs": False,
             "max_neighbors_per_image": int(args.pair_k_pose),
-            "max_axis_angle_degrees": float(args.pano_pair_max_axis_angle),
+            "max_axis_angle_degrees": float(
+                state.tracking_group_stats["max_axis_angle_degrees"]
+            ),
             "pair_graph": state.pair_graph_stats,
             "frame_projected_overlap": state.frame_overlap_stats,
         },
@@ -971,6 +1052,12 @@ def main():
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    configured_rig = load_pano_rig_metadata(
+        args.dataset,
+        ["placeholder.png"],
+        hfov_override=args.pano_hfov_degrees,
+        vfov_override=args.pano_vfov_degrees,
+    )
     with open(output_dir / "pipeline_config.json", "w") as f:
         json.dump(
             {
@@ -983,13 +1070,16 @@ def main():
                     "group_strategy": args.vggsfm_group_strategy,
                     "track_mode": PIPELINE_TRACK_MODE,
                 },
-                "pano_cubemap": {
-                    "input_directories": list(SENSOR_NAMES),
-                    "image_order": "frame_major_center_left_right_up_down",
+                "pano_rig": {
+                    "input_directories": list(configured_rig.sensor_names),
+                    "image_order": "frame_major_"
+                    + "_".join(configured_rig.sensor_names),
                     "stage_a_images": "center only",
-                    "stage_b_images": "all five faces",
-                    "tracking_images": "all five high-resolution faces",
-                    "frame_filtering": "center driven whole five-face frame",
+                    "stage_b_images": "all manifest-declared views",
+                    "tracking_images": "all manifest-declared high-resolution views",
+                    "frame_filtering": "center driven whole synchronized frame",
+                    "hfov_degrees": configured_rig.hfov_degrees,
+                    "vfov_degrees": configured_rig.vfov_degrees,
                     "stop_before_bae": bool(args.stop_before_bae),
                 },
                 "args": vars(args),

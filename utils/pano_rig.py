@@ -1,13 +1,14 @@
-"""Fixed five-face cubemap rig helpers for the pano pipeline branch.
+"""Co-located perspective rig helpers for the panorama pipeline.
 
-The rig uses the Front/Left/Right/Up/Down face orientation produced by
-``pytorch360convert.e2c``. Images are ordered frame-major, with the stable
-sensor order center, left, right, up, down for every source timestamp.
+The legacy layout is a five-face 90-degree Cubemap5 rig.  The overlapping
+layout keeps only Center/Left/Right, retains the same 0/-90/+90-degree axes,
+and uses wider perspective images so adjacent horizontal views overlap.
 """
 
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import json
 from pathlib import Path
 
 import numpy as np
@@ -18,6 +19,12 @@ SENSOR_CUBEMAP_FACES = ("Front", "Left", "Right", "Up", "Down")
 SENSOR_YAWS_DEGREES = (0.0, -90.0, 90.0, 0.0, 0.0)
 CENTER_SENSOR_INDEX = 0
 CUBEMAP_FOV_DEGREES = 90.0
+OVERLAP3_SENSOR_NAMES = ("center", "left", "right")
+OVERLAP3_SENSOR_FACES = ("Front", "Left", "Right")
+OVERLAP3_SENSOR_YAWS_DEGREES = (0.0, -90.0, 90.0)
+OVERLAP3_HFOV_DEGREES = 110.0
+OVERLAP3_VFOV_DEGREES = 100.0
+PANO_RIG_MANIFEST_NAME = "pano_rig_manifest.json"
 
 # OpenCV camera coordinates are +x right, +y down, +z forward. These complete
 # sensor_from_rig rotations reproduce pytorch360convert.e2c's face pixel
@@ -29,6 +36,7 @@ SENSOR_FROM_RIG_ROTATIONS = (
     ((1.0, 0.0, 0.0), (0.0, 0.0, 1.0), (0.0, -1.0, 0.0)),  # Up
     ((1.0, 0.0, 0.0), (0.0, 0.0, -1.0), (0.0, 1.0, 0.0)),  # Down
 )
+OVERLAP3_SENSOR_FROM_RIG_ROTATIONS = SENSOR_FROM_RIG_ROTATIONS[:3]
 
 
 @dataclass(frozen=True)
@@ -69,17 +77,25 @@ class PanoRigMetadata:
         payload["center_image_indices"] = self.center_image_indices
         payload["num_frames"] = self.num_frames
         payload["num_images"] = self.num_images
-        payload["image_order"] = "frame_major_center_left_right_up_down"
+        payload["image_order"] = "frame_major_" + "_".join(self.sensor_names)
         payload["sensor_order"] = list(self.sensor_names)
         payload["cubemap_face_order"] = list(self.sensor_cubemap_faces)
         payload["rig_reference_sensor"] = self.sensor_names[self.center_sensor_index]
         payload["rotation_semantics"] = "sensor_from_rig"
-        payload["face_geometry"] = "square_90_degree_hfov_vfov"
+        payload["face_geometry"] = "perspective_known_hfov_vfov"
         payload["translation_model"] = "co_located_zero_baseline"
         return payload
 
 
-def make_pano_rig_metadata(frame_names, hfov_degrees=CUBEMAP_FOV_DEGREES):
+def make_pano_rig_metadata(
+    frame_names,
+    hfov_degrees=CUBEMAP_FOV_DEGREES,
+    vfov_degrees=None,
+    sensor_names=SENSOR_NAMES,
+    sensor_cubemap_faces=None,
+    sensor_yaws_degrees=None,
+    sensor_from_rig_rotations=None,
+):
     frame_names = [str(name) for name in frame_names]
     if not frame_names:
         raise ValueError("A pano rig requires at least one frame")
@@ -87,13 +103,50 @@ def make_pano_rig_metadata(frame_names, hfov_degrees=CUBEMAP_FOV_DEGREES):
         raise ValueError("Pano frame basenames must be unique")
     if not 0.0 < float(hfov_degrees) < 180.0:
         raise ValueError("hfov_degrees must be in (0, 180)")
+    if vfov_degrees is None:
+        vfov_degrees = hfov_degrees
+    if not 0.0 < float(vfov_degrees) < 180.0:
+        raise ValueError("vfov_degrees must be in (0, 180)")
+    sensor_names = tuple(str(name) for name in sensor_names)
+    if not sensor_names or sensor_names[0] != "center":
+        raise ValueError("Pano sensor order must be non-empty and start with center")
+    if len(set(sensor_names)) != len(sensor_names):
+        raise ValueError("Pano sensor names must be unique")
+    if sensor_cubemap_faces is None:
+        sensor_cubemap_faces = tuple(name.title() for name in sensor_names)
+    if sensor_yaws_degrees is None:
+        sensor_yaws_degrees = tuple(0.0 for _ in sensor_names)
+    if sensor_from_rig_rotations is None:
+        known_rotations = dict(zip(SENSOR_NAMES, SENSOR_FROM_RIG_ROTATIONS))
+        try:
+            sensor_from_rig_rotations = tuple(
+                known_rotations[name] for name in sensor_names
+            )
+        except KeyError as exc:
+            raise ValueError(
+                f"No default sensor rotation for {exc.args[0]!r}"
+            ) from exc
+    sensor_cubemap_faces = tuple(str(name) for name in sensor_cubemap_faces)
+    sensor_yaws_degrees = tuple(float(value) for value in sensor_yaws_degrees)
+    sensor_from_rig_rotations = tuple(
+        tuple(tuple(float(value) for value in row) for row in rotation)
+        for rotation in sensor_from_rig_rotations
+    )
+    lengths = {
+        len(sensor_names),
+        len(sensor_cubemap_faces),
+        len(sensor_yaws_degrees),
+        len(sensor_from_rig_rotations),
+    }
+    if len(lengths) != 1:
+        raise ValueError("All pano sensor metadata arrays must have equal length")
 
     image_frame_indices = []
     image_sensor_indices = []
     image_names = []
     for frame_idx, frame_name in enumerate(frame_names):
         stem = Path(frame_name).stem
-        for sensor_idx, sensor_name in enumerate(SENSOR_NAMES):
+        for sensor_idx, sensor_name in enumerate(sensor_names):
             image_frame_indices.append(frame_idx)
             image_sensor_indices.append(sensor_idx)
             image_names.append(f"frame_{frame_idx:06d}_{sensor_name}_{stem}.png")
@@ -103,8 +156,122 @@ def make_pano_rig_metadata(frame_names, hfov_degrees=CUBEMAP_FOV_DEGREES):
         image_frame_indices=image_frame_indices,
         image_sensor_indices=image_sensor_indices,
         image_names=image_names,
+        sensor_names=sensor_names,
+        sensor_cubemap_faces=sensor_cubemap_faces,
+        sensor_yaws_degrees=sensor_yaws_degrees,
+        sensor_from_rig_rotations=sensor_from_rig_rotations,
+        center_sensor_index=0,
         hfov_degrees=float(hfov_degrees),
-        vfov_degrees=float(hfov_degrees),
+        vfov_degrees=float(vfov_degrees),
+    )
+
+
+def make_overlap3_metadata(frame_names):
+    """Build the default 110x100-degree Center/Left/Right panorama rig."""
+
+    return make_pano_rig_metadata(
+        frame_names,
+        hfov_degrees=OVERLAP3_HFOV_DEGREES,
+        vfov_degrees=OVERLAP3_VFOV_DEGREES,
+        sensor_names=OVERLAP3_SENSOR_NAMES,
+        sensor_cubemap_faces=OVERLAP3_SENSOR_FACES,
+        sensor_yaws_degrees=OVERLAP3_SENSOR_YAWS_DEGREES,
+        sensor_from_rig_rotations=OVERLAP3_SENSOR_FROM_RIG_ROTATIONS,
+    )
+
+
+def load_pano_rig_metadata(
+    dataset,
+    frame_names,
+    hfov_override=None,
+    vfov_override=None,
+):
+    """Load the prepared rig contract, with a legacy directory fallback.
+
+    New non-cubemap layouts must carry a manifest because the image dimensions
+    alone do not uniquely define both FOVs and the virtual-camera rotations.
+    """
+
+    dataset = Path(dataset)
+    manifest_path = dataset / PANO_RIG_MANIFEST_NAME
+    if manifest_path.is_file():
+        payload = json.loads(manifest_path.read_text())
+        output = payload.get("output", {})
+        rig = payload.get("rig") or {}
+        sensor_names = tuple(rig.get("sensor_order", ()))
+        views = rig.get("views", [])
+        if not sensor_names and views:
+            sensor_names = tuple(view["name"] for view in views)
+        if not sensor_names:
+            face_mapping = payload.get("cubemap", {}).get("face_mapping", [])
+            sensor_names = tuple(item["output_name"] for item in face_mapping)
+        if not sensor_names:
+            raise ValueError(f"Manifest has no pano sensor order: {manifest_path}")
+
+        view_by_name = {view["name"]: view for view in views}
+        known_faces = dict(zip(SENSOR_NAMES, SENSOR_CUBEMAP_FACES))
+        known_yaws = dict(zip(SENSOR_NAMES, SENSOR_YAWS_DEGREES))
+        known_rotations = dict(zip(SENSOR_NAMES, SENSOR_FROM_RIG_ROTATIONS))
+        try:
+            faces = tuple(
+                view_by_name.get(name, {}).get("reference_face", known_faces[name])
+                for name in sensor_names
+            )
+            yaws = tuple(
+                float(view_by_name.get(name, {}).get("yaw_degrees", known_yaws[name]))
+                for name in sensor_names
+            )
+            rotations = tuple(
+                view_by_name.get(name, {}).get(
+                    "sensor_from_rig_rotation", known_rotations[name]
+                )
+                for name in sensor_names
+            )
+        except KeyError as exc:
+            raise ValueError(
+                f"Manifest view {exc.args[0]!r} needs an explicit rotation"
+            ) from exc
+        hfov = float(output.get("hfov_degrees", CUBEMAP_FOV_DEGREES))
+        vfov = float(output.get("vfov_degrees", hfov))
+    else:
+        if all((dataset / name).is_dir() for name in SENSOR_NAMES):
+            sensor_names = SENSOR_NAMES
+            faces = SENSOR_CUBEMAP_FACES
+            yaws = SENSOR_YAWS_DEGREES
+            rotations = SENSOR_FROM_RIG_ROTATIONS
+            hfov = CUBEMAP_FOV_DEGREES
+            vfov = CUBEMAP_FOV_DEGREES
+        elif all((dataset / name).is_dir() for name in OVERLAP3_SENSOR_NAMES):
+            raise ValueError(
+                "A three-view pano dataset requires pano_rig_manifest.json so "
+                "HFOV/VFOV and rotations cannot be guessed"
+            )
+        else:
+            raise ValueError(
+                "Pano input must contain either manifest-declared sensor "
+                "directories or legacy center/left/right/up/down directories"
+            )
+
+    if hfov_override is not None and not np.isclose(
+        float(hfov_override), hfov, atol=1e-6
+    ):
+        raise ValueError(
+            f"--pano_hfov_degrees={hfov_override} disagrees with manifest HFOV={hfov}"
+        )
+    if vfov_override is not None and not np.isclose(
+        float(vfov_override), vfov, atol=1e-6
+    ):
+        raise ValueError(
+            f"--pano_vfov_degrees={vfov_override} disagrees with manifest VFOV={vfov}"
+        )
+    return make_pano_rig_metadata(
+        frame_names,
+        hfov_degrees=hfov,
+        vfov_degrees=vfov,
+        sensor_names=sensor_names,
+        sensor_cubemap_faces=faces,
+        sensor_yaws_degrees=yaws,
+        sensor_from_rig_rotations=rotations,
     )
 
 
@@ -242,13 +409,13 @@ def build_rig_projected_overlap_selection(
     max_axis_angle_degrees,
     group_rotation_threshold_degrees,
 ):
-    """Expand depth-ranked frame candidates into five-face pairs and groups.
+    """Expand depth-ranked frame candidates into rig-view pairs and groups.
 
     ``frame_candidate_details`` is produced by projected-overlap scoring on
     the Stage-A center views. That scoring uses real depth in both frames.
     Here the score is transferred to the synchronized rig frame and combined
     with each virtual sensor's known viewing axis. No depth is fabricated for
-    Left/Right/Up/Down.
+    non-center views.
     """
 
     extrinsic = np.asarray(extrinsic, dtype=np.float64)
@@ -701,7 +868,7 @@ def configure_rig_database(
     metadata,
     camera_model="SIMPLE_PINHOLE",
 ):
-    """Replace trivial database frames with one fixed five-sensor rig."""
+    """Replace trivial database frames with one fixed multi-sensor pano rig."""
 
     import pycolmap  # noqa: PLC0415
 
