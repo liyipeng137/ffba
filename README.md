@@ -95,7 +95,7 @@ feed-forward model: pi3x
 camera model      : SIMPLE_PINHOLE
 feature database  : SIFT
 prior query source: ALIKED
-group strategy    : pose
+group strategy    : ordered_motion
 BA backend        : BAE by default
 ```
 
@@ -206,18 +206,15 @@ utils/gluemap_refine_core.py
 主要步骤：
 
 1. 保存 high-resolution work images 到 `<output_dir>/images/`。
-2. 按 pose groups 运行 VGGSfM prior tracking。
+2. `ordered_motion` 默认路径从 pose、DINO retrieval 和时序窗口的并集生成候选，用 coarse depth 的有向 overlap、网格覆盖与 motion 过滤候选。
+3. 在旧 pose pair 数量形成的全局预算内选择可变 degree 的 SIFT graph；只选择通过阈值的 pair，不为凑固定 K 补边。
+4. 准备并匹配 SIFT database，统计每个 pair 的 verified match 数和双侧网格覆盖。
+5. 在旧 fixed-K group 的 neighbor-slot 总量内选择独立的 VGGSfM graph；SIFT 已测试但支撑不足的可靠 pair 会得到额外权重，每个 center 的实际邻居数可以不同。
+6. 运行 VGGSfM prior tracking。
    - tracker coarse fmaps 会优先以 BF16（不支持时 FP16）常驻 GPU，避免每个 pose group 重复从 CPU 搬运；若压缩缓存预计占用超过当前空闲显存的 50%，自动回退到原有 FP32 CPU cache。
-3. 准备 SIFT database。
-4. 统计 SIFT observations 和 prior track observations。
-5. 按观测数量过滤低覆盖帧。
-6. 导出前馈 depth 到 `<output_dir>/pred_depth/`，供后续分析或 dense 后处理使用。
-7. 使用 GlueMap 的 intrinsics averaging 得到 shared `SIMPLE_PINHOLE` intrinsics。
-8. 将 VGGSfM prior tracks snap 到 SIFT keypoints。
-9. 写出 prior track database。
-10. 合并 prior database 和 SIFT database。
-11. 写出 coarse COLMAP reconstruction。
-12. 进入 augmented refinement loop。
+7. 统计 SIFT observations 和 prior track observations，并过滤低覆盖帧。
+8. 导出前馈 depth，完成 intrinsics averaging，将 prior tracks snap 到 SIFT keypoints。
+9. 写出并合并 prior/SIFT databases、coarse COLMAP reconstruction，然后进入 augmented refinement loop。
 
 默认配置：
 
@@ -438,9 +435,17 @@ python run_merg3r_gluemap_pipeline.py \
   --vggsfm_group_strategy projected_overlap
 ```
 
-不传 `--vggsfm_group_strategy` 时仍使用 `pose`，便于和已有结果对照。
+不传 `--vggsfm_group_strategy` 时默认使用 `ordered_motion`。旧的 `pose` 和
+`projected_overlap` 路径仍可显式选择，用于 A/B 对照；这两个旧路径也会先
+准备 SIFT，但其 pair graph 和 group 选择逻辑不变。
 正式 projected-overlap 路径复用下方四个 `--projected_overlap_*` 参数；
 如果 sequence 阶段未产生 DINO similarity matrix，Stage A 会自动补算一次。
+
+`ordered_motion` 的两个 ratio 默认都是 `1.0`：SIFT pair 数不超过旧 pose
+graph 的 pair 数，VGGSfM neighbor-slot 总数和 group-size 平方和代理成本均不
+超过旧 fixed-K groups。它改变的是预算分配而不是主要网络工作量。`32` 是
+单个 group 的显存安全上限，不是要求填满的 K；候选不足或质量阈值未通过时
+会保留更小的 group。
 
 如果需要 PLY，可用 COLMAP 自带 converter 从 `points3D` 转出。
 
@@ -466,8 +471,8 @@ python run_merg3r_gluemap_pipeline.py \
 | `--pair_k_pose` | `25` | 每帧按 coarse pose 选取的邻居数量 |
 | `--pair_pose_rotation_threshold` | `30.0` | pose pair 允许的最大视角差，单位为度 |
 | `--path_tracker` | required in practice | VGGSfM tracker checkpoint |
-| `--neighbors_per_center` | `25` | 每个 VGGSfM group 的邻居上限；`pose` 策略下 rotation-valid 优先，同层按 camera-center 距离排序 |
-| `--vggsfm_group_strategy` | `pose` | 正式 VGGSfM tracking 的 group 构建策略；可选 `pose` 或 `projected_overlap` |
+| `--neighbors_per_center` | `25` | 旧 `pose`/`projected_overlap` 路径的每组邻居上限；在 `ordered_motion` 中只用于计算等耗时基线预算 |
+| `--vggsfm_group_strategy` | `ordered_motion` | 正式 group 构建策略；可选 `ordered_motion`、`pose` 或 `projected_overlap` |
 | `--vggsfm_group_batch_size` | `2` | 按 `(group_size, query_points)` 分桶后，每次 VGGSfM forward 的 group 数量；尾桶自动降为较小 batch |
 | `--export_vggsfm_groups_only` | off | Stage A 后按 audit strategy 导出 VGGSfM groups、contact sheets、JSON 和人工标签 CSV，然后跳过 tracker/refinement |
 | `--vggsfm_group_audit_strategy` | `pose` | `pose`、`projected_overlap` 或 `both`；仅影响 group audit 提前退出模式 |
@@ -475,6 +480,17 @@ python run_merg3r_gluemap_pipeline.py \
 | `--projected_overlap_samples` | `2048` | 每个 center 用于有向几何投影的 low-res depth 规则网格采样上限 |
 | `--projected_overlap_reproj_threshold` | `4.0` | low-res depth round-trip reprojection 一致性阈值，单位为像素 |
 | `--projected_overlap_conf_quantile` | `0.2` | 丢弃每帧最低比例的 depth-confidence 样本 |
+| `--ordered_temporal_window` | `8` | 有序输入中每个 center 向前、向后加入候选池的帧数 |
+| `--ordered_min_projected_overlap` | `0.10` | ordered 候选的最小有向 round-trip overlap；低于阈值不补入图 |
+| `--ordered_min_projected_grid_coverage` | `0.25` | ordered 候选在 source 规则网格上的最小覆盖 |
+| `--ordered_min_projected_visible_ratio` | `0.25` | ordered 候选投影到 target 后的最小可见比例 |
+| `--ordered_motion_target` | `0.08` | motion 得分的目标值，以图像对角线比例表示 |
+| `--ordered_sift_pair_budget_ratio` | `1.0` | SIFT 全局 pair 预算相对旧 pose graph pair 数的比例 |
+| `--ordered_vggsfm_neighbor_budget_ratio` | `1.0` | VGGSfM 全局 neighbor-slot 预算相对旧 fixed-K groups 的比例 |
+| `--ordered_vggsfm_hard_max_neighbors` | `32` | 单 group 显存安全上限；不会为达到该值而补邻居 |
+| `--ordered_sift_target_matches` | `256` | 计算 SIFT pair 支撑不足程度时的 verified match 饱和值 |
+| `--ordered_sift_target_grid_coverage` | `0.5` | 计算 SIFT pair 支撑不足程度时的双侧最小网格覆盖饱和值 |
+| `--ordered_sift_deficit_weight` | `0.5` | VGGSfM 选择时对已测试但 SIFT 支撑不足 pair 的加权强度 |
 | `--vggsfm_query_points` | `1024` | prior tracking query 点数 |
 | `--prior_match_topology` | `star` | prior tracks 写入 pair matches 的拓扑 |
 | `--min_frame_observations` | `10` | 低覆盖帧过滤阈值 |

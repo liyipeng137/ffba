@@ -126,11 +126,13 @@ def parse_args():
         "--vggsfm_group_strategy",
         type=str,
         default=PIPELINE_GROUP_STRATEGY,
-        choices=["pose", "projected_overlap"],
+        choices=["pose", "projected_overlap", "ordered_motion"],
         help=(
             "Group strategy used by formal VGGSfM prior tracking. "
             "'projected_overlap' ranks the union of rotation-valid pose and "
-            "DINO retrieval candidates using coarse projected overlap."
+            "DINO retrieval candidates using coarse projected overlap. "
+            "'ordered_motion' moves SIFT ahead of VGGSfM and allocates a "
+            "variable number of directed neighbors under a global budget."
         ),
     )
     parser.add_argument(
@@ -185,6 +187,39 @@ def parse_args():
         default=0.2,
         help="Drop the lowest source/target depth-confidence quantile.",
     )
+    parser.add_argument("--ordered_temporal_window", type=int, default=8)
+    parser.add_argument("--ordered_min_projected_overlap", type=float, default=0.10)
+    parser.add_argument(
+        "--ordered_min_projected_grid_coverage", type=float, default=0.25
+    )
+    parser.add_argument(
+        "--ordered_min_projected_visible_ratio", type=float, default=0.25
+    )
+    parser.add_argument("--ordered_motion_target", type=float, default=0.08)
+    parser.add_argument(
+        "--ordered_sift_pair_budget_ratio",
+        type=float,
+        default=1.0,
+        help="Global SIFT pair budget relative to the legacy pose-pair count.",
+    )
+    parser.add_argument(
+        "--ordered_vggsfm_neighbor_budget_ratio",
+        type=float,
+        default=1.0,
+        help=(
+            "Global VGGSfM neighbor-slot budget relative to the legacy "
+            "fixed-K group workload."
+        ),
+    )
+    parser.add_argument(
+        "--ordered_vggsfm_hard_max_neighbors",
+        type=int,
+        default=32,
+        help="Per-group memory safety cap; quality selection itself is variable-K.",
+    )
+    parser.add_argument("--ordered_sift_target_matches", type=int, default=256)
+    parser.add_argument("--ordered_sift_target_grid_coverage", type=float, default=0.5)
+    parser.add_argument("--ordered_sift_deficit_weight", type=float, default=0.5)
     parser.add_argument("--vggsfm_query_points", type=int, default=1024)
     parser.add_argument("--aliked_detection_threshold", type=float, default=0.005)
     parser.add_argument("--vggsfm_vis_threshold", type=float, default=0.5)
@@ -740,6 +775,19 @@ def main():
         projected_overlap_samples=args.projected_overlap_samples,
         projected_overlap_reproj_threshold=(args.projected_overlap_reproj_threshold),
         projected_overlap_conf_quantile=args.projected_overlap_conf_quantile,
+        ordered_temporal_window=args.ordered_temporal_window,
+        ordered_min_projected_overlap=args.ordered_min_projected_overlap,
+        ordered_min_projected_grid_coverage=(args.ordered_min_projected_grid_coverage),
+        ordered_min_projected_visible_ratio=(args.ordered_min_projected_visible_ratio),
+        ordered_motion_target=args.ordered_motion_target,
+        ordered_sift_pair_budget_ratio=args.ordered_sift_pair_budget_ratio,
+        ordered_vggsfm_neighbor_budget_ratio=(
+            args.ordered_vggsfm_neighbor_budget_ratio
+        ),
+        ordered_vggsfm_hard_max_neighbors=(args.ordered_vggsfm_hard_max_neighbors),
+        ordered_sift_target_matches=args.ordered_sift_target_matches,
+        ordered_sift_target_grid_coverage=(args.ordered_sift_target_grid_coverage),
+        ordered_sift_deficit_weight=args.ordered_sift_deficit_weight,
         vggsfm_query_points=args.vggsfm_query_points,
         aliked_detection_threshold=args.aliked_detection_threshold,
         vggsfm_vis_threshold=args.vggsfm_vis_threshold,

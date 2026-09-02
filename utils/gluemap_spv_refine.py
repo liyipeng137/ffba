@@ -19,7 +19,7 @@ from utils import gluemap_refine_core as ref
 CAMERA_MODEL = "SIMPLE_PINHOLE"
 S_DATABASE_MODE = "sift"
 QUERY_SOURCE = "aliked"
-GROUP_STRATEGY = "pose"
+GROUP_STRATEGY = "ordered_motion"
 TRACK_MODE = "SPV"
 TRACKER_INPUT = "1024"
 
@@ -36,6 +36,17 @@ class GluemapSpvRefineConfig:
     projected_overlap_samples: int = 2048
     projected_overlap_reproj_threshold: float = 4.0
     projected_overlap_conf_quantile: float = 0.2
+    ordered_temporal_window: int = 8
+    ordered_min_projected_overlap: float = 0.10
+    ordered_min_projected_grid_coverage: float = 0.25
+    ordered_min_projected_visible_ratio: float = 0.25
+    ordered_motion_target: float = 0.08
+    ordered_sift_pair_budget_ratio: float = 1.0
+    ordered_vggsfm_neighbor_budget_ratio: float = 1.0
+    ordered_vggsfm_hard_max_neighbors: int = 32
+    ordered_sift_target_matches: int = 256
+    ordered_sift_target_grid_coverage: float = 0.5
+    ordered_sift_deficit_weight: float = 0.5
     vggsfm_query_points: int = 1024
     aliked_detection_threshold: float = 0.005
     vggsfm_vis_threshold: float = 0.5
@@ -569,6 +580,20 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
     ref._ensure_gluemap_imports()
     pycolmap = ref._lazy_import_pycolmap()
     args = _make_refine_args(config)
+    for name, value in (
+        ("ordered_sift_pair_budget_ratio", config.ordered_sift_pair_budget_ratio),
+        (
+            "ordered_vggsfm_neighbor_budget_ratio",
+            config.ordered_vggsfm_neighbor_budget_ratio,
+        ),
+        ("ordered_motion_target", config.ordered_motion_target),
+    ):
+        if float(value) <= 0:
+            raise ValueError(f"{name} must be > 0")
+    if int(config.ordered_vggsfm_hard_max_neighbors) <= 0:
+        raise ValueError("ordered_vggsfm_hard_max_neighbors must be >= 1")
+    if float(config.ordered_sift_deficit_weight) < 0:
+        raise ValueError("ordered_sift_deficit_weight must be >= 0")
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -627,51 +652,199 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
         f"camera_model={CAMERA_MODEL}",
     )
 
-    _debug(
-        args,
-        "Running VGGSfM prior tracking: "
-        f"group_strategy={args.group_strategy}, "
-        f"group_batch_size={args.vggsfm_group_batch_size}, "
-        f"neighbors_per_center={args.neighbors_per_center}, "
-        f"query_points={args.vggsfm_query_points}, "
-        f"query_source={QUERY_SOURCE}, tracker_input={TRACKER_INPUT}",
-    )
+    legacy_pairs = pairs.copy()
+    candidate_details = None
+    candidate_stats = None
     tracking_groups = None
     tracking_group_stats = None
-    if args.group_strategy == "projected_overlap":
+    if args.group_strategy in {"projected_overlap", "ordered_motion"}:
         if coarse_state.retrieval_sim_matrix is None:
             raise ValueError(
                 "retrieval_sim_matrix is required when "
-                "vggsfm_group_strategy='projected_overlap'"
+                f"vggsfm_group_strategy={args.group_strategy!r}"
             )
         t0 = time.time()
-        tracking_groups, tracking_group_stats, _ = ref.build_projected_overlap_groups(
+        (
+            tracking_groups,
+            candidate_stats,
+            candidate_details,
+        ) = ref.build_projected_overlap_groups(
             pairs=pairs,
             extrinsic=extrinsic,
             intrinsics=initial_intrinsics_low_all,
             depth=coarse_state.raw_depth,
             depth_conf=coarse_state.raw_depth_conf,
             retrieval_sim_matrix=coarse_state.retrieval_sim_matrix,
-            max_neighbors=int(args.neighbors_per_center),
+            max_neighbors=(
+                None
+                if args.group_strategy == "ordered_motion"
+                else int(args.neighbors_per_center)
+            ),
             rotation_threshold=float(args.pair_pose_rotation_threshold),
             dino_candidates=int(config.projected_overlap_dino_candidates),
             max_samples=int(config.projected_overlap_samples),
             reprojection_threshold=float(config.projected_overlap_reproj_threshold),
             confidence_quantile=float(config.projected_overlap_conf_quantile),
+            temporal_window=(
+                int(config.ordered_temporal_window)
+                if args.group_strategy == "ordered_motion"
+                else 0
+            ),
+            min_projected_overlap=(
+                float(config.ordered_min_projected_overlap)
+                if args.group_strategy == "ordered_motion"
+                else 0.0
+            ),
+            min_projected_grid_coverage=(
+                float(config.ordered_min_projected_grid_coverage)
+                if args.group_strategy == "ordered_motion"
+                else 0.0
+            ),
+            min_projected_visible_ratio=(
+                float(config.ordered_min_projected_visible_ratio)
+                if args.group_strategy == "ordered_motion"
+                else 0.0
+            ),
         )
         stats["timing"]["vggsfm_group_build"] = time.time() - t0
-        _debug(
-            args,
-            "Built projected-overlap VGGSfM groups: "
-            f"groups={len(tracking_groups)}, "
-            f"group_size={tracking_group_stats['group_size']}",
-        )
+        if args.group_strategy == "projected_overlap":
+            tracking_group_stats = candidate_stats
     elif args.group_strategy != "pose":
         raise ValueError(
-            "vggsfm_group_strategy must be 'pose' or 'projected_overlap', "
+            "vggsfm_group_strategy must be 'pose', 'projected_overlap', or "
+            "'ordered_motion', "
             f"got {args.group_strategy!r}"
         )
 
+    if args.group_strategy == "ordered_motion":
+        sift_pair_budget = max(
+            1,
+            int(
+                round(len(legacy_pairs) * float(config.ordered_sift_pair_budget_ratio))
+            ),
+        )
+        pairs, sift_pair_selection_stats = ref.select_ordered_sift_pairs(
+            candidate_details,
+            len(image_names),
+            sift_pair_budget,
+            motion_target=float(config.ordered_motion_target),
+        )
+        stats["ordered_pair_selection"] = {
+            "candidate_generation": candidate_stats,
+            "sift": sift_pair_selection_stats,
+        }
+        _debug(
+            args,
+            "Selected ordered SIFT graph: "
+            f"legacy_pairs={len(legacy_pairs)}, selected_pairs={len(pairs)}, "
+            f"budget={sift_pair_budget}, "
+            f"components={sift_pair_selection_stats['connected_components']}",
+        )
+
+    prefilter_image_names = list(image_names)
+    _debug(args, "Preparing prefilter SIFT database before VGGSfM")
+    t0 = time.time()
+    prefilter_intrinsics_mapping = {idx: 0 for idx in range(len(image_names))}
+    features, sift_prefilter_stats = ref.prepare_sift_database_for_refine(
+        args,
+        output_dir,
+        output_dir,
+        image_names,
+        pairs,
+        CAMERA_MODEL,
+        prefilter_intrinsics_mapping,
+    )
+    stats["timing"]["prepare_sift_database_prefilter"] = time.time() - t0
+    stats["s_database"] = {
+        "mode": S_DATABASE_MODE,
+        "prefilter": sift_prefilter_stats,
+        "prefilter_database_ready": True,
+    }
+
+    if args.group_strategy == "ordered_motion":
+        t0 = time.time()
+        sift_pair_quality = ref.summarize_database_pair_quality(
+            output_dir / "database_sift.db",
+            image_names,
+            image_size_hw,
+        )
+        for i, j in pairs.tolist():
+            sift_pair_quality.setdefault(
+                tuple(sorted((int(i), int(j)))),
+                {"matches": 0, "grid_coverage_min": 0.0},
+            )
+        centers = ref.camera_centers_from_w2c(extrinsic)
+        viewing_axes = ref.camera_viewing_axes_from_w2c(extrinsic)
+        legacy_groups, _ = ref.build_vggsfm_groups(
+            args,
+            legacy_pairs,
+            len(image_names),
+            image_names,
+            image_size_hw,
+            centers=centers,
+            viewing_axes=viewing_axes,
+        )
+        legacy_neighbor_slots = sum(len(group) - 1 for group in legacy_groups)
+        legacy_group_cost = sum(len(group) ** 2 for group in legacy_groups)
+        vggsfm_budget_ratio = float(config.ordered_vggsfm_neighbor_budget_ratio)
+        neighbor_slot_budget = max(
+            1,
+            int(round(legacy_neighbor_slots * vggsfm_budget_ratio)),
+        )
+        group_cost_budget = max(
+            1,
+            int(round(legacy_group_cost * vggsfm_budget_ratio)),
+        )
+        tracking_groups, tracking_group_stats = ref.build_ordered_vggsfm_groups(
+            candidate_details,
+            sift_pair_quality,
+            len(image_names),
+            neighbor_slot_budget,
+            motion_target=float(config.ordered_motion_target),
+            sift_target_matches=int(config.ordered_sift_target_matches),
+            sift_target_grid_coverage=float(config.ordered_sift_target_grid_coverage),
+            sift_deficit_weight=float(config.ordered_sift_deficit_weight),
+            hard_max_neighbors=int(config.ordered_vggsfm_hard_max_neighbors),
+            legacy_neighbors_per_center=int(args.neighbors_per_center),
+            group_cost_budget=group_cost_budget,
+        )
+        tracking_group_stats.update(
+            {
+                "legacy_neighbor_slots": int(legacy_neighbor_slots),
+                "legacy_group_cost_proxy": int(legacy_group_cost),
+                "candidate_generation": candidate_stats,
+                **ref.summarize_groups(tracking_groups, len(image_names)),
+            }
+        )
+        match_values = [quality["matches"] for quality in sift_pair_quality.values()]
+        raw_match_values = [
+            quality.get("raw_matches", 0) for quality in sift_pair_quality.values()
+        ]
+        coverage_values = [
+            quality["grid_coverage_min"] for quality in sift_pair_quality.values()
+        ]
+        stats["s_database"]["prefilter_pair_quality"] = {
+            "tested_pairs": int(len(sift_pair_quality)),
+            "pairs_with_matches": int(
+                sum(quality["matches"] > 0 for quality in sift_pair_quality.values())
+            ),
+            "verified_matches": ref.summarize_distribution(match_values),
+            "raw_matches": ref.summarize_distribution(raw_match_values),
+            "grid_coverage_min": ref.summarize_distribution(coverage_values),
+        }
+        stats["ordered_pair_selection"]["vggsfm"] = tracking_group_stats
+        stats["timing"]["ordered_vggsfm_group_selection"] = time.time() - t0
+
+    _debug(
+        args,
+        "Running VGGSfM prior tracking: "
+        f"group_strategy={args.group_strategy}, "
+        f"group_batch_size={args.vggsfm_group_batch_size}, "
+        f"neighbors_per_center={args.neighbors_per_center}, "
+        f"groups={'auto' if tracking_groups is None else len(tracking_groups)}, "
+        f"query_points={args.vggsfm_query_points}, "
+        f"query_source={QUERY_SOURCE}, tracker_input={TRACKER_INPUT}",
+    )
     t0 = time.time()
     prior_tracks, prior_stats = ref.run_vggsfm_prior_tracks(
         args,
@@ -719,25 +892,6 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
         f"time={stats['timing']['vggsfm_prior_tracks']:.2f}s",
     )
 
-    prefilter_image_names = list(image_names)
-    _debug(args, "Preparing prefilter SIFT database")
-    t0 = time.time()
-    prefilter_intrinsics_mapping = {idx: 0 for idx in range(len(image_names))}
-    features, sift_prefilter_stats = ref.prepare_sift_database_for_refine(
-        args,
-        output_dir,
-        output_dir,
-        image_names,
-        pairs,
-        CAMERA_MODEL,
-        prefilter_intrinsics_mapping,
-    )
-    stats["timing"]["prepare_sift_database_prefilter"] = time.time() - t0
-    stats["s_database"] = {
-        "mode": S_DATABASE_MODE,
-        "prefilter": sift_prefilter_stats,
-        "prefilter_database_ready": True,
-    }
     s_counts = np.asarray(
         sift_prefilter_stats["observations_per_image"], dtype=np.int64
     )
@@ -792,6 +946,19 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
         )
 
     kept_indices = np.asarray(coverage_stats["kept_indices"], dtype=np.int64)
+    virtual_tracking_groups = None
+    virtual_tracking_group_stats = None
+    if args.group_strategy == "ordered_motion":
+        old_to_new = {
+            int(old_idx): int(new_idx)
+            for new_idx, old_idx in enumerate(kept_indices.tolist())
+        }
+        virtual_tracking_groups = ref.remap_groups(tracking_groups, old_to_new)
+        virtual_tracking_group_stats = {
+            **tracking_group_stats,
+            "after_frame_filtering": True,
+            **ref.summarize_groups(virtual_tracking_groups, len(image_names)),
+        }
     initial_intrinsics_high = initial_intrinsics_high_all[kept_indices]
     initial_intrinsics_low = initial_intrinsics_low_all[kept_indices]
     depth = coarse_state.raw_depth[kept_indices]
@@ -863,6 +1030,8 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
             image_names,
             image_size_hw,
             depth_image_size_hw=depth_image_size_hw,
+            groups=virtual_tracking_groups,
+            group_stats=virtual_tracking_group_stats,
         )
         stats["timing"]["virtual_tracks"] = time.time() - t0
         vt = stats["virtual_tracks"]

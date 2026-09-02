@@ -363,6 +363,8 @@ def build_virtual_track_diagnostics(
     image_names,
     image_size_hw,
     depth_image_size_hw=None,
+    groups=None,
+    group_stats=None,
 ):
     from gluemap.estimators.covisibility_extraction import (  # noqa: PLC0415
         CovisibilityExtraction,
@@ -380,17 +382,20 @@ def build_virtual_track_diagnostics(
             f"depth_image_size_hw={tuple(depth_image_size_hw)}"
         )
 
-    centers = camera_centers_from_w2c(extrinsic)
-    viewing_axes = camera_viewing_axes_from_w2c(extrinsic)
-    groups, group_stats = build_vggsfm_groups(
-        args,
-        pairs,
-        num_images,
-        image_names,
-        image_size_hw,
-        centers=centers,
-        viewing_axes=viewing_axes,
-    )
+    if (groups is None) != (group_stats is None):
+        raise ValueError("groups and group_stats must be provided together")
+    if groups is None:
+        centers = camera_centers_from_w2c(extrinsic)
+        viewing_axes = camera_viewing_axes_from_w2c(extrinsic)
+        groups, group_stats = build_vggsfm_groups(
+            args,
+            pairs,
+            num_images,
+            image_names,
+            image_size_hw,
+            centers=centers,
+            viewing_axes=viewing_axes,
+        )
     center_set = {group[0] for group in groups}
     skipped_centers = [idx for idx in range(num_images) if idx not in center_set]
 
@@ -1068,6 +1073,11 @@ def _score_projected_overlap_pair(
             "projected_depth_valid_ratio": 0.0,
             "projected_overlap": 0.0,
             "projected_grid_coverage": 0.0,
+            "consistent_grid_mask": 0,
+            "motion_median_normalized": 0.0,
+            "motion_p90_normalized": 0.0,
+            "parallax_median_deg": 0.0,
+            "parallax_p90_deg": 0.0,
         }
 
     target_rotation = extrinsic[neighbor, :3, :3]
@@ -1147,7 +1157,40 @@ def _score_projected_overlap_pair(
     num_visible = int(visible.sum())
     num_depth_valid = int(depth_valid.sum())
     num_consistent = int(consistent.sum())
-    consistent_grid_cells = int(np.unique(source["grid_cells"][consistent]).size)
+    consistent_grid_cell_ids = np.unique(source["grid_cells"][consistent])
+    consistent_grid_cells = int(consistent_grid_cell_ids.size)
+    consistent_grid_mask = 0
+    for cell_id in consistent_grid_cell_ids.tolist():
+        consistent_grid_mask |= 1 << int(cell_id)
+
+    motion_normalized = np.linalg.norm(target_xy - source_xy, axis=1) / max(
+        float(np.hypot(height, width)),
+        1.0,
+    )
+    centers = camera_centers_from_w2c(extrinsic[[center, neighbor]])
+    source_rays = world_points - centers[0]
+    target_rays_world = world_points - centers[1]
+    source_ray_norm = np.linalg.norm(source_rays, axis=1)
+    target_ray_norm = np.linalg.norm(target_rays_world, axis=1)
+    valid_rays = (
+        consistent
+        & np.isfinite(source_ray_norm)
+        & np.isfinite(target_ray_norm)
+        & (source_ray_norm > 1e-12)
+        & (target_ray_norm > 1e-12)
+    )
+    parallax_deg = np.zeros(num_source, dtype=np.float64)
+    if np.any(valid_rays):
+        cosine = np.einsum(
+            "ij,ij->i",
+            source_rays[valid_rays] / source_ray_norm[valid_rays, None],
+            target_rays_world[valid_rays] / target_ray_norm[valid_rays, None],
+        )
+        parallax_deg[valid_rays] = np.degrees(np.arccos(np.clip(cosine, -1.0, 1.0)))
+
+    finite_motion = consistent & np.isfinite(motion_normalized)
+    motion_values = motion_normalized[finite_motion]
+    parallax_values = parallax_deg[valid_rays]
     return {
         "source_samples": num_source,
         "visible_samples": num_visible,
@@ -1160,6 +1203,19 @@ def _score_projected_overlap_pair(
             float(consistent_grid_cells / source["num_grid_cells"])
             if source["num_grid_cells"] > 0
             else 0.0
+        ),
+        "consistent_grid_mask": int(consistent_grid_mask),
+        "motion_median_normalized": (
+            float(np.median(motion_values)) if motion_values.size else 0.0
+        ),
+        "motion_p90_normalized": (
+            float(np.percentile(motion_values, 90)) if motion_values.size else 0.0
+        ),
+        "parallax_median_deg": (
+            float(np.median(parallax_values)) if parallax_values.size else 0.0
+        ),
+        "parallax_p90_deg": (
+            float(np.percentile(parallax_values, 90)) if parallax_values.size else 0.0
         ),
     }
 
@@ -1177,6 +1233,10 @@ def build_projected_overlap_groups(
     max_samples=2048,
     reprojection_threshold=4.0,
     confidence_quantile=0.2,
+    temporal_window=0,
+    min_projected_overlap=0.0,
+    min_projected_grid_coverage=0.0,
+    min_projected_visible_ratio=0.0,
 ):
     t_start = time.time()
     extrinsic = np.asarray(extrinsic, dtype=np.float64)
@@ -1210,12 +1270,21 @@ def build_projected_overlap_groups(
             "Expected retrieval similarity shape "
             f"({num_images}, {num_images}), got {retrieval_sim_matrix.shape}"
         )
-    if max_neighbors <= 0:
+    if max_neighbors is not None and max_neighbors <= 0:
         raise ValueError("max_neighbors must be >= 1")
     if dino_candidates <= 0:
         raise ValueError("dino_candidates must be >= 1")
     if reprojection_threshold <= 0:
         raise ValueError("reprojection_threshold must be > 0")
+    if temporal_window < 0:
+        raise ValueError("temporal_window must be >= 0")
+    for name, value in (
+        ("min_projected_overlap", min_projected_overlap),
+        ("min_projected_grid_coverage", min_projected_grid_coverage),
+        ("min_projected_visible_ratio", min_projected_visible_ratio),
+    ):
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(f"{name} must be in [0, 1]")
 
     adjacency = defaultdict(set)
     for i, j in np.asarray(pairs, dtype=np.int64).reshape(-1, 2).tolist():
@@ -1242,6 +1311,12 @@ def build_projected_overlap_groups(
     selected_pose_only = 0
     selected_dino_only = 0
     selected_both = 0
+    selected_temporal = 0
+    temporal_candidate_counts = []
+    eligible_candidate_counts = []
+    rejection_reason_counts = defaultdict(int)
+    selected_motion = []
+    selected_parallax = []
 
     dino_k = min(int(dino_candidates), max(num_images - 1, 0))
     for center in range(num_images):
@@ -1270,11 +1345,19 @@ def build_projected_overlap_groups(
         row[center] = -np.inf
         dino_order = np.argsort(-row, kind="stable")[:dino_k]
         dino_candidates_set = {int(idx) for idx in dino_order if idx != center}
-        candidates = sorted(pose_candidates | dino_candidates_set)
+        temporal_start = max(0, center - int(temporal_window))
+        temporal_stop = min(num_images, center + int(temporal_window) + 1)
+        temporal_candidates_set = {
+            idx for idx in range(temporal_start, temporal_stop) if idx != center
+        }
+        candidates = sorted(
+            pose_candidates | dino_candidates_set | temporal_candidates_set
+        )
 
         candidate_counts.append(len(candidates))
         pose_candidate_counts.append(len(pose_candidates))
         dino_candidate_counts.append(len(dino_candidates_set))
+        temporal_candidate_counts.append(len(temporal_candidates_set))
         details = []
         for neighbor in candidates:
             pair_stats = _score_projected_overlap_pair(
@@ -1290,6 +1373,7 @@ def build_projected_overlap_groups(
             )
             in_pose = neighbor in pose_candidates
             in_dino = neighbor in dino_candidates_set
+            in_temporal = neighbor in temporal_candidates_set
             dot = float(np.dot(viewing_axes[center], viewing_axes[neighbor]))
             rotation_angle = float(np.rad2deg(np.arccos(np.clip(dot, -1.0, 1.0))))
             detail = {
@@ -1299,6 +1383,7 @@ def build_projected_overlap_groups(
                     for source_name, present in (("pose", in_pose), ("dino", in_dino))
                     if present
                 ],
+                "temporal_gap": int(abs(neighbor - center)),
                 "dino_similarity": float(retrieval_sim_matrix[center, neighbor]),
                 "rotation_angle_deg": rotation_angle,
                 "rotation_valid": rotation_angle < rotation_threshold,
@@ -1307,6 +1392,17 @@ def build_projected_overlap_groups(
                 ),
                 **pair_stats,
             }
+            if in_temporal:
+                detail["candidate_sources"].append("temporal")
+            rejection_reasons = []
+            if detail["projected_overlap"] < min_projected_overlap:
+                rejection_reasons.append("overlap")
+            if detail["projected_grid_coverage"] < min_projected_grid_coverage:
+                rejection_reasons.append("grid_coverage")
+            if detail["projected_visible_ratio"] < min_projected_visible_ratio:
+                rejection_reasons.append("visible_ratio")
+            detail["selection_eligible"] = not rejection_reasons
+            detail["rejection_reasons"] = rejection_reasons
             details.append(detail)
 
         details.sort(
@@ -1319,42 +1415,68 @@ def build_projected_overlap_groups(
                 item["image_index"],
             )
         )
-        selected = details[: min(int(max_neighbors), len(details))]
+        eligible_details = [item for item in details if item["selection_eligible"]]
+        eligible_candidate_counts.append(len(eligible_details))
+        for detail in details:
+            for reason in detail["rejection_reasons"]:
+                rejection_reason_counts[reason] += 1
+        if max_neighbors is None:
+            selected = eligible_details
+        else:
+            selected = eligible_details[
+                : min(int(max_neighbors), len(eligible_details))
+            ]
         for rank, detail in enumerate(selected, start=1):
             detail["selected"] = True
             detail["selected_rank"] = rank
             selected_overlaps.append(detail["projected_overlap"])
             selected_grid_coverages.append(detail["projected_grid_coverage"])
             selected_visible_ratios.append(detail["projected_visible_ratio"])
+            selected_motion.append(detail["motion_median_normalized"])
+            selected_parallax.append(detail["parallax_median_deg"])
             sources = set(detail["candidate_sources"])
-            if sources == {"pose", "dino"}:
+            pose_dino_sources = sources & {"pose", "dino"}
+            if pose_dino_sources == {"pose", "dino"}:
                 selected_both += 1
-            elif sources == {"pose"}:
+            elif pose_dino_sources == {"pose"}:
                 selected_pose_only += 1
-            elif sources == {"dino"}:
+            elif pose_dino_sources == {"dino"}:
                 selected_dino_only += 1
-        for detail in details[len(selected) :]:
-            detail["selected"] = False
-            detail["selected_rank"] = None
+            if "temporal" in sources:
+                selected_temporal += 1
+        selected_ids = {item["image_index"] for item in selected}
+        for detail in details:
+            if detail["image_index"] not in selected_ids:
+                detail["selected"] = False
+                detail["selected_rank"] = None
         candidate_details[center] = details
         if selected:
             groups.append([center, *[item["image_index"] for item in selected]])
 
     stats = {
         "strategy": "projected_overlap_hybrid",
-        "candidate_pool": "rotation_valid_pose_pairs_union_dino_topk",
+        "candidate_pool": "rotation_valid_pose_pairs_union_dino_topk_union_temporal",
         "input_pairs": int(np.asarray(pairs).reshape(-1, 2).shape[0]),
-        "max_neighbors": int(max_neighbors),
+        "max_neighbors": int(max_neighbors) if max_neighbors is not None else None,
         "pose_rotation_threshold": float(rotation_threshold),
         "dino_candidates_per_center": int(dino_k),
         "max_source_samples": int(max_samples),
         "actual_regular_grid_samples": int(sample_xy.shape[0]),
         "reprojection_threshold_lowres_px": float(reprojection_threshold),
         "depth_confidence_quantile": float(confidence_quantile),
+        "temporal_window": int(temporal_window),
+        "selection_thresholds": {
+            "min_projected_overlap": float(min_projected_overlap),
+            "min_projected_grid_coverage": float(min_projected_grid_coverage),
+            "min_projected_visible_ratio": float(min_projected_visible_ratio),
+        },
         "seconds": float(time.time() - t_start),
         "candidate_count": summarize_numeric(candidate_counts),
         "pose_candidate_count": summarize_numeric(pose_candidate_counts),
         "dino_candidate_count": summarize_numeric(dino_candidate_counts),
+        "temporal_candidate_count": summarize_numeric(temporal_candidate_counts),
+        "eligible_candidate_count": summarize_numeric(eligible_candidate_counts),
+        "rejection_reason_counts": dict(sorted(rejection_reason_counts.items())),
         "selected_projected_overlap": summarize_distribution(selected_overlaps),
         "selected_projected_grid_coverage": summarize_distribution(
             selected_grid_coverages
@@ -1362,14 +1484,504 @@ def build_projected_overlap_groups(
         "selected_projected_visible_ratio": summarize_distribution(
             selected_visible_ratios
         ),
+        "selected_motion_median_normalized": summarize_distribution(
+            selected_motion
+        ),
+        "selected_parallax_median_deg": summarize_distribution(selected_parallax),
         "selected_candidate_source": {
             "pose_only": int(selected_pose_only),
             "dino_only": int(selected_dino_only),
             "both": int(selected_both),
+            "temporal": int(selected_temporal),
         },
         **summarize_groups(groups, num_images),
     }
     return groups, stats, candidate_details
+
+
+def _ordered_motion_quality(detail, motion_target):
+    motion = max(float(detail.get("motion_median_normalized", 0.0)), 0.0)
+    motion_target = float(motion_target)
+    if motion_target <= 0:
+        motion_quality = 1.0
+    elif motion <= 1e-12:
+        motion_quality = 0.0
+    else:
+        ratio = motion / motion_target
+        motion_quality = float(np.exp(-abs(np.log(ratio))))
+    geometry_quality = (
+        0.40 * float(detail.get("projected_overlap", 0.0))
+        + 0.25 * float(detail.get("projected_grid_coverage", 0.0))
+        + 0.15 * float(detail.get("projected_visible_ratio", 0.0))
+        + 0.10 * float(detail.get("projected_depth_valid_ratio", 0.0))
+        + 0.10 * motion_quality
+    )
+    return float(geometry_quality), float(motion_quality)
+
+
+def _disjoint_set_components(num_images, pairs):
+    parent = list(range(num_images))
+
+    def find(item):
+        while parent[item] != item:
+            parent[item] = parent[parent[item]]
+            item = parent[item]
+        return item
+
+    def union(a, b):
+        root_a = find(a)
+        root_b = find(b)
+        if root_a != root_b:
+            parent[root_b] = root_a
+
+    for i, j in pairs:
+        union(int(i), int(j))
+    components = defaultdict(list)
+    for image_idx in range(num_images):
+        components[find(image_idx)].append(image_idx)
+    return [tuple(values) for values in components.values()]
+
+
+def select_ordered_sift_pairs(
+    candidate_details,
+    num_images,
+    pair_budget,
+    motion_target=0.08,
+):
+    """Select a variable-degree, no-fill SIFT graph under a global pair budget."""
+    pair_budget = int(pair_budget)
+    if pair_budget <= 0:
+        raise ValueError("pair_budget must be >= 1")
+
+    undirected = {}
+    for center, details in candidate_details.items():
+        center = int(center)
+        for detail in details:
+            if not detail.get("selection_eligible", True):
+                continue
+            neighbor = int(detail["image_index"])
+            pair = tuple(sorted((center, neighbor)))
+            geometry_quality, motion_quality = _ordered_motion_quality(
+                detail, motion_target
+            )
+            record = undirected.setdefault(
+                pair,
+                {
+                    "pair": pair,
+                    "utility": 0.0,
+                    "motion_quality": 0.0,
+                    "temporal": False,
+                    "directions": 0,
+                },
+            )
+            record["utility"] = max(record["utility"], geometry_quality)
+            record["motion_quality"] = max(record["motion_quality"], motion_quality)
+            record["temporal"] |= "temporal" in detail.get("candidate_sources", ())
+            record["directions"] += 1
+
+    for record in undirected.values():
+        record["priority"] = record["utility"] * (1.05 if record["temporal"] else 1.0)
+
+    ranked = sorted(
+        undirected.values(),
+        key=lambda item: (
+            -item["priority"],
+            -item["motion_quality"],
+            item["pair"],
+        ),
+    )
+    eligible_components = _disjoint_set_components(
+        num_images, [record["pair"] for record in ranked]
+    )
+    full_backbone_pairs = num_images - len(eligible_components)
+
+    # Build a maximum-quality spanning forest first. This preserves connectivity
+    # whenever the eligible graph and the strict workload budget permit it.
+    parent = list(range(num_images))
+
+    def find(item):
+        while parent[item] != item:
+            parent[item] = parent[parent[item]]
+            item = parent[item]
+        return item
+
+    selected = []
+    selected_set = set()
+    for record in ranked:
+        if len(selected) >= pair_budget:
+            break
+        i, j = record["pair"]
+        root_i = find(i)
+        root_j = find(j)
+        if root_i == root_j:
+            continue
+        parent[root_j] = root_i
+        selected.append(record)
+        selected_set.add(record["pair"])
+
+    backbone_pairs = len(selected)
+    degrees = np.zeros(num_images, dtype=np.int64)
+    for record in selected:
+        i, j = record["pair"]
+        degrees[i] += 1
+        degrees[j] += 1
+
+    remaining = [record for record in ranked if record["pair"] not in selected_set]
+    while remaining and len(selected) < pair_budget:
+        best_index = max(
+            range(len(remaining)),
+            key=lambda index: (
+                remaining[index]["priority"]
+                / np.sqrt(
+                    (degrees[remaining[index]["pair"][0]] + 1)
+                    * (degrees[remaining[index]["pair"][1]] + 1)
+                ),
+                remaining[index]["motion_quality"],
+                tuple(-value for value in remaining[index]["pair"]),
+            ),
+        )
+        record = remaining.pop(best_index)
+        selected.append(record)
+        selected_set.add(record["pair"])
+        i, j = record["pair"]
+        degrees[i] += 1
+        degrees[j] += 1
+
+    selected_pairs = np.asarray(
+        sorted(record["pair"] for record in selected), dtype=np.int64
+    ).reshape(-1, 2)
+    components = _disjoint_set_components(num_images, selected_pairs.tolist())
+    return selected_pairs, {
+        "strategy": "ordered_motion_variable_k",
+        "candidate_pairs": int(len(ranked)),
+        "eligible_pairs": int(len(ranked)),
+        "pair_budget": int(pair_budget),
+        "backbone_truncated_by_budget": bool(full_backbone_pairs > pair_budget),
+        "full_backbone_pairs": int(full_backbone_pairs),
+        "backbone_pairs": int(backbone_pairs),
+        "selected_pairs": int(len(selected_pairs)),
+        "unused_budget": int(max(pair_budget - len(selected_pairs), 0)),
+        "degrees": summarize_numeric(degrees.tolist()),
+        "zero_degree_images": int(np.sum(degrees == 0)),
+        "connected_components": int(len(components)),
+        "component_sizes": sorted(
+            (len(component) for component in components), reverse=True
+        ),
+        "motion_target_normalized": float(motion_target),
+        "selected_temporal_pairs": int(
+            sum(record["temporal"] for record in selected)
+        ),
+        "selected_utility": summarize_distribution(
+            [record["utility"] for record in selected]
+        ),
+        "selected_motion_quality": summarize_distribution(
+            [record["motion_quality"] for record in selected]
+        ),
+        "selected_pair_indices": [record["pair"] for record in selected],
+    }
+
+
+def summarize_database_pair_quality(
+    database_path,
+    image_names,
+    image_size_hw,
+    grid_size=8,
+):
+    """Return raw SIFT match count and two-sided grid coverage for each pair."""
+    pycolmap = _lazy_import_pycolmap()
+    database = pycolmap.Database.open(str(database_path))
+    height, width = (int(value) for value in image_size_hw)
+    try:
+        images = {image.image_id: image for image in database.read_all_images()}
+        name_to_idx = {str(Path(name)): idx for idx, name in enumerate(image_names)}
+        keypoints = {}
+        for image_id in images:
+            image_keypoints = database.read_keypoints(image_id)
+            if image_keypoints is None:
+                keypoints[image_id] = np.empty((0, 2), dtype=np.float32)
+            else:
+                keypoints[image_id] = np.asarray(image_keypoints)[:, :2]
+        pair_ids, matches_list = database.read_all_matches()
+        quality = {}
+        for pair_id, matches in zip(pair_ids, matches_list, strict=False):
+            if matches is None or len(matches) == 0:
+                continue
+            image_id1, image_id2 = pycolmap.pair_id_to_image_pair(pair_id)
+            image1 = images.get(image_id1)
+            image2 = images.get(image_id2)
+            if image1 is None or image2 is None:
+                continue
+            idx1 = name_to_idx.get(str(Path(image1.name)))
+            idx2 = name_to_idx.get(str(Path(image2.name)))
+            if idx1 is None or idx2 is None:
+                continue
+            raw_matches = np.asarray(matches, dtype=np.int64).reshape(-1, 2)
+            matches = raw_matches
+            with contextlib.suppress(Exception):
+                geometry = database.read_two_view_geometry(image_id1, image_id2)
+                if (
+                    geometry is not None
+                    and geometry.inlier_matches is not None
+                ):
+                    matches = np.asarray(
+                        geometry.inlier_matches, dtype=np.int64
+                    ).reshape(-1, 2)
+            if image_id1 not in keypoints or image_id2 not in keypoints:
+                continue
+            if np.any(matches[:, 0] >= len(keypoints[image_id1])) or np.any(
+                matches[:, 1] >= len(keypoints[image_id2])
+            ):
+                continue
+            xy1 = keypoints[image_id1][matches[:, 0]]
+            xy2 = keypoints[image_id2][matches[:, 1]]
+
+            def coverage(xy):
+                grid_x = np.clip(
+                    (xy[:, 0] * grid_size / max(width, 1)).astype(np.int64),
+                    0,
+                    grid_size - 1,
+                )
+                grid_y = np.clip(
+                    (xy[:, 1] * grid_size / max(height, 1)).astype(np.int64),
+                    0,
+                    grid_size - 1,
+                )
+                return float(
+                    np.unique(grid_y * grid_size + grid_x).size / (grid_size**2)
+                )
+
+            pair = tuple(sorted((int(idx1), int(idx2))))
+            coverage1 = coverage(xy1)
+            coverage2 = coverage(xy2)
+            quality[pair] = {
+                "matches": int(len(matches)),
+                "raw_matches": int(len(raw_matches)),
+                "grid_coverage_image1": coverage1,
+                "grid_coverage_image2": coverage2,
+                "grid_coverage_min": float(min(coverage1, coverage2)),
+            }
+        return quality
+    finally:
+        database.close()
+
+
+def build_ordered_vggsfm_groups(
+    candidate_details,
+    sift_pair_quality,
+    num_images,
+    neighbor_slot_budget,
+    motion_target=0.08,
+    sift_target_matches=256,
+    sift_target_grid_coverage=0.5,
+    sift_deficit_weight=0.5,
+    hard_max_neighbors=None,
+    legacy_neighbors_per_center=None,
+    group_cost_budget=None,
+):
+    """Allocate directed VGGSfM neighbors without a per-center K limit."""
+    neighbor_slot_budget = int(neighbor_slot_budget)
+    if neighbor_slot_budget <= 0:
+        raise ValueError("neighbor_slot_budget must be >= 1")
+    if sift_target_matches <= 0:
+        raise ValueError("sift_target_matches must be >= 1")
+    if not 0.0 < sift_target_grid_coverage <= 1.0:
+        raise ValueError("sift_target_grid_coverage must be in (0, 1]")
+    if hard_max_neighbors is not None and int(hard_max_neighbors) <= 0:
+        raise ValueError("hard_max_neighbors must be >= 1")
+    if group_cost_budget is not None and int(group_cost_budget) <= 0:
+        raise ValueError("group_cost_budget must be >= 1")
+
+    per_center = {}
+    for center in range(num_images):
+        ranked = []
+        detail_masks = {}
+        for detail in candidate_details.get(center, ()):
+            if not detail.get("selection_eligible", True):
+                continue
+            neighbor = int(detail["image_index"])
+            detail_masks[neighbor] = int(detail.get("consistent_grid_mask", 0))
+            geometry_quality, motion_quality = _ordered_motion_quality(
+                detail, motion_target
+            )
+            pair = tuple(sorted((center, neighbor)))
+            sift_tested = pair in sift_pair_quality
+            sift = sift_pair_quality.get(pair, {})
+            if sift_tested:
+                match_support = min(
+                    float(sift.get("matches", 0)) / float(sift_target_matches),
+                    1.0,
+                )
+                grid_support = min(
+                    float(sift.get("grid_coverage_min", 0.0))
+                    / float(sift_target_grid_coverage),
+                    1.0,
+                )
+                sift_support = min(match_support, grid_support)
+                sift_deficit = 1.0 - sift_support
+            else:
+                sift_deficit = 0.0
+            utility = geometry_quality * (
+                1.0 + float(sift_deficit_weight) * sift_deficit
+            )
+            ranked.append(
+                {
+                    "center": center,
+                    "neighbor": neighbor,
+                    "utility": float(utility),
+                    "geometry_quality": float(geometry_quality),
+                    "motion_quality": float(motion_quality),
+                    "sift_deficit": float(sift_deficit),
+                    "sift_tested": bool(sift_tested),
+                    "temporal": "temporal" in detail.get("candidate_sources", ()),
+                }
+            )
+        remaining = list(ranked)
+        ranked = []
+        covered_grid_mask = 0
+        while remaining:
+            best_index = max(
+                range(len(remaining)),
+                key=lambda index: (
+                    remaining[index]["utility"]
+                    * (1.05 if remaining[index]["temporal"] else 1.0)
+                    * (
+                        1.0
+                        + 0.25
+                        * (
+                            int(
+                                detail_masks[remaining[index]["neighbor"]]
+                                & ~covered_grid_mask
+                            ).bit_count()
+                            / max(
+                                int(
+                                    detail_masks[remaining[index]["neighbor"]]
+                                ).bit_count(),
+                                1,
+                            )
+                        )
+                    ),
+                    remaining[index]["motion_quality"],
+                    -remaining[index]["neighbor"],
+                ),
+            )
+            record = remaining.pop(best_index)
+            candidate_mask = detail_masks[record["neighbor"]]
+            new_cells = int(candidate_mask & ~covered_grid_mask).bit_count()
+            total_cells = max(int(candidate_mask).bit_count(), 1)
+            record["marginal_grid_fraction"] = float(new_cells / total_cells)
+            record["selection_priority"] = float(
+                record["utility"]
+                * (1.05 if record["temporal"] else 1.0)
+                * (1.0 + 0.25 * record["marginal_grid_fraction"])
+            )
+            covered_grid_mask |= candidate_mask
+            ranked.append(record)
+        if hard_max_neighbors is not None:
+            ranked = ranked[: int(hard_max_neighbors)]
+        per_center[center] = ranked
+
+    selected = defaultdict(list)
+    selected_records = []
+    selected_group_cost = 0
+    max_rank = max((len(records) for records in per_center.values()), default=0)
+    for rank in range(max_rank):
+        round_records = [
+            records[rank] for records in per_center.values() if rank < len(records)
+        ]
+        round_records.sort(
+            key=lambda item: (
+                -item["selection_priority"],
+                item["center"],
+                item["neighbor"],
+            )
+        )
+        for record in round_records:
+            if len(selected_records) >= neighbor_slot_budget:
+                break
+            center = record["center"]
+            old_neighbor_count = len(selected[center])
+            old_group_cost = (
+                (old_neighbor_count + 1) ** 2 if old_neighbor_count > 0 else 0
+            )
+            new_group_cost = (old_neighbor_count + 2) ** 2
+            incremental_cost = new_group_cost - old_group_cost
+            if (
+                group_cost_budget is not None
+                and selected_group_cost + incremental_cost > int(group_cost_budget)
+            ):
+                continue
+            selected[record["center"]].append(record["neighbor"])
+            selected_records.append(record)
+            selected_group_cost += incremental_cost
+        if len(selected_records) >= neighbor_slot_budget:
+            break
+
+    groups = [
+        [center, *neighbors]
+        for center, neighbors in sorted(selected.items())
+        if neighbors
+    ]
+    neighbor_counts = np.asarray(
+        [len(selected.get(center, ())) for center in range(num_images)],
+        dtype=np.int64,
+    )
+    return groups, {
+        "strategy": "ordered_motion_sift_aware_variable_k",
+        "neighbor_slot_budget": int(neighbor_slot_budget),
+        "selected_neighbor_slots": int(len(selected_records)),
+        "unused_budget": int(max(neighbor_slot_budget - len(selected_records), 0)),
+        "group_cost_proxy": int(selected_group_cost),
+        "group_cost_budget": (
+            int(group_cost_budget) if group_cost_budget is not None else None
+        ),
+        "neighbors": summarize_numeric(neighbor_counts.tolist()),
+        "missing_centers": [
+            int(center) for center in range(num_images) if neighbor_counts[center] == 0
+        ],
+        "hard_max_neighbors": (
+            int(hard_max_neighbors) if hard_max_neighbors is not None else None
+        ),
+        "centers_above_legacy_k": (
+            [
+                int(center)
+                for center in range(num_images)
+                if neighbor_counts[center] > int(legacy_neighbors_per_center)
+            ]
+            if legacy_neighbors_per_center is not None
+            else []
+        ),
+        "centers_exceeding_legacy_k": (
+            int(np.sum(neighbor_counts > int(legacy_neighbors_per_center)))
+            if legacy_neighbors_per_center is not None
+            else 0
+        ),
+        "max_selected_neighbors": (
+            int(neighbor_counts.max()) if neighbor_counts.size else 0
+        ),
+        "motion_target_normalized": float(motion_target),
+        "sift_target_matches": int(sift_target_matches),
+        "sift_target_grid_coverage": float(sift_target_grid_coverage),
+        "sift_deficit_weight": float(sift_deficit_weight),
+        "selected_sift_deficit": summarize_distribution(
+            [record["sift_deficit"] for record in selected_records]
+        ),
+        "selected_sift_tested_neighbor_slots": int(
+            sum(record["sift_tested"] for record in selected_records)
+        ),
+        "selected_sift_untested_neighbor_slots": int(
+            sum(not record["sift_tested"] for record in selected_records)
+        ),
+        "selected_geometry_quality": summarize_distribution(
+            [record["geometry_quality"] for record in selected_records]
+        ),
+        "selected_marginal_grid_fraction": summarize_distribution(
+            [record["marginal_grid_fraction"] for record in selected_records]
+        ),
+        "selected_priority": summarize_distribution(
+            [record["selection_priority"] for record in selected_records]
+        ),
+        "groups": groups,
+    }
 
 
 def summarize_groups(groups, num_images):
@@ -1749,6 +2361,8 @@ def run_vggsfm_prior_tracks(
     tracker_device = tracker_parameter.device
     tracker_dtype = tracker_parameter.dtype
 
+    actual_max_neighbors = max((len(group) - 1 for group in groups), default=0)
+    rank_capacity = max(int(args.neighbors_per_center), actual_max_neighbors)
     neighbor_rank_stats = [
         {
             "rank": rank,
@@ -1764,7 +2378,7 @@ def run_vggsfm_prior_tracks(
             "in_bounds_pass": 0,
             "accepted_observations": 0,
         }
-        for rank in range(1, int(args.neighbors_per_center) + 1)
+        for rank in range(1, rank_capacity + 1)
     ]
     rotation_threshold = getattr(args, "pair_pose_rotation_threshold", None)
     total_neighbor_slots = 0
@@ -2018,6 +2632,7 @@ def run_vggsfm_prior_tracks(
         "num_tracks": len(tracks),
         "num_observations": observations,
         "neighbors_per_center": args.neighbors_per_center,
+        "actual_max_neighbors": int(actual_max_neighbors),
         "group_strategy": args.group_strategy,
         "batching": {
             "configured_batch_size": int(group_batch_size),
@@ -2092,7 +2707,29 @@ def remap_pairs(pairs, old_to_new):
         if ni == nj:
             continue
         remapped.add(tuple(sorted((ni, nj))))
-    return np.asarray(sorted(remapped), dtype=np.int64)
+    return np.asarray(sorted(remapped), dtype=np.int64).reshape(-1, 2)
+
+
+def remap_groups(groups, old_to_new):
+    remapped_groups = []
+    for group in groups:
+        if not group or int(group[0]) not in old_to_new:
+            continue
+        center = old_to_new[int(group[0])]
+        neighbors = []
+        seen = {center}
+        for image_idx in group[1:]:
+            image_idx = int(image_idx)
+            if image_idx not in old_to_new:
+                continue
+            neighbor = old_to_new[image_idx]
+            if neighbor in seen:
+                continue
+            seen.add(neighbor)
+            neighbors.append(neighbor)
+        if neighbors:
+            remapped_groups.append([center, *neighbors])
+    return remapped_groups
 
 
 def remap_prior_tracks(tracks, old_to_new):

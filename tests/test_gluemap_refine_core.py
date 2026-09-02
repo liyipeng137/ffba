@@ -365,6 +365,196 @@ def test_track_max_triangulation_angle_degrees():
     assert angle == pytest.approx(90.0)
 
 
+def _ordered_candidate(
+    neighbor,
+    *,
+    overlap=0.8,
+    grid_coverage=0.7,
+    visible_ratio=0.9,
+    motion=0.08,
+    eligible=True,
+    temporal=True,
+):
+    return {
+        "image_index": neighbor,
+        "candidate_sources": ["temporal"] if temporal else ["dino"],
+        "selection_eligible": eligible,
+        "projected_overlap": overlap,
+        "projected_grid_coverage": grid_coverage,
+        "projected_visible_ratio": visible_ratio,
+        "projected_depth_valid_ratio": visible_ratio,
+        "motion_median_normalized": motion,
+    }
+
+
+def test_projected_overlap_candidates_include_ordered_motion_signals():
+    extrinsic = np.zeros((2, 3, 4), dtype=np.float64)
+    extrinsic[:, :3, :3] = np.eye(3)
+    intrinsics = np.repeat(
+        np.array([[[2.0, 0.0, 1.5], [0.0, 2.0, 1.5], [0.0, 0.0, 1.0]]]),
+        2,
+        axis=0,
+    )
+
+    groups, stats, details = ref.build_projected_overlap_groups(
+        pairs=np.array([[0, 1]], dtype=np.int64),
+        extrinsic=extrinsic,
+        intrinsics=intrinsics,
+        depth=np.ones((2, 4, 4), dtype=np.float32),
+        depth_conf=None,
+        retrieval_sim_matrix=np.eye(2, dtype=np.float64),
+        max_neighbors=None,
+        rotation_threshold=30.0,
+        dino_candidates=1,
+        max_samples=16,
+        reprojection_threshold=1.0,
+        temporal_window=1,
+        min_projected_overlap=0.5,
+        min_projected_grid_coverage=0.5,
+        min_projected_visible_ratio=0.5,
+    )
+
+    assert groups == [[0, 1], [1, 0]]
+    assert stats["max_neighbors"] is None
+    assert details[0][0]["motion_median_normalized"] == pytest.approx(0.0)
+    assert details[0][0]["parallax_median_deg"] == pytest.approx(0.0)
+    assert details[0][0]["consistent_grid_mask"].bit_count() == 16
+
+
+def test_ordered_sift_pair_selection_uses_budget_without_ineligible_fill():
+    candidate_details = {
+        0: [
+            _ordered_candidate(1),
+            _ordered_candidate(2, temporal=False),
+            _ordered_candidate(4, eligible=False),
+        ],
+        1: [_ordered_candidate(2), _ordered_candidate(3, temporal=False)],
+        2: [_ordered_candidate(3), _ordered_candidate(4, temporal=False)],
+        3: [_ordered_candidate(4)],
+        4: [],
+    }
+
+    pairs, stats = ref.select_ordered_sift_pairs(
+        candidate_details,
+        num_images=5,
+        pair_budget=5,
+    )
+
+    assert pairs.shape == (5, 2)
+    assert (0, 4) not in {tuple(pair) for pair in pairs.tolist()}
+    assert stats["selected_pairs"] == 5
+    assert stats["connected_components"] == 1
+    assert stats["zero_degree_images"] == 0
+
+    budgeted_pairs, budgeted_stats = ref.select_ordered_sift_pairs(
+        candidate_details,
+        num_images=5,
+        pair_budget=2,
+    )
+    assert budgeted_pairs.shape == (2, 2)
+    assert budgeted_stats["backbone_truncated_by_budget"] is True
+
+
+def test_ordered_vggsfm_groups_are_sift_aware_and_variable_k():
+    candidate_details = {
+        0: [
+            _ordered_candidate(1),
+            _ordered_candidate(2),
+            _ordered_candidate(3),
+        ],
+        1: [_ordered_candidate(0)],
+        2: [],
+        3: [],
+    }
+    sift_pair_quality = {
+        (0, 1): {"matches": 512, "grid_coverage_min": 0.8},
+        (0, 2): {"matches": 8, "grid_coverage_min": 0.05},
+    }
+
+    groups, stats = ref.build_ordered_vggsfm_groups(
+        candidate_details,
+        sift_pair_quality,
+        num_images=4,
+        neighbor_slot_budget=4,
+        sift_deficit_weight=1.0,
+        hard_max_neighbors=3,
+        legacy_neighbors_per_center=1,
+    )
+
+    groups_by_center = {group[0]: group[1:] for group in groups}
+    assert groups_by_center[0][0] == 2
+    assert len(groups_by_center[0]) == 3
+    assert stats["selected_neighbor_slots"] == 4
+    assert stats["centers_exceeding_legacy_k"] == 1
+    assert stats["max_selected_neighbors"] == 3
+
+    cost_limited_groups, cost_limited_stats = ref.build_ordered_vggsfm_groups(
+        candidate_details,
+        sift_pair_quality,
+        num_images=4,
+        neighbor_slot_budget=4,
+        sift_deficit_weight=1.0,
+        hard_max_neighbors=3,
+        legacy_neighbors_per_center=1,
+        group_cost_budget=13,
+    )
+    assert sum(len(group) ** 2 for group in cost_limited_groups) <= 13
+    assert cost_limited_stats["group_cost_proxy"] <= 13
+
+
+def test_sift_pair_quality_prefers_verified_matches(monkeypatch, tmp_path):
+    class FakeDatabase:
+        def read_all_images(self):
+            return [
+                SimpleNamespace(image_id=1, name="a.jpg"),
+                SimpleNamespace(image_id=2, name="b.jpg"),
+            ]
+
+        def read_keypoints(self, image_id):
+            del image_id
+            return np.array(
+                [[0.5, 0.5, 1.0, 0.0], [4.5, 4.5, 1.0, 0.0], [7.5, 7.5, 1.0, 0.0]],
+                dtype=np.float32,
+            )
+
+        def read_all_matches(self):
+            return [42], [np.array([[0, 0], [1, 1], [2, 2]], dtype=np.uint32)]
+
+        def read_two_view_geometry(self, image_id1, image_id2):
+            assert (image_id1, image_id2) == (1, 2)
+            return SimpleNamespace(
+                inlier_matches=np.array([[0, 0], [2, 2]], dtype=np.uint32)
+            )
+
+        def close(self):
+            pass
+
+    database = FakeDatabase()
+    fake_pycolmap = SimpleNamespace(
+        Database=SimpleNamespace(open=lambda _path: database),
+        pair_id_to_image_pair=lambda _pair_id: (1, 2),
+    )
+    monkeypatch.setattr(ref, "_lazy_import_pycolmap", lambda: fake_pycolmap)
+
+    quality = ref.summarize_database_pair_quality(
+        tmp_path / "database.db",
+        ["a.jpg", "b.jpg"],
+        (8, 8),
+    )
+
+    assert quality[(0, 1)]["matches"] == 2
+    assert quality[(0, 1)]["raw_matches"] == 3
+    assert quality[(0, 1)]["grid_coverage_min"] == pytest.approx(2 / 64)
+
+
+def test_remap_groups_drops_removed_centers_and_neighbors():
+    groups = [[0, 1, 2, 3], [1, 0], [2, 0, 3], [3, 2]]
+
+    remapped = ref.remap_groups(groups, {0: 0, 2: 1, 3: 2})
+
+    assert remapped == [[0, 1, 2], [1, 0, 2], [2, 1]]
+
+
 def test_bae_budget_pruning_deletes_selected_track_in_place():
     class FakeReconstruction:
         def __init__(self, points3d, images):
