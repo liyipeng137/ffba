@@ -272,7 +272,7 @@ def parse_args():
     parser.add_argument(
         "--final_bae_huber_delta",
         type=float,
-        default=None,
+        default=2.0,
         help=(
             "Optional BAE Huber delta used only in the final augmented "
             "refinement iteration. When omitted, --bae_huber_delta is used "
