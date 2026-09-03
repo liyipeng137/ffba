@@ -3049,9 +3049,10 @@ def tracks_to_keypoints_and_matches(
     merge_threshold=1e-3,
     match_topology="all_pairs",
 ):
-    if match_topology not in {"all_pairs", "star"}:
+    if match_topology not in {"all_pairs", "star", "chain"}:
         raise ValueError(
-            "match_topology must be 'all_pairs' or 'star', " f"got {match_topology!r}"
+            "match_topology must be 'all_pairs', 'star', or 'chain', "
+            f"got {match_topology!r}"
         )
 
     raw_keypoints = [[] for _ in range(num_images)]
@@ -3097,11 +3098,16 @@ def tracks_to_keypoints_and_matches(
                 for a in range(len(obs_indices))
                 for b in range(a + 1, len(obs_indices))
             )
-        else:
+        elif match_topology == "star":
             # Match GlueMap TrackEstablishment's star-style prior: each
             # tracker group emits correspondences between the center view
             # (first observation) and each visible neighbor.
             index_pairs = ((0, b) for b in range(1, len(obs_indices)))
+        else:
+            # Ordered tracks already encode their strongest local evidence in
+            # consecutive observations.  A chain avoids inventing long-range
+            # pair matches through transitive closure.
+            index_pairs = ((a, a + 1) for a in range(len(obs_indices) - 1))
         for a, b in index_pairs:
             i, pi = obs_indices[a]
             j, pj = obs_indices[b]

@@ -1,533 +1,231 @@
-# FeedForwardWithBA / MERG3R + GlueMap 主流程说明
+# FeedForwardWithBA：MERG3R + RoMaV2 ordered tracking + GlueMap
 
-本文档以当前主入口 [run_merg3r_gluemap_pipeline.py](run_merg3r_gluemap_pipeline.py) 为准。
+本分支是面向质量实验的 FFBA 管线。Stage A 仍由 Pi3X/MERG3R 提供粗 pose、
+intrinsics 和 depth；Stage B 已将活动的 VGGSfM prior 路径替换为直接使用
+RoMaV2 的有序长轨迹前端。SIFT 保留为独立的补充观测源，后续三角化、过滤和
+GlueMap augmented BA/BAE 维持原流程。
 
-这个项目的目标不是保留原始 MERG3R 或 GlueMap 的独立运行形态，而是把前馈式几何模型、MERG3R 的分块合并能力、GlueMap 的稀疏匹配/三角化能力，以及 BAE bundle adjustment 后端缝合成一个可交付 SfM POD 的主流程。
+当前目标场景是室内和中等范围室外序列，输入必须按文件名排序后具有正确时序。
 
-## 核心思想
-
-主流程分为两大阶段：
+## 管线概览
 
 ```text
-输入图片
+ordered RGB frames
   │
-  ▼
-两阶段图片处理
-  ├─ low images  -> 前馈模型粗估计 pose / intrinsics / depth
-  └─ high images -> 稀疏特征、VGGSfM prior tracks、最终 COLMAP 输出
+  ├─ Stage A: Pi3X/MERG3R
+  │    ├─ coarse poses
+  │    ├─ per-frame intrinsics
+  │    └─ depth / depth confidence
   │
-  ▼
-Stage A: MERG3R coarse geometry
-  ├─ pi3x 前馈预测局部 depth/pose
-  ├─ MERG3R subset split + global alignment
-  ├─ 生成 BA 前 coarse pose / depth / intrinsics
-  └─ 基于 coarse pose 建立共视 pair graph
+  ├─ RoMaV2 low-resolution adjacent pass
+  │    └─ measured image motion
   │
-  ▼
-Stage B: GlueMap-style sparse refinement
-  ├─ SIFT database
-  ├─ VGGSfM prior tracks
-  ├─ prior tracks snap 到 SIFT keypoints
-  ├─ 合并 SIFT + prior track database
-  ├─ 三角化 / track selection / reprojection filtering
-  └─ BAE 或 Ceres bundle adjustment
+  ├─ tracking plan
+  │    ├─ hard adjacent backbone: (i-1) -> i
+  │    ├─ continuity direct anchor
+  │    └─ geometry direct anchor
   │
-  ▼
-refined_gluemap_aba/  # 最终 refined COLMAP model
+  ├─ RoMaV2 high-resolution tracking
+  │    ├─ certainty + ALIKED spatial births
+  │    ├─ capped births + per-cell candidate prefilter
+  │    ├─ accumulated covariance filtering
+  │    ├─ per-frame spatial thinning
+  │    ├─ minimum track length + weak-frame rescue
+  │    └─ direct/sequential consistency refinement
+  │
+  ├─ independent SIFT database on the selected edge graph
+  │
+  └─ GlueMap triangulation/filtering + Ceres or BAE
+       └─ refined COLMAP reconstruction
 ```
 
-Stage A 用前馈模型快速给出全局可用的 coarse 几何；Stage B 不再完全依赖前馈 depth，而是把 coarse pose 作为先验，交给 GlueMap 风格的稀疏特征、prior track 和 BA 流程去生成最终可交付的 SfM 稀疏重建。
+## 设计要点
 
-## 环境准备
-```bash
-conda env create -f env_base.yaml
-pip install trimesh numba "xformers==0.0.32.post1" "git+https://github.com/pypose/pypose.git"
-cd third_party/gluemap && pip install .
-cd third_party/bae && USE_CUDSS=0 python -m pip install --no-build-isolation -v -e .
-# prepare vggsfm_track weights
-```
+### Stage A 仍然被复用
 
-## 当前主入口
+Stage A 不再决定 prior tracker 的固定邻居组，但它不是废弃计算。粗 pose、
+intrinsics 和 depth 会被用于非相邻 direct anchor 的预筛选：
 
-运行示例：
+- 有向 projected overlap；
+- source-grid coverage；
+- depth consistency；
+- 粗 parallax；
+- 后续 BA 的初始化。
 
-```bash
-python run_merg3r_gluemap_pipeline.py  \
-  --dataset /kiri/tmp/Courtroom540/images \
-  --output_dir  /kiri/tmp/Courtroom540/output \
-  --prior_match_topology star \
-  --ba_backend bae \
-  --bae_max_num_iterations 20 \
-  --num_refinement_iterations 2  \
-  --bae_optimize_intrinsics \
-  --bae_robust_loss huber \
-  --bae_huber_delta 1.0 \
-  --filter_reproj_error_threshold 1.0 \
-  --neighbors_per_center 12 \
-  --vggsfm_group_strategy projected_overlap \
-  --vggsfm_group_batch_size 3
+DINO retrieval 不再被此路径强制计算。相邻主干始终存在，因此粗 pose 较差时也
+不会切断时序连续性；Stage A 几何只决定额外 direct edge 是否值得匹配。
 
-# test on 1000 frames
-python run_merg3r_gluemap_pipeline.py    \
-  --dataset /kiri/tmp/Courtroom540/images \  
-  --output_dir  /kiri/tmp/Courtroom540/output_fk/ \
-  --subset_size 200 \
-  --overlap 10 \
-  --prior_match_topology star   \
-  --ba_backend bae   \
-  --bae_max_num_iterations 20 \   
-  --num_refinement_iterations 2  \   
-  --bae_optimize_intrinsics    \
-  --bae_robust_loss huber   \
-  --bae_huber_delta 1.0   \
-  --bae_max_observations  2000000 \
-  --filter_reproj_error_threshold 0.5  \
-  --neighbors_per_center 12   \
-  --select_track_min_support 256  \
-  --vggsfm_group_strategy projected_overlap \   
-  --vggsfm_group_batch_size 3 
-```
+### 实际图像运动，而不是时序软权重
 
-当前主流程固定使用：
+RoMaV2 首先在相邻帧上执行低分辨率 batch matching，测量归一化 median flow。
+tracking plan 使用累计实际运动选择跨度：
 
-```text
-feed-forward model: pi3x
-camera model      : SIMPLE_PINHOLE
-feature database  : SIFT
-prior query source: ALIKED
-group strategy    : ordered_motion
-BA backend        : BAE by default
-```
+- `continuity_direct` 偏向较短的累计运动目标，修复逐帧传播漂移；
+- `geometry_direct` 偏向较大的累计运动目标，并结合 Stage A overlap/parallax；
+- 每个 target 最多各选一个，且两个 anchor 不重复；
+- `max_anchor_gap` 限制目标场景下的最大搜索跨度。
 
-## 输入要求
+旧 `ordered_motion` 中 pose/DINO/时序/depth-overlap 的候选并集和 `1.05x` 时序软
+加权已经退出活动路径。
 
-`--dataset` 指向图片目录：
+### 长 track 的质量控制
 
-```text
-/path/to/images/
-  frame_000000.png
-  frame_000001.png
-  ...
-```
+每一步 RoMaV2 输出 overlap certainty 和 2x2 precision。precision 被转换到当前
+工作图像的像素 covariance 后沿 track 累加：
 
-注意：当前 tensor loading 仍要求进入模型的图片尺寸一致。默认开启的 image pyramid 会对图片做 resize/crop，但输入数据最好本身来自同一序列或同一分辨率规范。
+- 累计 certainty 使用路径上的最小值；
+- 累计 covariance 使用逐步相加；
+- 总 sigma 超过 `roma_max_track_sigma_px` 的 track 会被停止；
+- direct path 只有在与 sequential path 几何一致且 covariance 更低时才替换；
+- 不一致的高置信 direct 证据会提高 observation covariance，使漂移在后续传播
+  时更容易被过滤。
 
-## Stage A: 前馈粗几何
+covariance 当前用于前端筛选、direct path 选择和审计，不直接作为 BA 权重。
 
-代码入口：
+### 空间密度与 thinning
 
-```text
-run_merg3r_coarse_stage()
-```
+新点由 dense certainty 候选和 ALIKED salient points 合并产生。选择器按规则网格
+round-robin，并执行像素半径抑制；候选预筛选也按 cell 分配预算，避免全局
+certainty top-k 在均衡器运行前就删除低纹理区域。传播到 target 后再次按
+certainty、covariance 和 track length 做空间 thinning。
 
-主要步骤：
+为抑制短轨 birth cohort 在场景表面形成块状聚集：
 
-1. 可选构建两阶段图片金字塔。
-2. 加载 low-resolution 图片。
-3. 用 MERG3R 的 sequence split 方式分块。
-4. 用 `pi3x` 对每个 subset 做前馈推理。
-5. 合并并对齐各 subset 的 pose / depth / intrinsics。
-6. 恢复原始图片顺序。
-7. 将 low-resolution intrinsics 映射到 high-resolution 工作图。
-8. 基于 coarse pose 构建 pair graph。
-9. 保存 `pipeline_stage_a_summary.json`。
+- 初始帧可以建立完整主干，后续每帧新生默认最多 `384` 条；
+- birth 使用独立的 `6 px` NMS，而传播 thinning 仍使用 `3 px`；
+- 默认只保留长度至少为 `3` 的 RoMa track；
+- 若严格长度门限会让某帧断开，只按空间均衡方式救回少量长度 `2` 的轨迹，
+  将该帧补到 `16` 个 RoMa observations，不恢复全局短轨洪水。
 
-Stage A 的结果不直接作为最终 SfM 输出。它主要提供：
+上述上限控制的是 RoMa prior；SIFT 仍独立提供纹理角点，不受该门限影响。
 
-- 初始 camera pose；
-- 初始 intrinsics；
-- 原始 dense depth；
-- 用于构建 GlueMap pose groups 的 pair graph；
-- 后续稀疏精修的几何先验。
+RoMa observations 不再强制 snap 到 SIFT keypoints。两个数据库独立写入后再由
+GlueMap 合并，避免 prior 精度被最近邻 SIFT 位置覆盖。
 
-## 两阶段图片处理
+GlueMap 原有 `SelectTrack` 会在 SIFT pair coverage 足够时无条件删除 non-SIFT
+track；本路径将其关闭，否则通过上述质量门限的 RoMa prior 仍会在 BA 前被全部
+清空。RoMa 的数量控制由每帧空间上限和 covariance 筛选负责。
 
-这是后续新增的重要逻辑，位于 [utils/image_pyramid.py](utils/image_pyramid.py)。
+### 匹配拓扑
 
-默认开启：
+RoMa prior 默认以 `chain` 拓扑写入 COLMAP：长 track 只产生相邻 observation
+之间的 pair match，不通过传递闭包凭空创建远跨度 matches。`all_pairs` 和 `star`
+仍保留为实验选项。
+
+### Epipolar verification 的当前作用
+
+每条 RoMa edge 会从 dense field 采样高置信 correspondences，并用 MAGSAC 估计
+fundamental matrix，记录 inlier ratio。它目前只做诊断，不参与 hard rejection，
+因为粗内参、低纹理或近平面场景可能让单一阈值误杀有效 edge。审计结果可用于
+下一轮确定是否按 edge 类型设置门限。
+
+## 环境
 
 ```bash
---image_pyramid
+source /opt/conda/bin/activate
+conda activate gluemap-merg3r
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 ```
 
-作用：
+`expandable_segments` 可减少 181 帧 Stage A 中大块临时张量造成的 CUDA 显存碎片。
 
-- `low images`：在 CPU 内存生成，DINO/Pi3X 按批搬到 GPU；Stage A
-  前馈结束后释放。
-- `high images`：保留在 CPU 内存，供 SIFT、VGGSfM prior tracking、GlueMap
-  refinement 和最终输出按需使用。
-- low/high 中间图片不落盘；`images/` 仍由 `_save_work_images()` 保存一次，供
-  SIFT/pycolmap 和 group audit 使用。
-- `manifest`：记录原图、low 图、high 图之间的 resize/crop/scale 关系。
-- `scale_intrinsics_with_pyramid_records()`：把 Stage A 得到的 low intrinsics
-  映射到 high 图坐标系。
+RoMaV2 源码直接从 `third_party/vidmap/third_party/RoMaV2/src` 导入。首次运行会
+自动下载 `romav2.0.1.pt` 到 Torch Hub checkpoint cache。
 
-相关参数：
+## 运行
+
+质量优先的默认运行：
 
 ```bash
---stage1_downscale_n 4
---stage1_multiple 14
---stage2_scale_factor 0
---image_pyramid_workers 16
+python run_merg3r_gluemap_pipeline.py \
+  --dataset /kiri/ff_data/181/input/181_img_data \
+  --output_dir /kiri/ff_data/181/output/ffba_roma_antispot_v2 \
+  --ba_backend bae
 ```
 
-`--stage2_scale_factor 0` 表示 high 图默认约等于原始尺寸，即使用 `stage1_downscale_n` 作为 low-to-high 放大倍率。
-
-如果要禁用：
+先用少量帧做集成 smoke test：
 
 ```bash
---no-image_pyramid
+python run_merg3r_gluemap_pipeline.py \
+  --dataset /kiri/ff_data/181/input/181_img_data \
+  --output_dir /tmp/ffba_roma_smoke \
+  --num_images 8 \
+  --subset_size 8 \
+  --ba_backend bae
 ```
 
-## Pair Graph
+重要的 RoMa 参数：
 
-Stage A 后会构建用于 GlueMap pose groups 的 pair graph。
+| 参数 | 默认值 | 含义 |
+| --- | ---: | --- |
+| `--roma_lowres_size` | `560` | 相邻运动测量的方形分辨率 |
+| `--roma_lowres_batch_size` | `4` | 低分辨率相邻 pair batch |
+| `--roma_highres_max_size` | `1200` | high-res matching 的最大边 |
+| `--roma_max_keypoints` | `1500` | 每帧传播后的空间 thinning 上限 |
+| `--roma_max_births_per_frame` | `384` | 非初始帧的 RoMa 新生轨迹上限 |
+| `--roma_min_track_length` | `3` | 常规 RoMa track 最短长度 |
+| `--roma_short_track_rescue_min_observations` | `16` | 弱帧短轨安全补点目标；`0` 关闭 |
+| `--roma_aliked_keypoints` | `750` | 每帧加入候选池的 ALIKED 点数 |
+| `--roma_min_confidence` | `0.05` | RoMa overlap certainty 下限 |
+| `--roma_nms_radius` | `3.0` | target thinning 空间抑制半径，像素 |
+| `--roma_birth_nms_radius` | `6.0` | 新生点空间抑制半径，像素 |
+| `--roma_max_track_sigma_px` | `8.0` | 累计 covariance 的 track sigma 上限 |
+| `--roma_max_anchor_gap` | `12` | direct anchor 最大帧跨度 |
+| `--roma_continuity_motion_target` | `0.06` | continuity anchor 累计 flow 目标 |
+| `--roma_geometry_motion_target` | `0.12` | geometry anchor 累计 flow 目标 |
+| `--roma_min_stage_a_overlap` | `0.10` | Stage A direct 候选 overlap 下限 |
+| `--roma_min_stage_a_grid_coverage` | `0.15` | Stage A source-grid coverage 下限 |
+| `--roma_direct_consistency_px` | `4.0` | direct/sequential 最小一致性容差 |
+| `--roma_spatial_grid_size` | `8` | 空间均匀选择的网格边数 |
+| `--roma_spatial_prefilter_oversample` | `8` | 每 cell 候选预筛选倍率 |
+| `--roma_epipolar_diagnostics` | on | 记录 MAGSAC epipolar 统计 |
+| `--prior_match_topology` | `chain` | RoMa prior 写库拓扑 |
 
-默认主要依赖 pose 邻接：
-
-```bash
---pair_k_pose 25
---pair_pose_rotation_threshold 30.0
-```
-
-思想是：前馈模型已经提供 coarse pose，因此后续稀疏匹配不需要完全盲目地 all-pairs，而是在满足 rotation threshold 的候选中，按 camera center 距离优先选择邻居。`pair_k_pose` 是每帧主动选择的上限；候选不足时不补边，也不要求每个 center 都必须有 pair。
-
-## Stage B: GlueMap/SPV 精修
-
-代码入口：
-
-```text
-utils/gluemap_spv_refine.py::run_gluemap_spv_refinement()
-utils/gluemap_refine_core.py
-```
-
-这里 GlueMap 被当作工具包使用，而不是作为独立 CLI 运行。
-
-主要步骤：
-
-1. 保存 high-resolution work images 到 `<output_dir>/images/`。
-2. `ordered_motion` 默认路径从 pose、DINO retrieval 和时序窗口的并集生成候选，用 coarse depth 的有向 overlap、网格覆盖与 motion 过滤候选。
-3. 在旧 pose pair 数量形成的全局预算内选择可变 degree 的 SIFT graph；只选择通过阈值的 pair，不为凑固定 K 补边。
-4. 准备并匹配 SIFT database，统计每个 pair 的 verified match 数和双侧网格覆盖。
-5. 在旧 fixed-K group 的 neighbor-slot 总量内选择独立的 VGGSfM graph；SIFT 已测试但支撑不足的可靠 pair 会得到额外权重，每个 center 的实际邻居数可以不同。
-6. 运行 VGGSfM prior tracking。
-   - tracker coarse fmaps 会优先以 BF16（不支持时 FP16）常驻 GPU，避免每个 pose group 重复从 CPU 搬运；若压缩缓存预计占用超过当前空闲显存的 50%，自动回退到原有 FP32 CPU cache。
-7. 统计 SIFT observations 和 prior track observations，并过滤低覆盖帧。
-8. 导出前馈 depth，完成 intrinsics averaging，将 prior tracks snap 到 SIFT keypoints。
-9. 写出并合并 prior/SIFT databases、coarse COLMAP reconstruction，然后进入 augmented refinement loop。
-
-默认配置：
-
-```text
-SIFT database mode : sift
-VGGSfM query source: aliked
-tracker input      : 1024
-prior topology     : star
-camera model       : SIMPLE_PINHOLE
-```
-
-## Augmented Refinement Loop
-
-精修循环位于：
-
-```text
-utils/gluemap_refine_core.py::run_merg3r_augmented_refinement_loop()
-```
-
-每一轮大致执行：
-
-```text
-seed reconstruction
-  -> triangulation
-  -> select tracks
-  -> reprojection / angular error filtering
-  -> bundle adjustment
-  -> 下一轮继续用优化后的 pose / intrinsics 作为 seed
-```
-
-关键参数：
-
-```bash
---num_refinement_iterations 3
---tri_min_angle 1.0
---tri_create_max_angle_error 0.5
---select_track_min_support 512
---filter_reproj_error_type angular
---filter_reproj_error_threshold 0.5
---augmented_ba_max_filter_iterations 3
---augmented_ba_normalized_reproj_threshold 1e-2
-```
-
-如需仅在最后一轮减弱 Huber 降权、增强中等残差的拟合力度，例如
-三轮分别使用 `delta=1.0 / 1.0 / 2.0`：
-
-```bash
---num_refinement_iterations 3
---bae_robust_loss huber
---bae_huber_delta 1.0
---final_bae_huber_delta 2.0
-```
-
-## BAE 后端
-
-原 GlueMap / pycolmap 路线默认依赖 Ceres solver；当前主流程默认使用 [third_party/bae](third_party/bae) 作为 PyTorch BA 后端：
-
-```bash
---ba_backend bae
-```
-
-BAE 默认参数：
-
-```bash
---bae_max_num_iterations 20
---bae_optimize_intrinsics
---bae_fix_gauge two_cams
---bae_robust_loss huber
---bae_huber_delta 1.0
-```
-
-当前 BAE 路线的设计取舍：
-
-- 使用真实 sparse tracks 做 refinement。
-- 跳过 GlueMap virtual tracks。
-- 用 `two_cams` gauge fixing 模拟 COLMAP/Ceres 的 gauge 约束语义。
-- 可优化 `SIMPLE_PINHOLE` 的 focal，固定 principal point。
-- 对 real-track residual 使用 Huber robust loss。
-- 中间轮不强制重复 post-BA filter，最终轮才保留有效过滤结果。
-
-如果显式使用 Ceres：
-
-```bash
---ba_backend ceres
-```
-
-Ceres 路线会保留 GlueMap 原本更接近 SPV 的 virtual-track 分支：
-
-- 构建 virtual tracks；
-- 初始化 virtual points；
-- 同时维护 real reconstruction 和 virtual reconstruction；
-- 每轮做 virtual track selection / filtering / BA。
-
-因此 README 里的 `SPV` 指的是 GlueMap 原始 virtual-track 思路；当前默认 BAE 主线实际是 `SP real tracks + BAE BA`。
-
-## 这套项目后来新增/改造的逻辑
-
-相对于原始 MERG3R 或原始 GlueMap，当前主流程主要新增了这些部分：
-
-1. **两阶段图片处理**
-   - low 图给前馈模型；
-   - high 图给稀疏特征、VGGSfM prior 和最终输出；
-   - 显式保存 low/high 对应关系和 intrinsics scale。
-
-2. **前馈粗几何到 GlueMap 的桥接**
-   - 把 MERG3R/PI3X 的 coarse pose、intrinsics、depth 整理为 `Merg3rCoarseState`；
-   - 用 coarse pose 建 pose-aware pair graph；
-   - 让 GlueMap 后端从 coarse reconstruction 启动，跳过原始的每帧构建star图推理阶段。
-
-3. **VGGSfM prior tracks + SIFT snap/merge**
-   - 用 ALIKED query point 生成 prior tracks；
-   - 将 prior observations snap 到 SIFT keypoints；
-   - 合并 `database_vggsfm_prior.db` 与 `database_sift.db`。
-
-4. **BAE 替代 Ceres 作为默认 BA 后端**
-   - BAE 位于 `third_party/bae`；
-   - 主流程默认 `--ba_backend bae`；
-   - 保留 `--ba_backend ceres` 作为对照路径。
-
-5. **低覆盖帧过滤**
-   - 统计 SIFT observations 和 prior observations；
-   - 对低于 `--min_frame_observations` 的帧做过滤；
-   - 避免低观测帧破坏后续三角化和 BA。
-
-6. **Depth 导出与后处理接口**
-   - Stage A 的 depth 会导出到 `pred_depth/`；
-   - 后续的 depth correction、TSDF、LingBot depth refine 等脚本可以基于这些输出继续处理；
-   - 这些 dense/depth 后处理不是 `run_merg3r_gluemap_pipeline.py` 主流程的一部分。
-
-7. **项目结构清理**
-   - GlueMap / BAE 作为 `third_party/` 工具包；
-   - 通用函数逐步移到 `utils/`；
-   - 当前主流程只依赖保留下来的 `pi3x_model` / `vggt_omega` feed-forward 代码，其中主入口固定 `pi3x`。
+`--roma_compile` 默认关闭，便于实验迭代；确认输入形状稳定后可显式开启。
 
 ## 主要输出
 
-一次运行的 `<output_dir>` 典型结构：
-
 ```text
-output/
+output_dir/
   pipeline_config.json
   pipeline_stage_a_summary.json
-  refine_stats.json
-
-  image_pyramid/
-    image_pyramid_manifest.json
-
   images/
-    frame_000000.png
-    frame_000001.png
-    ...
-
   pred_depth/
-    depth_npy/
-    depth_u16/
-    depth_vis/
-
+  roma_ordered_tracking/
+    tracking_plan.json
+    track_observations.npz
+  database_roma_prior.db
   database_sift.db
-  database_vggsfm_prior.db
   database_merged.db
-
   coarse/
-    cameras.*
-    images.*
-    points3D.*
-
   refined_gluemap_aba/
-    cameras.*
-    images.*
-    points3D.*
-
-  virtual_gluemap_aba/        # 仅 Ceres / virtual-track 路线可能产生
+  refine_stats.json
 ```
 
-最终交付的 SfM sparse reconstruction 通常看：
+`tracking_plan.json` 包含低分辨率相邻运动、Stage A 几何候选、实际 edge plan、
+sequential/direct/epipolar 统计。`track_observations.npz` 保存每条最终 track 的图像
+索引、像素位置、certainty、covariance 和 observation provenance。
 
-```text
-<output_dir>/refined_gluemap_aba/
-```
+## 验证
 
-只审计 VGGSfM group、同时比较 pose baseline 与 projected-overlap hybrid：
+项目自身测试只收集顶层 `tests/`，避免误收 vendored 项目的独立测试套件：
 
 ```bash
-python run_merg3r_gluemap_pipeline.py \
-  --dataset <images> \
-  --output_dir <output> \
-  --pair_k_pose 25 \
-  --neighbors_per_center 12 \
-  --export_vggsfm_groups_only \
-  --vggsfm_group_audit_strategy both
+PYTHONPATH=. pytest -q tests
 ```
 
-该模式在相同 Stage A 结果上输出：
+当前实现覆盖 planning、空间 round-robin、Stage A geometry 和 chain topology 的
+纯数值测试。完整质量评估应在相同输入上切换回旧分支做 A/B，并至少比较：
 
-```text
-vggsfm_group_audit/
-  pose_k12/
-  projected_overlap_hybrid_k12/
-    groups.json
-    candidate_scores.json
-    labels.csv
-    contact_sheets/
-    groups/
-```
+- 注册帧数、稀疏点数和 observation 数；
+- track length 与累计 sigma 分布；
+- 每帧/每网格覆盖率；
+- triangulation angle 和 reprojection error；
+- 远景与画面边缘的人工检查；
+- sequential/direct edge 的 epipolar inlier ratio。
 
-projected-overlap hybrid 的候选池为 rotation-valid pose pairs 与 DINO
-top-30 的并集；排序使用 low-resolution depth 的有向 round-trip
-reprojection overlap，DINO 只用于候选召回。
+## 当前范围
 
-正式 refinement 使用 projected-overlap group：
-
-```bash
-python run_merg3r_gluemap_pipeline.py \
-  --dataset <images> \
-  --output_dir <output> \
-  --pair_k_pose 25 \
-  --neighbors_per_center 12 \
-  --vggsfm_group_strategy projected_overlap
-```
-
-不传 `--vggsfm_group_strategy` 时默认使用 `ordered_motion`。旧的 `pose` 和
-`projected_overlap` 路径仍可显式选择，用于 A/B 对照；这两个旧路径也会先
-准备 SIFT，但其 pair graph 和 group 选择逻辑不变。
-正式 projected-overlap 路径复用下方四个 `--projected_overlap_*` 参数；
-如果 sequence 阶段未产生 DINO similarity matrix，Stage A 会自动补算一次。
-
-`ordered_motion` 的两个 ratio 默认都是 `1.0`：SIFT pair 数不超过旧 pose
-graph 的 pair 数，VGGSfM neighbor-slot 总数和 group-size 平方和代理成本均不
-超过旧 fixed-K groups。它改变的是预算分配而不是主要网络工作量。`32` 是
-单个 group 的显存安全上限，不是要求填满的 K；候选不足或质量阈值未通过时
-会保留更小的 group。
-
-如果需要 PLY，可用 COLMAP 自带 converter 从 `points3D` 转出。
-
-## 常用参数
-
-| 参数 | 默认 | 说明 |
-| --- | --- | --- |
-| `--dataset` | required | 输入图片目录 |
-| `--output_dir` | required | 输出目录 |
-| `--device` | `cuda` | 推理和 refinement 设备 |
-| `--num_images` | `-1` | 限制图片数量，`-1` 表示全部 |
-| `--subsample` | `1` | 按顺序采样图片 |
-| `--multi_dirs` | off | 递归读取多级图片目录 |
-| `--image_pyramid` | on | 启用 low/high 两阶段图片 |
-| `--stage1_downscale_n` | `4` | low 图相对原图的下采样基数 |
-| `--stage1_multiple` | `14` | low 图裁剪到该倍数 |
-| `--stage2_scale_factor` | `0` | high 图相对 low 图的倍率，`0` 表示使用 `stage1_downscale_n` |
-| `--sequence_type` | `shortest_path` | MERG3R subset 构建方式 |
-| `--subset_size` | `100` | 每个前馈 subset 的图片数 |
-| `--overlap` | `5` | subset 之间的 overlap |
-| `--splitting_type` | `interleave` | subset 内图片组织方式 |
-| `--alignment_type` | `weighted_iterative` | MERG3R subset pose 对齐方式 |
-| `--pair_k_pose` | `25` | 每帧按 coarse pose 选取的邻居数量 |
-| `--pair_pose_rotation_threshold` | `30.0` | pose pair 允许的最大视角差，单位为度 |
-| `--path_tracker` | required in practice | VGGSfM tracker checkpoint |
-| `--neighbors_per_center` | `25` | 旧 `pose`/`projected_overlap` 路径的每组邻居上限；在 `ordered_motion` 中只用于计算等耗时基线预算 |
-| `--vggsfm_group_strategy` | `ordered_motion` | 正式 group 构建策略；可选 `ordered_motion`、`pose` 或 `projected_overlap` |
-| `--vggsfm_group_batch_size` | `2` | 按 `(group_size, query_points)` 分桶后，每次 VGGSfM forward 的 group 数量；尾桶自动降为较小 batch |
-| `--export_vggsfm_groups_only` | off | Stage A 后按 audit strategy 导出 VGGSfM groups、contact sheets、JSON 和人工标签 CSV，然后跳过 tracker/refinement |
-| `--vggsfm_group_audit_strategy` | `pose` | `pose`、`projected_overlap` 或 `both`；仅影响 group audit 提前退出模式 |
-| `--projected_overlap_dino_candidates` | `30` | 每个 center 加入 projected-overlap 候选池的 DINO retrieval 数量 |
-| `--projected_overlap_samples` | `2048` | 每个 center 用于有向几何投影的 low-res depth 规则网格采样上限 |
-| `--projected_overlap_reproj_threshold` | `4.0` | low-res depth round-trip reprojection 一致性阈值，单位为像素 |
-| `--projected_overlap_conf_quantile` | `0.2` | 丢弃每帧最低比例的 depth-confidence 样本 |
-| `--ordered_temporal_window` | `8` | 有序输入中每个 center 向前、向后加入候选池的帧数 |
-| `--ordered_min_projected_overlap` | `0.10` | ordered 候选的最小有向 round-trip overlap；低于阈值不补入图 |
-| `--ordered_min_projected_grid_coverage` | `0.25` | ordered 候选在 source 规则网格上的最小覆盖 |
-| `--ordered_min_projected_visible_ratio` | `0.25` | ordered 候选投影到 target 后的最小可见比例 |
-| `--ordered_motion_target` | `0.08` | motion 得分的目标值，以图像对角线比例表示 |
-| `--ordered_sift_pair_budget_ratio` | `1.0` | SIFT 全局 pair 预算相对旧 pose graph pair 数的比例 |
-| `--ordered_vggsfm_neighbor_budget_ratio` | `1.0` | VGGSfM 全局 neighbor-slot 预算相对旧 fixed-K groups 的比例 |
-| `--ordered_vggsfm_hard_max_neighbors` | `32` | 单 group 显存安全上限；不会为达到该值而补邻居 |
-| `--ordered_sift_target_matches` | `256` | 计算 SIFT pair 支撑不足程度时的 verified match 饱和值 |
-| `--ordered_sift_target_grid_coverage` | `0.5` | 计算 SIFT pair 支撑不足程度时的双侧最小网格覆盖饱和值 |
-| `--ordered_sift_deficit_weight` | `0.5` | VGGSfM 选择时对已测试但 SIFT 支撑不足 pair 的加权强度 |
-| `--vggsfm_query_points` | `1024` | prior tracking query 点数 |
-| `--prior_match_topology` | `star` | prior tracks 写入 pair matches 的拓扑 |
-| `--min_frame_observations` | `10` | 低覆盖帧过滤阈值 |
-| `--ba_backend` | `bae` | `bae` 或 `ceres` |
-| `--bae_max_num_iterations` | `20` | BAE 迭代次数 |
-| `--bae_max_observations` | `0` | 每轮进入 BAE 的 real observation 硬上限；`0` 表示禁用，超限时按质量排序原地删除完整 track |
-| `--bae_fix_gauge` | `two_cams` | BAE gauge fixing 策略 |
-| `--bae_robust_loss` | `huber` | BAE robust loss |
-| `--final_bae_huber_delta` | unset | 仅在 augmented refinement 最后一轮使用的 BAE Huber delta；未设置时每轮均使用 `--bae_huber_delta` |
-| `--num_refinement_iterations` | `3` | augmented refinement 外层轮数 |
-
-## 推荐检查点
-
-运行完成后优先检查：
-
-```text
-pipeline_stage_a_summary.json
-refine_stats.json
-refined_gluemap_aba/
-```
-
-重点看：
-
-- Stage A 是否覆盖了所有图片；
-- pair graph 是否有 `zero_degree_images`；
-- frame filtering 是否丢掉过多帧；
-- SIFT / prior track observations 是否足够；
-- `vggsfm.neighbor_rank_stats` 中第 13～25 名邻居的通过率和有效 observation；
-- `vggsfm.workload.attempted_query_views` 与 `query_track_stats` 的成轨率、track length；
-- `augmented_refinement.final.real_by_source` 中最终 `p_only` / `mixed` 点数；
-- `augmented_refinement.final.angular_errors_by_track_source` 中最终 P 误差；
-- BAE summary 是否收敛；
-- `refined_gluemap_aba` 中的 registered images 和 points3D 数量是否合理。
-
-## 当前边界
-
-- `run_merg3r_gluemap_pipeline.py` 是当前主流程。
-- `run_merg3r_bae_pipeline.py` 是较早的 MERG3R + BAE pipeline，不是当前 README 描述的主路径。
-- `eval/`、旧 README 里的评测命令、旧 `run.sh` 参数不作为当前主流程依据。
-- depth correction、TSDF、LingBot depth refine、hybrid point cloud 等属于 BA 后处理链路，可基于主流程输出继续运行，但不属于本 README 的主流程闭环。
+本版有意暂缓 DINO loop closure、sequential/loop-closure 独立来源图、GeoCalib 和
+view-graph calibration。相机模型仍为 `SIMPLE_PINHOLE`。这些方向适合在当前
+ordered backbone 的质量稳定后分阶段加入，避免同时改变过多误差来源。

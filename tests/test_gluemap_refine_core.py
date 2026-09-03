@@ -616,3 +616,22 @@ def test_bae_budget_pruning_deletes_selected_track_in_place():
         "observations": 2,
     }
     assert set(reconstruction.points3D) == {2, 3}
+
+
+def test_chain_match_topology_only_connects_consecutive_observations():
+    track = [
+        (0, np.array([1.0, 1.0], dtype=np.float32)),
+        (1, np.array([2.0, 1.0], dtype=np.float32)),
+        (3, np.array([4.0, 1.0], dtype=np.float32)),
+        (4, np.array([5.0, 1.0], dtype=np.float32)),
+    ]
+
+    _keypoints, matches, stats = ref.tracks_to_keypoints_and_matches(
+        [track],
+        num_images=5,
+        match_topology="chain",
+    )
+
+    assert set(matches) == {(0, 1), (1, 3), (3, 4)}
+    assert (0, 3) not in matches
+    assert stats["match_topology"] == "chain"

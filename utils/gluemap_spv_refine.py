@@ -15,46 +15,47 @@ from PIL import Image, ImageDraw, ImageOps
 
 from algos.utils import export_prediction_depth_maps
 from utils import gluemap_refine_core as ref
+from utils.roma_ordered_tracks import (
+    RomaOrderedConfig,
+    run_roma_ordered_prior_tracks,
+)
 
 CAMERA_MODEL = "SIMPLE_PINHOLE"
 S_DATABASE_MODE = "sift"
-QUERY_SOURCE = "aliked"
-GROUP_STRATEGY = "ordered_motion"
-TRACK_MODE = "SPV"
-TRACKER_INPUT = "1024"
+PRIOR_TRACKER = "romav2_ordered"
+TRACK_MODE = "SP"
 
 
 @dataclass
 class GluemapSpvRefineConfig:
-    path_tracker: str
     device: str = "cuda"
-    neighbors_per_center: int = 25
-    pair_pose_rotation_threshold: float = 30.0
-    vggsfm_group_strategy: str = GROUP_STRATEGY
-    vggsfm_group_batch_size: int = 2
-    projected_overlap_dino_candidates: int = 30
-    projected_overlap_samples: int = 2048
-    projected_overlap_reproj_threshold: float = 4.0
-    projected_overlap_conf_quantile: float = 0.2
-    ordered_temporal_window: int = 8
-    ordered_min_projected_overlap: float = 0.10
-    ordered_min_projected_grid_coverage: float = 0.25
-    ordered_min_projected_visible_ratio: float = 0.25
-    ordered_motion_target: float = 0.08
-    ordered_sift_pair_budget_ratio: float = 1.0
-    ordered_vggsfm_neighbor_budget_ratio: float = 1.0
-    ordered_vggsfm_hard_max_neighbors: int = 32
-    ordered_sift_target_matches: int = 256
-    ordered_sift_target_grid_coverage: float = 0.5
-    ordered_sift_deficit_weight: float = 0.5
-    vggsfm_query_points: int = 1024
+    roma_compile: bool = False
+    roma_lowres_size: int = 560
+    roma_lowres_batch_size: int = 4
+    roma_highres_max_size: int = 1200
+    roma_max_keypoints: int = 1500
+    roma_max_births_per_frame: int = 384
+    roma_min_track_length: int = 3
+    roma_short_track_rescue_min_observations: int = 16
+    roma_aliked_keypoints: int = 750
     aliked_detection_threshold: float = 0.005
-    vggsfm_vis_threshold: float = 0.5
-    vggsfm_score_threshold: float = 0.0
-    vggsfm_fine_tracking: bool = False
-    prior_snap_threshold: float = 1.0
+    roma_min_confidence: float = 0.05
+    roma_nms_radius: float = 3.0
+    roma_birth_nms_radius: float = 6.0
+    roma_max_track_sigma_px: float = 8.0
+    roma_max_anchor_gap: int = 12
+    roma_continuity_motion_target: float = 0.06
+    roma_geometry_motion_target: float = 0.12
+    roma_min_stage_a_overlap: float = 0.10
+    roma_min_stage_a_grid_coverage: float = 0.15
+    roma_direct_consistency_px: float = 4.0
+    roma_stage_a_samples: int = 512
+    roma_stage_a_depth_rel_threshold: float = 0.15
+    roma_spatial_grid_size: int = 8
+    roma_spatial_prefilter_oversample: int = 8
+    roma_epipolar_diagnostics: bool = True
     prior_keypoint_merge_threshold: float = 1e-3
-    prior_match_topology: str = "all_pairs"
+    prior_match_topology: str = "chain"
     min_frame_observations: int = 10
     ba_backend: str = "ceres"
     ba_max_num_iterations: int = 100
@@ -70,7 +71,6 @@ class GluemapSpvRefineConfig:
     augmented_ba_normalized_reproj_threshold: float = 1e-2
     tri_min_angle: float = 1.0
     tri_create_max_angle_error: float = 0.5
-    select_track_min_support: int = 512
     filter_reproj_error_type: str = "angular"
     filter_reproj_error_threshold: float = 0.5
     virtual_init_angular_error_threshold: float | None = None
@@ -93,29 +93,15 @@ class GluemapSpvRefineResult:
 
 
 def _make_refine_args(config: GluemapSpvRefineConfig):
-    use_virtual_tracks = config.ba_backend == "ceres"
     return SimpleNamespace(
-        path_tracker=config.path_tracker,
-        track_mode="SPV" if use_virtual_tracks else "SP",
-        neighbors_per_center=config.neighbors_per_center,
-        pair_pose_rotation_threshold=config.pair_pose_rotation_threshold,
-        group_strategy=config.vggsfm_group_strategy,
-        vggsfm_group_batch_size=config.vggsfm_group_batch_size,
+        track_mode="SP",
         skip_doppelgangers=True,
         valid_dg_threshold=0.8,
         star_sequential_window=0,
-        build_virtual_tracks=use_virtual_tracks,
+        build_virtual_tracks=False,
         save_virtual_tracks_debug=config.save_virtual_tracks_debug,
-        vggsfm_query_points=config.vggsfm_query_points,
-        vggsfm_query_source=QUERY_SOURCE,
-        vggsfm_tracker_input=TRACKER_INPUT,
-        aliked_detection_threshold=config.aliked_detection_threshold,
-        vggsfm_vis_threshold=config.vggsfm_vis_threshold,
-        vggsfm_score_threshold=config.vggsfm_score_threshold,
-        vggsfm_fine_tracking=config.vggsfm_fine_tracking,
         s_database_mode=S_DATABASE_MODE,
-        prior_snap_to_sift=True,
-        prior_snap_threshold=config.prior_snap_threshold,
+        prior_snap_to_sift=False,
         prior_keep_unsnapped=True,
         prior_keypoint_merge_threshold=config.prior_keypoint_merge_threshold,
         prior_match_topology=config.prior_match_topology,
@@ -139,8 +125,11 @@ def _make_refine_args(config: GluemapSpvRefineConfig):
         ),
         tri_min_angle=config.tri_min_angle,
         tri_create_max_angle_error=config.tri_create_max_angle_error,
-        enable_select_tracks=True,
-        select_track_min_support=config.select_track_min_support,
+        # RoMa tracks have already passed certainty, accumulated-covariance,
+        # spatial-density, and direct-path checks.  GlueMap's legacy
+        # SelectTrack treats every non-SIFT track as disposable once SIFT pair
+        # coverage is high, which would silently remove the entire RoMa prior.
+        enable_select_tracks=False,
         enable_reprojection_filter=True,
         filter_reproj_error_type=config.filter_reproj_error_type,
         filter_reproj_error_threshold=config.filter_reproj_error_threshold,
@@ -580,20 +569,6 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
     ref._ensure_gluemap_imports()
     pycolmap = ref._lazy_import_pycolmap()
     args = _make_refine_args(config)
-    for name, value in (
-        ("ordered_sift_pair_budget_ratio", config.ordered_sift_pair_budget_ratio),
-        (
-            "ordered_vggsfm_neighbor_budget_ratio",
-            config.ordered_vggsfm_neighbor_budget_ratio,
-        ),
-        ("ordered_motion_target", config.ordered_motion_target),
-    ):
-        if float(value) <= 0:
-            raise ValueError(f"{name} must be > 0")
-    if int(config.ordered_vggsfm_hard_max_neighbors) <= 0:
-        raise ValueError("ordered_vggsfm_hard_max_neighbors must be >= 1")
-    if float(config.ordered_sift_deficit_weight) < 0:
-        raise ValueError("ordered_sift_deficit_weight must be >= 0")
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -614,16 +589,13 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
         coarse_state.intrinsic_low, dtype=np.float64
     )
     extrinsic = np.asarray(coarse_state.extrinsic, dtype=np.float64)
-    pairs = np.asarray(coarse_state.pairs, dtype=np.int64)
-    metadata = {"image_size_hw": image_size_hw}
+    stage_a_pairs = np.asarray(coarse_state.pairs, dtype=np.int64)
 
     stats = {
         "track_mode": args.track_mode,
         "camera_model": CAMERA_MODEL,
         "s_database_mode": S_DATABASE_MODE,
-        "vggsfm_query_source": QUERY_SOURCE,
-        "vggsfm_tracker_input": TRACKER_INPUT,
-        "group_strategy": args.group_strategy,
+        "prior_tracker": PRIOR_TRACKER,
         "ba_backend": config.ba_backend,
         "bae_optimize_intrinsics": config.bae_optimize_intrinsics,
         "bae_fix_gauge": config.bae_fix_gauge,
@@ -646,103 +618,69 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
     _debug(
         args,
         "Loaded coarse state: "
-        f"images={len(image_names)}, pairs={pairs.shape[0]}, "
+        f"images={len(image_names)}, stage_a_pairs={stage_a_pairs.shape[0]}, "
         f"high_image_size_hw={image_size_hw}, "
         f"low_image_size_hw={depth_image_size_hw}, "
         f"camera_model={CAMERA_MODEL}",
     )
 
-    legacy_pairs = pairs.copy()
-    candidate_details = None
-    candidate_stats = None
-    tracking_groups = None
-    tracking_group_stats = None
-    if args.group_strategy in {"projected_overlap", "ordered_motion"}:
-        if coarse_state.retrieval_sim_matrix is None:
-            raise ValueError(
-                "retrieval_sim_matrix is required when "
-                f"vggsfm_group_strategy={args.group_strategy!r}"
-            )
-        t0 = time.time()
-        (
-            tracking_groups,
-            candidate_stats,
-            candidate_details,
-        ) = ref.build_projected_overlap_groups(
-            pairs=pairs,
-            extrinsic=extrinsic,
-            intrinsics=initial_intrinsics_low_all,
-            depth=coarse_state.raw_depth,
-            depth_conf=coarse_state.raw_depth_conf,
-            retrieval_sim_matrix=coarse_state.retrieval_sim_matrix,
-            max_neighbors=(
-                None
-                if args.group_strategy == "ordered_motion"
-                else int(args.neighbors_per_center)
-            ),
-            rotation_threshold=float(args.pair_pose_rotation_threshold),
-            dino_candidates=int(config.projected_overlap_dino_candidates),
-            max_samples=int(config.projected_overlap_samples),
-            reprojection_threshold=float(config.projected_overlap_reproj_threshold),
-            confidence_quantile=float(config.projected_overlap_conf_quantile),
-            temporal_window=(
-                int(config.ordered_temporal_window)
-                if args.group_strategy == "ordered_motion"
-                else 0
-            ),
-            min_projected_overlap=(
-                float(config.ordered_min_projected_overlap)
-                if args.group_strategy == "ordered_motion"
-                else 0.0
-            ),
-            min_projected_grid_coverage=(
-                float(config.ordered_min_projected_grid_coverage)
-                if args.group_strategy == "ordered_motion"
-                else 0.0
-            ),
-            min_projected_visible_ratio=(
-                float(config.ordered_min_projected_visible_ratio)
-                if args.group_strategy == "ordered_motion"
-                else 0.0
-            ),
-        )
-        stats["timing"]["vggsfm_group_build"] = time.time() - t0
-        if args.group_strategy == "projected_overlap":
-            tracking_group_stats = candidate_stats
-    elif args.group_strategy != "pose":
-        raise ValueError(
-            "vggsfm_group_strategy must be 'pose', 'projected_overlap', or "
-            "'ordered_motion', "
-            f"got {args.group_strategy!r}"
-        )
-
-    if args.group_strategy == "ordered_motion":
-        sift_pair_budget = max(
-            1,
-            int(
-                round(len(legacy_pairs) * float(config.ordered_sift_pair_budget_ratio))
-            ),
-        )
-        pairs, sift_pair_selection_stats = ref.select_ordered_sift_pairs(
-            candidate_details,
-            len(image_names),
-            sift_pair_budget,
-            motion_target=float(config.ordered_motion_target),
-        )
-        stats["ordered_pair_selection"] = {
-            "candidate_generation": candidate_stats,
-            "sift": sift_pair_selection_stats,
-        }
-        _debug(
-            args,
-            "Selected ordered SIFT graph: "
-            f"legacy_pairs={len(legacy_pairs)}, selected_pairs={len(pairs)}, "
-            f"budget={sift_pair_budget}, "
-            f"components={sift_pair_selection_stats['connected_components']}",
-        )
+    roma_config = RomaOrderedConfig(
+        device=config.device,
+        compile=config.roma_compile,
+        lowres_size=config.roma_lowres_size,
+        lowres_batch_size=config.roma_lowres_batch_size,
+        highres_max_size=config.roma_highres_max_size,
+        max_keypoints=config.roma_max_keypoints,
+        max_births_per_frame=config.roma_max_births_per_frame,
+        min_track_length=config.roma_min_track_length,
+        short_track_rescue_min_observations=(
+            config.roma_short_track_rescue_min_observations
+        ),
+        aliked_keypoints=config.roma_aliked_keypoints,
+        aliked_detection_threshold=config.aliked_detection_threshold,
+        min_confidence=config.roma_min_confidence,
+        nms_radius=config.roma_nms_radius,
+        birth_nms_radius=config.roma_birth_nms_radius,
+        max_track_sigma_px=config.roma_max_track_sigma_px,
+        max_anchor_gap=config.roma_max_anchor_gap,
+        continuity_motion_target=config.roma_continuity_motion_target,
+        geometry_motion_target=config.roma_geometry_motion_target,
+        min_stage_a_overlap=config.roma_min_stage_a_overlap,
+        min_stage_a_grid_coverage=config.roma_min_stage_a_grid_coverage,
+        direct_consistency_px=config.roma_direct_consistency_px,
+        stage_a_samples=config.roma_stage_a_samples,
+        stage_a_depth_rel_threshold=config.roma_stage_a_depth_rel_threshold,
+        spatial_grid_size=config.roma_spatial_grid_size,
+        spatial_prefilter_oversample=(config.roma_spatial_prefilter_oversample),
+        epipolar_diagnostics=config.roma_epipolar_diagnostics,
+    )
+    _debug(
+        args,
+        "Running RoMaV2 ordered tracking: adjacent backbone + dynamic direct edges",
+    )
+    t0 = time.time()
+    roma_result = run_roma_ordered_prior_tracks(
+        coarse_state.high_images,
+        extrinsic,
+        initial_intrinsics_low_all,
+        coarse_state.raw_depth,
+        output_dir,
+        roma_config,
+    )
+    stats["timing"]["roma_ordered_prior_tracks"] = time.time() - t0
+    stats["roma"] = roma_result.stats
+    prior_tracks = roma_result.tracks
+    pairs = roma_result.pairs
+    _debug(
+        args,
+        "RoMaV2 prior done: "
+        f"edges={len(roma_result.plan)}, tracks={len(prior_tracks)}, "
+        f"observations={sum(len(track) for track in prior_tracks)}, "
+        f"time={stats['timing']['roma_ordered_prior_tracks']:.2f}s",
+    )
 
     prefilter_image_names = list(image_names)
-    _debug(args, "Preparing prefilter SIFT database before VGGSfM")
+    _debug(args, "Preparing independent SIFT database on the RoMa edge graph")
     t0 = time.time()
     prefilter_intrinsics_mapping = {idx: 0 for idx in range(len(image_names))}
     features, sift_prefilter_stats = ref.prepare_sift_database_for_refine(
@@ -760,137 +698,6 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
         "prefilter": sift_prefilter_stats,
         "prefilter_database_ready": True,
     }
-
-    if args.group_strategy == "ordered_motion":
-        t0 = time.time()
-        sift_pair_quality = ref.summarize_database_pair_quality(
-            output_dir / "database_sift.db",
-            image_names,
-            image_size_hw,
-        )
-        for i, j in pairs.tolist():
-            sift_pair_quality.setdefault(
-                tuple(sorted((int(i), int(j)))),
-                {"matches": 0, "grid_coverage_min": 0.0},
-            )
-        centers = ref.camera_centers_from_w2c(extrinsic)
-        viewing_axes = ref.camera_viewing_axes_from_w2c(extrinsic)
-        legacy_groups, _ = ref.build_vggsfm_groups(
-            args,
-            legacy_pairs,
-            len(image_names),
-            image_names,
-            image_size_hw,
-            centers=centers,
-            viewing_axes=viewing_axes,
-        )
-        legacy_neighbor_slots = sum(len(group) - 1 for group in legacy_groups)
-        legacy_group_cost = sum(len(group) ** 2 for group in legacy_groups)
-        vggsfm_budget_ratio = float(config.ordered_vggsfm_neighbor_budget_ratio)
-        neighbor_slot_budget = max(
-            1,
-            int(round(legacy_neighbor_slots * vggsfm_budget_ratio)),
-        )
-        group_cost_budget = max(
-            1,
-            int(round(legacy_group_cost * vggsfm_budget_ratio)),
-        )
-        tracking_groups, tracking_group_stats = ref.build_ordered_vggsfm_groups(
-            candidate_details,
-            sift_pair_quality,
-            len(image_names),
-            neighbor_slot_budget,
-            motion_target=float(config.ordered_motion_target),
-            sift_target_matches=int(config.ordered_sift_target_matches),
-            sift_target_grid_coverage=float(config.ordered_sift_target_grid_coverage),
-            sift_deficit_weight=float(config.ordered_sift_deficit_weight),
-            hard_max_neighbors=int(config.ordered_vggsfm_hard_max_neighbors),
-            legacy_neighbors_per_center=int(args.neighbors_per_center),
-            group_cost_budget=group_cost_budget,
-        )
-        tracking_group_stats.update(
-            {
-                "legacy_neighbor_slots": int(legacy_neighbor_slots),
-                "legacy_group_cost_proxy": int(legacy_group_cost),
-                "candidate_generation": candidate_stats,
-                **ref.summarize_groups(tracking_groups, len(image_names)),
-            }
-        )
-        match_values = [quality["matches"] for quality in sift_pair_quality.values()]
-        raw_match_values = [
-            quality.get("raw_matches", 0) for quality in sift_pair_quality.values()
-        ]
-        coverage_values = [
-            quality["grid_coverage_min"] for quality in sift_pair_quality.values()
-        ]
-        stats["s_database"]["prefilter_pair_quality"] = {
-            "tested_pairs": int(len(sift_pair_quality)),
-            "pairs_with_matches": int(
-                sum(quality["matches"] > 0 for quality in sift_pair_quality.values())
-            ),
-            "verified_matches": ref.summarize_distribution(match_values),
-            "raw_matches": ref.summarize_distribution(raw_match_values),
-            "grid_coverage_min": ref.summarize_distribution(coverage_values),
-        }
-        stats["ordered_pair_selection"]["vggsfm"] = tracking_group_stats
-        stats["timing"]["ordered_vggsfm_group_selection"] = time.time() - t0
-
-    _debug(
-        args,
-        "Running VGGSfM prior tracking: "
-        f"group_strategy={args.group_strategy}, "
-        f"group_batch_size={args.vggsfm_group_batch_size}, "
-        f"neighbors_per_center={args.neighbors_per_center}, "
-        f"groups={'auto' if tracking_groups is None else len(tracking_groups)}, "
-        f"query_points={args.vggsfm_query_points}, "
-        f"query_source={QUERY_SOURCE}, tracker_input={TRACKER_INPUT}",
-    )
-    t0 = time.time()
-    prior_tracks, prior_stats = ref.run_vggsfm_prior_tracks(
-        args,
-        coarse_state.high_images,
-        None,
-        pairs,
-        metadata,
-        extrinsic,
-        image_names,
-        groups=tracking_groups,
-        group_stats=tracking_group_stats,
-    )
-    stats["timing"]["vggsfm_prior_tracks"] = time.time() - t0
-    stats["vggsfm"] = prior_stats
-    group_stats = prior_stats["group_stats"]
-    valid_neighbors = group_stats.get("selected_rotation_valid_neighbors")
-    unfiltered_neighbors = group_stats.get("selected_unfiltered_neighbors")
-    neighbor_priority_summary = ""
-    if valid_neighbors is not None and unfiltered_neighbors is not None:
-        neighbor_priority_summary = (
-            f"neighbor_order={group_stats['neighbor_order']}, "
-            f"valid_neighbors_mean={valid_neighbors['mean']:.2f}, "
-            f"unfiltered_neighbors_mean={unfiltered_neighbors['mean']:.2f}, "
-        )
-    workload = prior_stats["workload"]
-    query_track_stats = prior_stats["query_track_stats"]
-    track_length = query_track_stats["track_length"]
-    _debug(
-        args,
-        "VGGSfM prior done: "
-        f"groups={prior_stats['num_groups']}, "
-        f"tracks={prior_stats['num_tracks']}, "
-        f"observations={prior_stats['num_observations']}, "
-        f"{neighbor_priority_summary}"
-        f"attempted_query_views={workload['attempted_query_views']}, "
-        f"forming_track_rate={query_track_stats['forming_track_rate']:.3f}, "
-        f"track_length_median={track_length['median']:.2f}, "
-        f"track_length_p90={track_length['p90']:.2f}, "
-        f"fmap_precompute={prior_stats['precompute_fmaps']['seconds']:.2f}s, "
-        f"fmap_cache={prior_stats['precompute_fmaps']['storage_dtype']}@"
-        f"{prior_stats['precompute_fmaps']['storage_device']}, "
-        f"fmap_resident="
-        f"{prior_stats['precompute_fmaps']['resident_on_tracker_device']}, "
-        f"group_tracking={prior_stats['group_tracking_time']:.2f}s, "
-        f"time={stats['timing']['vggsfm_prior_tracks']:.2f}s",
-    )
 
     s_counts = np.asarray(
         sift_prefilter_stats["observations_per_image"], dtype=np.int64
@@ -946,19 +753,6 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
         )
 
     kept_indices = np.asarray(coverage_stats["kept_indices"], dtype=np.int64)
-    virtual_tracking_groups = None
-    virtual_tracking_group_stats = None
-    if args.group_strategy == "ordered_motion":
-        old_to_new = {
-            int(old_idx): int(new_idx)
-            for new_idx, old_idx in enumerate(kept_indices.tolist())
-        }
-        virtual_tracking_groups = ref.remap_groups(tracking_groups, old_to_new)
-        virtual_tracking_group_stats = {
-            **tracking_group_stats,
-            "after_frame_filtering": True,
-            **ref.summarize_groups(virtual_tracking_groups, len(image_names)),
-        }
     initial_intrinsics_high = initial_intrinsics_high_all[kept_indices]
     initial_intrinsics_low = initial_intrinsics_low_all[kept_indices]
     depth = coarse_state.raw_depth[kept_indices]
@@ -1030,8 +824,8 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
             image_names,
             image_size_hw,
             depth_image_size_hw=depth_image_size_hw,
-            groups=virtual_tracking_groups,
-            group_stats=virtual_tracking_group_stats,
+            groups=None,
+            group_stats=None,
         )
         stats["timing"]["virtual_tracks"] = time.time() - t0
         vt = stats["virtual_tracks"]
@@ -1079,21 +873,21 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
         f"matches={sift_final_stats['num_matches']}",
     )
 
-    _debug(args, "Writing VGGSfM prior database")
+    _debug(args, "Writing RoMaV2 prior database")
     t0 = time.time()
     stats["prior_database"] = ref.write_tracks_database(
-        str(output_dir / "database_vggsfm_prior.db"),
+        str(output_dir / "database_roma_prior.db"),
         image_names,
         image_size_hw,
         intrinsic,
         CAMERA_MODEL,
         prior_tracks,
-        features=features,
-        snap_to_features=True,
-        snap_threshold=args.prior_snap_threshold,
+        features=None,
+        snap_to_features=False,
+        snap_threshold=0.0,
         keep_unsnapped=True,
         merge_threshold=args.prior_keypoint_merge_threshold,
-        snap_target="sift",
+        snap_target="roma_original",
         match_topology=args.prior_match_topology,
     )
     stats["timing"]["write_prior_db"] = time.time() - t0
@@ -1107,15 +901,15 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
         f"pairs={prior_db_stats['num_pairs']}, "
         f"raw_kp={prior_db_stats['keypoint_merge']['raw_total']}, "
         f"merged_kp={prior_db_stats['keypoint_merge']['merged_total']}, "
-        f"snapped={snap_stats['snapped_observations']}",
+        f"snapped={snap_stats.get('snapped_observations', 0)}",
     )
 
     from gluemap.utils.colmap import merge_colmap_databases  # noqa: PLC0415
 
-    _debug(args, "Merging VGGSfM prior and SIFT databases")
+    _debug(args, "Merging RoMaV2 prior and independent SIFT databases")
     t0 = time.time()
     merge_colmap_databases(
-        str(output_dir / "database_vggsfm_prior.db"),
+        str(output_dir / "database_roma_prior.db"),
         str(output_dir / "database_sift.db"),
         str(output_dir / "database_merged.db"),
         primary_features_first=False,

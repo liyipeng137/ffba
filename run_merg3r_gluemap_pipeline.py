@@ -9,10 +9,7 @@ import torch
 
 from algos.alignment import align_extrinsics
 from algos.sequence import create_sequence
-from algos.utils import (
-    get_sim_matrix,
-    restore_predictions_order,
-)
+from algos.utils import restore_predictions_order
 from utils.feedforward import load_model, run_inference_step_by_step
 from utils.image_pyramid import (
     build_two_resolution_image_tensors,
@@ -21,13 +18,10 @@ from utils.image_pyramid import (
 )
 from utils.gluemap_spv_refine import (
     CAMERA_MODEL as PIPELINE_CAMERA_MODEL,
-    GROUP_STRATEGY as PIPELINE_GROUP_STRATEGY,
-    QUERY_SOURCE as PIPELINE_QUERY_SOURCE,
+    PRIOR_TRACKER as PIPELINE_PRIOR_TRACKER,
     S_DATABASE_MODE as PIPELINE_S_DATABASE_MODE,
     TRACK_MODE as PIPELINE_TRACK_MODE,
-    TRACKER_INPUT as PIPELINE_TRACKER_INPUT,
     GluemapSpvRefineConfig,
-    export_vggsfm_groups,
     run_gluemap_spv_refinement,
 )
 
@@ -57,7 +51,7 @@ class Merg3rCoarseState:
 def parse_args():
     parser = argparse.ArgumentParser(
         "Run the integrated Merg3r + GlueMap pipeline with fixed "
-        "pi3x + SIMPLE_PINHOLE + SIFT + ALIKED + configurable groups + SPV."
+        "pi3x + SIMPLE_PINHOLE + RoMaV2 ordered tracks + SIFT + SP refinement."
     )
     parser.add_argument("--dataset", type=str, required=True)
     parser.add_argument("--output_dir", type=str, required=True)
@@ -77,7 +71,7 @@ def parse_args():
         help=(
             "Preprocess the input image directory into in-memory low/high "
             "tensors. Low-res images feed MERG3R; high-res images feed SIFT, "
-            "VGGSfM prior, refinement, and final outputs."
+            "RoMaV2 prior, SIFT, refinement, and final outputs."
         ),
     )
     parser.add_argument("--stage1_downscale_n", type=int, default=4)
@@ -117,125 +111,54 @@ def parse_args():
     parser.add_argument("--pair_k_pose", type=int, default=25)
     parser.add_argument("--pair_pose_rotation_threshold", type=float, default=30.0)
     parser.add_argument(
-        "--path_tracker",
-        type=str,
-        default="/root/.cache/torch/hub/checkpoints/vggsfm_v2_tracker.pt",
+        "--roma_compile", action=argparse.BooleanOptionalAction, default=False
     )
-    parser.add_argument("--neighbors_per_center", type=int, default=25)
+    parser.add_argument("--roma_lowres_size", type=int, default=560)
+    parser.add_argument("--roma_lowres_batch_size", type=int, default=4)
+    parser.add_argument("--roma_highres_max_size", type=int, default=1200)
+    parser.add_argument("--roma_max_keypoints", type=int, default=1500)
+    parser.add_argument("--roma_max_births_per_frame", type=int, default=384)
+    parser.add_argument("--roma_min_track_length", type=int, default=3)
     parser.add_argument(
-        "--vggsfm_group_strategy",
-        type=str,
-        default=PIPELINE_GROUP_STRATEGY,
-        choices=["pose", "projected_overlap", "ordered_motion"],
-        help=(
-            "Group strategy used by formal VGGSfM prior tracking. "
-            "'projected_overlap' ranks the union of rotation-valid pose and "
-            "DINO retrieval candidates using coarse projected overlap. "
-            "'ordered_motion' moves SIFT ahead of VGGSfM and allocates a "
-            "variable number of directed neighbors under a global budget."
-        ),
+        "--roma_short_track_rescue_min_observations", type=int, default=16
     )
-    parser.add_argument(
-        "--vggsfm_group_batch_size",
-        type=int,
-        default=2,
-        help=(
-            "Number of equal-shape VGGSfM groups processed per forward. "
-            "Groups are bucketed by group size and query-point count."
-        ),
-    )
-    parser.add_argument(
-        "--export_vggsfm_groups_only",
-        action="store_true",
-        help=(
-            "Stop after Stage A and export the selected VGGSfM audit groups as "
-            "per-center images, contact sheets, JSON, and a label CSV."
-        ),
-    )
-    parser.add_argument(
-        "--vggsfm_group_audit_strategy",
-        type=str,
-        default="pose",
-        choices=["pose", "projected_overlap", "both"],
-        help=(
-            "Group strategy exported by --export_vggsfm_groups_only. "
-            "'projected_overlap' uses pose-no-fill plus DINO retrieval "
-            "candidates; 'both' also exports the pose baseline."
-        ),
-    )
-    parser.add_argument(
-        "--projected_overlap_dino_candidates",
-        type=int,
-        default=30,
-        help="Per-center DINO candidates added to the projected-overlap pool.",
-    )
-    parser.add_argument(
-        "--projected_overlap_samples",
-        type=int,
-        default=2048,
-        help="Maximum regular-grid source depth samples per center.",
-    )
-    parser.add_argument(
-        "--projected_overlap_reproj_threshold",
-        type=float,
-        default=4.0,
-        help="Round-trip reprojection threshold in low-resolution pixels.",
-    )
-    parser.add_argument(
-        "--projected_overlap_conf_quantile",
-        type=float,
-        default=0.2,
-        help="Drop the lowest source/target depth-confidence quantile.",
-    )
-    parser.add_argument("--ordered_temporal_window", type=int, default=8)
-    parser.add_argument("--ordered_min_projected_overlap", type=float, default=0.10)
-    parser.add_argument(
-        "--ordered_min_projected_grid_coverage", type=float, default=0.25
-    )
-    parser.add_argument(
-        "--ordered_min_projected_visible_ratio", type=float, default=0.25
-    )
-    parser.add_argument("--ordered_motion_target", type=float, default=0.08)
-    parser.add_argument(
-        "--ordered_sift_pair_budget_ratio",
-        type=float,
-        default=1.0,
-        help="Global SIFT pair budget relative to the legacy pose-pair count.",
-    )
-    parser.add_argument(
-        "--ordered_vggsfm_neighbor_budget_ratio",
-        type=float,
-        default=1.0,
-        help=(
-            "Global VGGSfM neighbor-slot budget relative to the legacy "
-            "fixed-K group workload."
-        ),
-    )
-    parser.add_argument(
-        "--ordered_vggsfm_hard_max_neighbors",
-        type=int,
-        default=32,
-        help="Per-group memory safety cap; quality selection itself is variable-K.",
-    )
-    parser.add_argument("--ordered_sift_target_matches", type=int, default=256)
-    parser.add_argument("--ordered_sift_target_grid_coverage", type=float, default=0.5)
-    parser.add_argument("--ordered_sift_deficit_weight", type=float, default=0.5)
-    parser.add_argument("--vggsfm_query_points", type=int, default=1024)
+    parser.add_argument("--roma_aliked_keypoints", type=int, default=750)
     parser.add_argument("--aliked_detection_threshold", type=float, default=0.005)
-    parser.add_argument("--vggsfm_vis_threshold", type=float, default=0.5)
-    parser.add_argument("--vggsfm_score_threshold", type=float, default=0.0)
-    parser.add_argument("--vggsfm_fine_tracking", action="store_true")
-    parser.add_argument("--prior_snap_threshold", type=float, default=1.0)
+    parser.add_argument("--roma_min_confidence", type=float, default=0.05)
+    parser.add_argument("--roma_nms_radius", type=float, default=3.0)
+    parser.add_argument("--roma_birth_nms_radius", type=float, default=6.0)
+    parser.add_argument("--roma_max_track_sigma_px", type=float, default=8.0)
+    parser.add_argument("--roma_max_anchor_gap", type=int, default=12)
+    parser.add_argument("--roma_continuity_motion_target", type=float, default=0.06)
+    parser.add_argument("--roma_geometry_motion_target", type=float, default=0.12)
+    parser.add_argument("--roma_min_stage_a_overlap", type=float, default=0.10)
+    parser.add_argument(
+        "--roma_min_stage_a_grid_coverage", type=float, default=0.15
+    )
+    parser.add_argument("--roma_direct_consistency_px", type=float, default=4.0)
+    parser.add_argument("--roma_stage_a_samples", type=int, default=512)
+    parser.add_argument(
+        "--roma_stage_a_depth_rel_threshold", type=float, default=0.15
+    )
+    parser.add_argument("--roma_spatial_grid_size", type=int, default=8)
+    parser.add_argument(
+        "--roma_spatial_prefilter_oversample", type=int, default=8
+    )
+    parser.add_argument(
+        "--roma_epipolar_diagnostics",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--prior_keypoint_merge_threshold", type=float, default=1e-3)
     parser.add_argument(
         "--prior_match_topology",
         type=str,
-        default="star",
-        choices=["all_pairs", "star"],
+        default="chain",
+        choices=["chain", "all_pairs", "star"],
         help=(
-            "Topology used to convert VGGSfM prior tracks into COLMAP pair "
-            "matches. 'star' writes only center-neighbor correspondences, "
-            "matching GlueMap TrackEstablishment more closely."
+            "Topology used to convert ordered RoMa tracks into COLMAP pair "
+            "matches. 'chain' preserves only consecutive observations and "
+            "avoids transitive long-range closure."
         ),
     )
     parser.add_argument("--min_frame_observations", type=int, default=10)
@@ -323,7 +246,6 @@ def parse_args():
     )
     parser.add_argument("--tri_min_angle", type=float, default=1.0)
     parser.add_argument("--tri_create_max_angle_error", type=float, default=0.5)
-    parser.add_argument("--select_track_min_support", type=int, default=512)
     parser.add_argument(
         "--filter_reproj_error_type",
         type=str,
@@ -530,19 +452,6 @@ def run_merg3r_coarse_stage(args, output_dir):
         retrieval_sim_matrix = retrieval_sim_matrix.numpy().astype(
             np.float32, copy=False
         )
-    if retrieval_sim_matrix is None:
-        print(
-            "[PIPELINE] Computing DINO retrieval matrix for all images before "
-            "feed-forward inference.",
-            flush=True,
-        )
-        retrieval_sim_matrix = (
-            get_sim_matrix(low_images, alpha=args.alpha, device=args.device)
-            .detach()
-            .cpu()
-            .numpy()
-            .astype(np.float32, copy=False)
-        )
     batches = sequence.image_split
     for idx, batch in enumerate(batches):
         batches[idx] = batch.to("cpu")
@@ -636,9 +545,7 @@ def write_stage_a_summary(output_dir, args, state, timing):
             "model": PIPELINE_MODEL,
             "camera_model": PIPELINE_CAMERA_MODEL,
             "s_database_mode": PIPELINE_S_DATABASE_MODE,
-            "vggsfm_query_source": PIPELINE_QUERY_SOURCE,
-            "vggsfm_tracker_input": PIPELINE_TRACKER_INPUT,
-            "group_strategy": args.vggsfm_group_strategy,
+            "prior_tracker": PIPELINE_PRIOR_TRACKER,
             "track_mode": PIPELINE_TRACK_MODE,
         },
         "low_image_names": state.low_image_names,
@@ -696,9 +603,7 @@ def main():
                     "model": PIPELINE_MODEL,
                     "camera_model": PIPELINE_CAMERA_MODEL,
                     "s_database_mode": PIPELINE_S_DATABASE_MODE,
-                    "vggsfm_query_source": PIPELINE_QUERY_SOURCE,
-                    "vggsfm_tracker_input": PIPELINE_TRACKER_INPUT,
-                    "group_strategy": args.vggsfm_group_strategy,
+                    "prior_tracker": PIPELINE_PRIOR_TRACKER,
                     "track_mode": PIPELINE_TRACK_MODE,
                 },
                 "args": vars(args),
@@ -729,71 +634,37 @@ def main():
         f"zero={state.pair_graph_stats['zero_degree_images']}"
     )
 
-    if args.export_vggsfm_groups_only:
-        if args.vggsfm_group_audit_strategy == "both":
-            audit_strategies = ["pose", "projected_overlap"]
-        else:
-            audit_strategies = [args.vggsfm_group_audit_strategy]
-        manifest_paths = []
-        for audit_strategy in audit_strategies:
-            manifest_paths.append(
-                export_vggsfm_groups(
-                    state,
-                    output_dir,
-                    neighbors_per_center=args.neighbors_per_center,
-                    pair_pose_rotation_threshold=(args.pair_pose_rotation_threshold),
-                    num_workers=args.image_pyramid_workers,
-                    selection_strategy=audit_strategy,
-                    retrieval_sim_matrix=state.retrieval_sim_matrix,
-                    projected_overlap_dino_candidates=(
-                        args.projected_overlap_dino_candidates
-                    ),
-                    projected_overlap_samples=args.projected_overlap_samples,
-                    projected_overlap_reproj_threshold=(
-                        args.projected_overlap_reproj_threshold
-                    ),
-                    projected_overlap_conf_quantile=(
-                        args.projected_overlap_conf_quantile
-                    ),
-                )
-            )
-        print(
-            "[PIPELINE] Group export done; refinement was skipped: "
-            f"manifests={[str(path) for path in manifest_paths]}",
-            flush=True,
-        )
-        return
-
     refine_config = GluemapSpvRefineConfig(
-        path_tracker=args.path_tracker,
         device=args.device,
-        neighbors_per_center=args.neighbors_per_center,
-        pair_pose_rotation_threshold=args.pair_pose_rotation_threshold,
-        vggsfm_group_strategy=args.vggsfm_group_strategy,
-        vggsfm_group_batch_size=args.vggsfm_group_batch_size,
-        projected_overlap_dino_candidates=(args.projected_overlap_dino_candidates),
-        projected_overlap_samples=args.projected_overlap_samples,
-        projected_overlap_reproj_threshold=(args.projected_overlap_reproj_threshold),
-        projected_overlap_conf_quantile=args.projected_overlap_conf_quantile,
-        ordered_temporal_window=args.ordered_temporal_window,
-        ordered_min_projected_overlap=args.ordered_min_projected_overlap,
-        ordered_min_projected_grid_coverage=(args.ordered_min_projected_grid_coverage),
-        ordered_min_projected_visible_ratio=(args.ordered_min_projected_visible_ratio),
-        ordered_motion_target=args.ordered_motion_target,
-        ordered_sift_pair_budget_ratio=args.ordered_sift_pair_budget_ratio,
-        ordered_vggsfm_neighbor_budget_ratio=(
-            args.ordered_vggsfm_neighbor_budget_ratio
+        roma_compile=args.roma_compile,
+        roma_lowres_size=args.roma_lowres_size,
+        roma_lowres_batch_size=args.roma_lowres_batch_size,
+        roma_highres_max_size=args.roma_highres_max_size,
+        roma_max_keypoints=args.roma_max_keypoints,
+        roma_max_births_per_frame=args.roma_max_births_per_frame,
+        roma_min_track_length=args.roma_min_track_length,
+        roma_short_track_rescue_min_observations=(
+            args.roma_short_track_rescue_min_observations
         ),
-        ordered_vggsfm_hard_max_neighbors=(args.ordered_vggsfm_hard_max_neighbors),
-        ordered_sift_target_matches=args.ordered_sift_target_matches,
-        ordered_sift_target_grid_coverage=(args.ordered_sift_target_grid_coverage),
-        ordered_sift_deficit_weight=args.ordered_sift_deficit_weight,
-        vggsfm_query_points=args.vggsfm_query_points,
+        roma_aliked_keypoints=args.roma_aliked_keypoints,
         aliked_detection_threshold=args.aliked_detection_threshold,
-        vggsfm_vis_threshold=args.vggsfm_vis_threshold,
-        vggsfm_score_threshold=args.vggsfm_score_threshold,
-        vggsfm_fine_tracking=args.vggsfm_fine_tracking,
-        prior_snap_threshold=args.prior_snap_threshold,
+        roma_min_confidence=args.roma_min_confidence,
+        roma_nms_radius=args.roma_nms_radius,
+        roma_birth_nms_radius=args.roma_birth_nms_radius,
+        roma_max_track_sigma_px=args.roma_max_track_sigma_px,
+        roma_max_anchor_gap=args.roma_max_anchor_gap,
+        roma_continuity_motion_target=args.roma_continuity_motion_target,
+        roma_geometry_motion_target=args.roma_geometry_motion_target,
+        roma_min_stage_a_overlap=args.roma_min_stage_a_overlap,
+        roma_min_stage_a_grid_coverage=args.roma_min_stage_a_grid_coverage,
+        roma_direct_consistency_px=args.roma_direct_consistency_px,
+        roma_stage_a_samples=args.roma_stage_a_samples,
+        roma_stage_a_depth_rel_threshold=(args.roma_stage_a_depth_rel_threshold),
+        roma_spatial_grid_size=args.roma_spatial_grid_size,
+        roma_spatial_prefilter_oversample=(
+            args.roma_spatial_prefilter_oversample
+        ),
+        roma_epipolar_diagnostics=args.roma_epipolar_diagnostics,
         prior_keypoint_merge_threshold=args.prior_keypoint_merge_threshold,
         prior_match_topology=args.prior_match_topology,
         min_frame_observations=args.min_frame_observations,
@@ -813,7 +684,6 @@ def main():
         ),
         tri_min_angle=args.tri_min_angle,
         tri_create_max_angle_error=args.tri_create_max_angle_error,
-        select_track_min_support=args.select_track_min_support,
         filter_reproj_error_type=args.filter_reproj_error_type,
         filter_reproj_error_threshold=args.filter_reproj_error_threshold,
         virtual_init_angular_error_threshold=args.virtual_init_angular_error_threshold,
