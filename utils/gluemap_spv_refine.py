@@ -1,4 +1,5 @@
 import csv
+import gc
 import json
 import os
 import shutil
@@ -9,6 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import torch
 from PIL import Image, ImageDraw, ImageOps
 
 from algos.utils import export_prediction_depth_maps
@@ -46,10 +48,12 @@ class GluemapSpvRefineConfig:
     ba_backend: str = "ceres"
     ba_max_num_iterations: int = 100
     bae_max_num_iterations: int = 20
+    bae_max_observations: int = 0
     bae_optimize_intrinsics: bool = False
     bae_fix_gauge: str = "two_cams"
     bae_robust_loss: str = "none"
     bae_huber_delta: float = 1.0
+    final_bae_huber_delta: float | None = None
     num_refinement_iterations: int = 2
     augmented_ba_max_filter_iterations: int = 3
     augmented_ba_normalized_reproj_threshold: float = 1e-2
@@ -111,10 +115,12 @@ def _make_refine_args(config: GluemapSpvRefineConfig):
         ba_backend=config.ba_backend,
         ba_max_num_iterations=config.ba_max_num_iterations,
         bae_max_num_iterations=config.bae_max_num_iterations,
+        bae_max_observations=config.bae_max_observations,
         bae_optimize_intrinsics=config.bae_optimize_intrinsics,
         bae_fix_gauge=config.bae_fix_gauge,
         bae_robust_loss=config.bae_robust_loss,
         bae_huber_delta=config.bae_huber_delta,
+        final_bae_huber_delta=config.final_bae_huber_delta,
         num_refinement_iterations=config.num_refinement_iterations,
         augmented_ba_max_filter_iterations=(config.augmented_ba_max_filter_iterations),
         augmented_ba_normalized_reproj_threshold=(
@@ -138,6 +144,28 @@ def _make_refine_args(config: GluemapSpvRefineConfig):
 def _debug(args, message):
     if args.debug_print:
         print(f"[PIPELINE-REFINE] {message}", flush=True)
+
+
+def _cuda_memory_snapshot(device):
+    allocated_bytes = int(torch.cuda.memory_allocated(device))
+    reserved_bytes = int(torch.cuda.memory_reserved(device))
+    free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+    return {
+        "allocated_bytes": allocated_bytes,
+        "reserved_bytes": reserved_bytes,
+        "driver_free_bytes": int(free_bytes),
+        "total_bytes": int(total_bytes),
+    }
+
+
+def _format_cuda_memory_snapshot(snapshot):
+    gib = 1024**3
+    return (
+        f"allocated={snapshot['allocated_bytes'] / gib:.2f} GiB, "
+        f"reserved={snapshot['reserved_bytes'] / gib:.2f} GiB, "
+        f"driver_free={snapshot['driver_free_bytes'] / gib:.2f}/"
+        f"{snapshot['total_bytes'] / gib:.2f} GiB"
+    )
 
 
 def _save_one_work_image(item):
@@ -576,6 +604,7 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
         "bae_fix_gauge": config.bae_fix_gauge,
         "bae_robust_loss": config.bae_robust_loss,
         "bae_huber_delta": config.bae_huber_delta,
+        "final_bae_huber_delta": config.final_bae_huber_delta,
         "timing": {"save_work_images": save_work_images_seconds},
         "work_images": {
             "images_dir": str(images_dir),
@@ -937,11 +966,54 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
     )
     stats["timing"]["write_coarse"] = time.time() - t0
 
+    if args.device.startswith("cuda") and torch.cuda.is_available():
+        cuda_device = torch.device(args.device)
+        torch.cuda.synchronize(cuda_device)
+        cuda_memory_before = _cuda_memory_snapshot(cuda_device)
+        print(
+            "[PIPELINE-REFINE] CUDA memory before augmented refinement "
+            f"cleanup: {_format_cuda_memory_snapshot(cuda_memory_before)}",
+            flush=True,
+        )
+        gc_collected = int(gc.collect())
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize(cuda_device)
+        cuda_memory_after = _cuda_memory_snapshot(cuda_device)
+        print(
+            "[PIPELINE-REFINE] CUDA memory after augmented refinement "
+            f"cleanup: {_format_cuda_memory_snapshot(cuda_memory_after)}, "
+            f"gc_collected={gc_collected}",
+            flush=True,
+        )
+        stats["augmented_refinement_cuda_cleanup"] = {
+            "enabled": True,
+            "device": str(cuda_device),
+            "gc_collected": gc_collected,
+            "before": cuda_memory_before,
+            "after": cuda_memory_after,
+            "reserved_bytes_released": int(
+                cuda_memory_before["reserved_bytes"]
+                - cuda_memory_after["reserved_bytes"]
+            ),
+            "driver_free_bytes_gained": int(
+                cuda_memory_after["driver_free_bytes"]
+                - cuda_memory_before["driver_free_bytes"]
+            ),
+        }
+    else:
+        stats["augmented_refinement_cuda_cleanup"] = {
+            "enabled": False,
+            "reason": "CUDA device is not active",
+        }
+
     _debug(
         args,
         "Running augmented refinement: "
         f"iterations={args.num_refinement_iterations}, "
-        f"ba_max_iters={args.ba_max_num_iterations}",
+        f"ba_max_iters={args.ba_max_num_iterations}, "
+        f"filter_reproj_threshold={args.filter_reproj_error_threshold}, "
+        f"bae_huber_delta={args.bae_huber_delta}, "
+        f"final_bae_huber_delta={args.final_bae_huber_delta}",
     )
     t0 = time.time()
     (

@@ -223,6 +223,16 @@ def parse_args():
         help="BAE optimizer iterations when --ba_backend=bae.",
     )
     parser.add_argument(
+        "--bae_max_observations",
+        type=int,
+        default=0,
+        help=(
+            "Maximum real observations passed to each BAE round. Values <= 0 "
+            "disable the budget. When exceeded, whole real tracks are pruned "
+            "in place immediately before BAE; ignored by the Ceres backend."
+        ),
+    )
+    parser.add_argument(
         "--bae_optimize_intrinsics",
         default=True,
         action="store_true",
@@ -258,6 +268,16 @@ def parse_args():
         type=float,
         default=1.0,
         help="Huber delta in pixels when --bae_robust_loss=huber.",
+    )
+    parser.add_argument(
+        "--final_bae_huber_delta",
+        type=float,
+        default=2.0,
+        help=(
+            "Optional BAE Huber delta used only in the final augmented "
+            "refinement iteration. When omitted, --bae_huber_delta is used "
+            "for every iteration."
+        ),
     )
     parser.add_argument("--num_refinement_iterations", type=int, default=3)
     parser.add_argument("--augmented_ba_max_filter_iterations", type=int, default=3)
@@ -732,10 +752,12 @@ def main():
         ba_backend=args.ba_backend,
         ba_max_num_iterations=args.ba_max_num_iterations,
         bae_max_num_iterations=args.bae_max_num_iterations,
+        bae_max_observations=args.bae_max_observations,
         bae_optimize_intrinsics=args.bae_optimize_intrinsics,
         bae_fix_gauge=args.bae_fix_gauge,
         bae_robust_loss=args.bae_robust_loss,
         bae_huber_delta=args.bae_huber_delta,
+        final_bae_huber_delta=args.final_bae_huber_delta,
         num_refinement_iterations=args.num_refinement_iterations,
         augmented_ba_max_filter_iterations=args.augmented_ba_max_filter_iterations,
         augmented_ba_normalized_reproj_threshold=(

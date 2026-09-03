@@ -38,14 +38,23 @@ refined_gluemap_aba/  # 最终 refined COLMAP model
 
 Stage A 用前馈模型快速给出全局可用的 coarse 几何；Stage B 不再完全依赖前馈 depth，而是把 coarse pose 作为先验，交给 GlueMap 风格的稀疏特征、prior track 和 BA 流程去生成最终可交付的 SfM 稀疏重建。
 
+## 环境准备
+```bash
+conda env create -f env_base.yaml
+pip install trimesh numba "xformers==0.0.32.post1" "git+https://github.com/pypose/pypose.git"
+cd third_party/gluemap && pip install .
+cd third_party/bae && USE_CUDSS=0 python -m pip install --no-build-isolation -v -e .
+# prepare vggsfm_track weights
+```
+
 ## 当前主入口
 
 运行示例：
 
 ```bash
 python run_merg3r_gluemap_pipeline.py  \
-  --dataset /kiri/images/ \
-  --output_dir  /kiri/output/ \
+  --dataset /kiri/tmp/Courtroom540/images \
+  --output_dir  /kiri/tmp/Courtroom540/output \
   --prior_match_topology star \
   --ba_backend bae \
   --bae_max_num_iterations 20 \
@@ -54,10 +63,29 @@ python run_merg3r_gluemap_pipeline.py  \
   --bae_robust_loss huber \
   --bae_huber_delta 1.0 \
   --filter_reproj_error_threshold 1.0 \
-  --neighbors_per_center 16 \
-  --no-pair_pose_fill_unfiltered \
+  --neighbors_per_center 12 \
   --vggsfm_group_strategy projected_overlap \
   --vggsfm_group_batch_size 3
+
+# test on 1000 frames
+python run_merg3r_gluemap_pipeline.py    \
+  --dataset /kiri/tmp/Courtroom540/images \  
+  --output_dir  /kiri/tmp/Courtroom540/output_fk/ \
+  --subset_size 200 \
+  --overlap 10 \
+  --prior_match_topology star   \
+  --ba_backend bae   \
+  --bae_max_num_iterations 20 \   
+  --num_refinement_iterations 2  \   
+  --bae_optimize_intrinsics    \
+  --bae_robust_loss huber   \
+  --bae_huber_delta 1.0   \
+  --bae_max_observations  2000000 \
+  --filter_reproj_error_threshold 0.5  \
+  --neighbors_per_center 12   \
+  --select_track_min_support 256  \
+  --vggsfm_group_strategy projected_overlap \   
+  --vggsfm_group_batch_size 3 
 ```
 
 当前主流程固定使用：
@@ -231,6 +259,16 @@ seed reconstruction
 --filter_reproj_error_threshold 0.5
 --augmented_ba_max_filter_iterations 3
 --augmented_ba_normalized_reproj_threshold 1e-2
+```
+
+如需仅在最后一轮减弱 Huber 降权、增强中等残差的拟合力度，例如
+三轮分别使用 `delta=1.0 / 1.0 / 2.0`：
+
+```bash
+--num_refinement_iterations 3
+--bae_robust_loss huber
+--bae_huber_delta 1.0
+--final_bae_huber_delta 2.0
 ```
 
 ## BAE 后端
@@ -442,8 +480,10 @@ python run_merg3r_gluemap_pipeline.py \
 | `--min_frame_observations` | `10` | 低覆盖帧过滤阈值 |
 | `--ba_backend` | `bae` | `bae` 或 `ceres` |
 | `--bae_max_num_iterations` | `20` | BAE 迭代次数 |
+| `--bae_max_observations` | `0` | 每轮进入 BAE 的 real observation 硬上限；`0` 表示禁用，超限时按质量排序原地删除完整 track |
 | `--bae_fix_gauge` | `two_cams` | BAE gauge fixing 策略 |
 | `--bae_robust_loss` | `huber` | BAE robust loss |
+| `--final_bae_huber_delta` | unset | 仅在 augmented refinement 最后一轮使用的 BAE Huber delta；未设置时每轮均使用 `--bae_huber_delta` |
 | `--num_refinement_iterations` | `3` | augmented refinement 外层轮数 |
 
 ## 推荐检查点

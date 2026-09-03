@@ -15,7 +15,7 @@ dependencies = [
     "scipy==1.17.1",
     #"torch==2.4.1",
     #"torchvision==0.19.1",
-    "pycolmap-cuda12==4.0.4",
+    "pycolmap-cuda12==4.1.0",
     "pyceres==2.6",
     "h5py==3.16.0",
     "networkx==3.6.1",
