@@ -17,6 +17,187 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from utils import gluemap_refine_core as ref
 
 
+def test_sift_candidate_pairs_keep_pose_and_add_temporal_recall():
+    combined, stats = ref.build_sift_candidate_pairs(
+        np.array([[0, 1], [2, 1]], dtype=np.int64),
+        num_images=4,
+        temporal_window=2,
+    )
+
+    np.testing.assert_array_equal(
+        combined,
+        np.array(
+            [[0, 1], [0, 2], [1, 2], [1, 3], [2, 3]],
+            dtype=np.int64,
+        ),
+    )
+    assert stats == {
+        "legacy_pose_pair_count": 2,
+        "temporal_pair_count": 5,
+        "temporal_overlap_pair_count": 2,
+        "temporal_new_pair_count": 3,
+        "sift_candidate_pair_count": 5,
+    }
+
+
+def test_sift_grid_coverage_requires_multiple_inliers_per_cell():
+    keypoints = np.array(
+        [
+            [10.0, 10.0],
+            [11.0, 11.0],
+            [60.0, 10.0],
+            [10.0, 60.0],
+            [60.0, 60.0],
+        ]
+    )
+
+    coverage, occupied = ref._grid_coverage_for_matched_keypoints(
+        keypoints,
+        np.arange(5),
+        image_size_hw=(100, 100),
+        grid_size=2,
+        min_inliers_per_cell=2,
+    )
+
+    assert occupied == 1
+    assert coverage == pytest.approx(0.25)
+
+
+def test_sift_first_center_selection_uses_support_and_max_gap():
+    selection = ref.select_sift_first_centers(
+        num_images=6,
+        valid_edges=np.array(
+            [[0, 1], [2, 3], [4, 5]],
+            dtype=np.int64,
+        ),
+        max_center_gap=2,
+    )
+
+    assert selection["selected_centers"] == [0, 2, 4]
+    assert selection["owner"] == [0, 0, 2, 2, 4, 4]
+    assert [frame["reason"] for frame in selection["frames"]] == [
+        "first_frame",
+        "skipped_supported",
+        "max_gap",
+        "skipped_supported",
+        "max_gap",
+        "skipped_supported",
+    ]
+
+
+def test_sift_first_center_selection_promotes_unsupported_frame():
+    selection = ref.select_sift_first_centers(
+        num_images=5,
+        valid_edges=np.array([[0, 1], [3, 4]], dtype=np.int64),
+        max_center_gap=3,
+    )
+
+    assert selection["selected_centers"] == [0, 2, 3]
+    assert selection["owner"] == [0, 0, 2, 3, 3]
+    assert selection["frames"][2]["reason"] == "insufficient_sift_support"
+
+
+def test_sift_schedule_threshold_sweep_reports_predicted_center_count():
+    records = [
+        {
+            "pair": [0, 1],
+            "inlier_count": 100,
+            "source_grid_coverage": 0.20,
+            "target_grid_coverage": 0.20,
+        },
+        {
+            "pair": [2, 3],
+            "inlier_count": 70,
+            "source_grid_coverage": 0.15,
+            "target_grid_coverage": 0.15,
+        },
+    ]
+
+    simulations = ref.simulate_sift_schedule_thresholds(
+        records,
+        num_images=4,
+        max_center_gap=2,
+        inlier_thresholds=(64, 96),
+        coverage_thresholds=(0.15,),
+    )
+
+    assert simulations == [
+        {
+            "min_pair_inliers": 64,
+            "min_grid_coverage": 0.15,
+            "valid_schedule_pair_count": 2,
+            "selected_center_count": 2,
+            "skipped_center_count": 2,
+            "selected_center_ratio": 0.5,
+        },
+        {
+            "min_pair_inliers": 96,
+            "min_grid_coverage": 0.15,
+            "valid_schedule_pair_count": 1,
+            "selected_center_count": 3,
+            "skipped_center_count": 1,
+            "selected_center_ratio": 0.75,
+        },
+    ]
+
+
+def test_three_layer_groups_force_owned_and_bridges_before_projected_fill():
+    details = {
+        0: [
+            {"image_index": 2},
+            {"image_index": 3},
+            {"image_index": 4},
+        ],
+        2: [
+            {"image_index": 1},
+            {"image_index": 5},
+        ],
+        4: [
+            {"image_index": 2},
+            {"image_index": 1},
+            {"image_index": 0},
+        ],
+    }
+
+    groups, stats = ref.build_three_layer_vggsfm_groups(
+        selected_centers=[0, 2, 4],
+        owner=[0, 0, 2, 2, 4, 4],
+        valid_sift_edges=np.array([[0, 1], [0, 2], [2, 3], [2, 4], [4, 5]]),
+        projected_candidate_details=details,
+        num_images=6,
+        max_neighbors=3,
+    )
+
+    assert groups == [
+        [0, 1, 2, 3],
+        [2, 3, 0, 4],
+        [4, 5, 2, 1],
+    ]
+    assert stats["overflow_groups"] == 0
+    assert stats["layer_member_counts"] == {
+        "owned_frame": 3,
+        "adjacent_center_bridge": 4,
+        "projected_overlap_fill": 2,
+    }
+    assert stats["group_records"][0]["member_sources"] == {
+        "1": "owned_frame",
+        "2": "adjacent_center_bridge",
+        "3": "projected_overlap_fill",
+    }
+
+
+def test_three_layer_groups_reject_non_center_owner():
+    with pytest.raises(ValueError, match="Every owner must be a selected center"):
+        ref.build_three_layer_vggsfm_groups(
+            selected_centers=[0, 2],
+            owner=[0, 1, 2],
+            valid_sift_edges=[],
+            projected_candidate_details={},
+            num_images=3,
+            max_neighbors=2,
+        )
+
+
 def test_final_bae_huber_delta_defaults_to_legacy_behavior():
     args = SimpleNamespace(
         bae_huber_delta=1.0,

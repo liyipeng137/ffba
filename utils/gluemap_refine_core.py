@@ -669,6 +669,384 @@ def summarize_database_matches(database_path, image_names):
     }
 
 
+def canonicalize_pair_array(pairs, num_images=None):
+    canonical = set()
+    array = np.asarray(pairs, dtype=np.int64)
+    if array.size == 0:
+        return np.empty((0, 2), dtype=np.int64)
+    for raw_i, raw_j in array.reshape(-1, 2).tolist():
+        i, j = sorted((int(raw_i), int(raw_j)))
+        if i == j:
+            continue
+        if num_images is not None and not (0 <= i < num_images and 0 <= j < num_images):
+            raise ValueError(f"Pair ({i}, {j}) is outside image range [0, {num_images})")
+        canonical.add((i, j))
+    return np.asarray(sorted(canonical), dtype=np.int64).reshape(-1, 2)
+
+
+def build_temporal_pairs(num_images, window):
+    num_images = int(num_images)
+    window = int(window)
+    if num_images < 0:
+        raise ValueError("num_images must be >= 0")
+    if window < 0:
+        raise ValueError("window must be >= 0")
+    pairs = [
+        (i, j)
+        for i in range(num_images)
+        for j in range(i + 1, min(num_images, i + window + 1))
+    ]
+    return np.asarray(pairs, dtype=np.int64).reshape(-1, 2)
+
+
+def build_sift_candidate_pairs(legacy_pose_pairs, num_images, temporal_window):
+    legacy = canonicalize_pair_array(legacy_pose_pairs, num_images=num_images)
+    temporal = build_temporal_pairs(num_images, temporal_window)
+    legacy_set = {tuple(pair) for pair in legacy.tolist()}
+    temporal_set = {tuple(pair) for pair in temporal.tolist()}
+    combined = np.asarray(
+        sorted(legacy_set | temporal_set),
+        dtype=np.int64,
+    ).reshape(-1, 2)
+    return combined, {
+        "legacy_pose_pair_count": int(len(legacy_set)),
+        "temporal_pair_count": int(len(temporal_set)),
+        "temporal_overlap_pair_count": int(len(legacy_set & temporal_set)),
+        "temporal_new_pair_count": int(len(temporal_set - legacy_set)),
+        "sift_candidate_pair_count": int(combined.shape[0]),
+    }
+
+
+def _grid_coverage_for_matched_keypoints(
+    keypoints,
+    matched_indices,
+    image_size_hw,
+    grid_size,
+    min_inliers_per_cell,
+):
+    keypoints = np.asarray(keypoints, dtype=np.float64)
+    matched_indices = np.asarray(matched_indices, dtype=np.int64)
+    height, width = (int(value) for value in image_size_hw)
+    grid_size = int(grid_size)
+    min_inliers_per_cell = int(min_inliers_per_cell)
+    if grid_size <= 0:
+        raise ValueError("grid_size must be >= 1")
+    if min_inliers_per_cell <= 0:
+        raise ValueError("min_inliers_per_cell must be >= 1")
+    if height <= 0 or width <= 0:
+        raise ValueError("image_size_hw must contain positive values")
+    if matched_indices.size == 0 or keypoints.shape[0] == 0:
+        return 0.0, 0
+    valid = (matched_indices >= 0) & (matched_indices < keypoints.shape[0])
+    xy = keypoints[matched_indices[valid], :2]
+    if xy.size == 0:
+        return 0.0, 0
+    finite = np.isfinite(xy).all(axis=1)
+    xy = xy[finite]
+    if xy.size == 0:
+        return 0.0, 0
+    grid_x = np.clip(
+        np.floor(xy[:, 0] * grid_size / width).astype(np.int64),
+        0,
+        grid_size - 1,
+    )
+    grid_y = np.clip(
+        np.floor(xy[:, 1] * grid_size / height).astype(np.int64),
+        0,
+        grid_size - 1,
+    )
+    counts = np.bincount(
+        grid_y * grid_size + grid_x,
+        minlength=grid_size * grid_size,
+    )
+    occupied = int(np.sum(counts >= min_inliers_per_cell))
+    return float(occupied / (grid_size * grid_size)), occupied
+
+
+def analyze_sift_schedule_graph(
+    database_path,
+    image_names,
+    candidate_pairs,
+    image_size_hw,
+    *,
+    legacy_pose_pairs=None,
+    temporal_pairs=None,
+    grid_size=8,
+    min_inliers_per_cell=2,
+    min_pair_inliers=128,
+    min_grid_coverage=0.20,
+):
+    pycolmap = _lazy_import_pycolmap()
+    candidate_pairs = canonicalize_pair_array(
+        candidate_pairs,
+        num_images=len(image_names),
+    )
+    legacy_set = {
+        tuple(pair)
+        for pair in canonicalize_pair_array(
+            legacy_pose_pairs if legacy_pose_pairs is not None else [],
+            num_images=len(image_names),
+        ).tolist()
+    }
+    temporal_set = {
+        tuple(pair)
+        for pair in canonicalize_pair_array(
+            temporal_pairs if temporal_pairs is not None else [],
+            num_images=len(image_names),
+        ).tolist()
+    }
+    min_pair_inliers = int(min_pair_inliers)
+    min_grid_coverage = float(min_grid_coverage)
+    if min_pair_inliers < 0:
+        raise ValueError("min_pair_inliers must be >= 0")
+    if not 0.0 <= min_grid_coverage <= 1.0:
+        raise ValueError("min_grid_coverage must be in [0, 1]")
+
+    database = pycolmap.Database.open(str(database_path))
+    records = []
+    verified_pairs = 0
+    valid_edges = []
+    source_verified = defaultdict(int)
+    source_valid = defaultdict(int)
+    try:
+        database_images = {
+            str(Path(image.name)): image for image in database.read_all_images()
+        }
+        image_ids = []
+        keypoints = []
+        for name in image_names:
+            normalized_name = str(Path(name))
+            image = database_images.get(normalized_name)
+            if image is None:
+                raise ValueError(f"Image {normalized_name!r} is missing from SIFT DB")
+            image_ids.append(int(image.image_id))
+            current = database.read_keypoints(image.image_id)
+            if current is None or len(current) == 0:
+                keypoints.append(np.empty((0, 2), dtype=np.float64))
+            else:
+                keypoints.append(np.asarray(current[:, :2], dtype=np.float64))
+
+        for i, j in candidate_pairs.tolist():
+            pair = (int(i), int(j))
+            sources = []
+            if pair in legacy_set:
+                sources.append("pose")
+            if pair in temporal_set:
+                sources.append("temporal")
+            geometry = database.read_two_view_geometry(image_ids[i], image_ids[j])
+            inlier_matches = getattr(geometry, "inlier_matches", None)
+            if inlier_matches is None:
+                inlier_matches = np.empty((0, 2), dtype=np.int64)
+            else:
+                inlier_matches = np.asarray(inlier_matches, dtype=np.int64).reshape(-1, 2)
+            inlier_count = int(inlier_matches.shape[0])
+            if inlier_count > 0:
+                verified_pairs += 1
+                for source in sources:
+                    source_verified[source] += 1
+
+            source_coverage, source_cells = _grid_coverage_for_matched_keypoints(
+                keypoints[i],
+                inlier_matches[:, 0],
+                image_size_hw,
+                grid_size,
+                min_inliers_per_cell,
+            )
+            target_coverage, target_cells = _grid_coverage_for_matched_keypoints(
+                keypoints[j],
+                inlier_matches[:, 1],
+                image_size_hw,
+                grid_size,
+                min_inliers_per_cell,
+            )
+            valid = bool(
+                inlier_count >= min_pair_inliers
+                and source_coverage >= min_grid_coverage
+                and target_coverage >= min_grid_coverage
+            )
+            if valid:
+                valid_edges.append(pair)
+                for source in sources:
+                    source_valid[source] += 1
+            records.append(
+                {
+                    "pair": [i, j],
+                    "sources": sources,
+                    "inlier_count": inlier_count,
+                    "source_grid_coverage": source_coverage,
+                    "target_grid_coverage": target_coverage,
+                    "source_occupied_cells": source_cells,
+                    "target_occupied_cells": target_cells,
+                    "valid_schedule_edge": valid,
+                }
+            )
+    finally:
+        database.close()
+
+    source_totals = {
+        "pose": int(sum(tuple(pair) in legacy_set for pair in candidate_pairs.tolist())),
+        "temporal": int(
+            sum(tuple(pair) in temporal_set for pair in candidate_pairs.tolist())
+        ),
+    }
+    source_stats = {}
+    for source, total in source_totals.items():
+        verified = int(source_verified[source])
+        valid = int(source_valid[source])
+        source_stats[source] = {
+            "candidate_pairs": total,
+            "verified_pairs": verified,
+            "valid_schedule_pairs": valid,
+            "verified_rate": float(verified / total) if total else 0.0,
+            "valid_rate": float(valid / total) if total else 0.0,
+        }
+    return {
+        "config": {
+            "grid_size": int(grid_size),
+            "min_inliers_per_cell": int(min_inliers_per_cell),
+            "min_pair_inliers": min_pair_inliers,
+            "min_grid_coverage": min_grid_coverage,
+        },
+        "candidate_pair_count": int(candidate_pairs.shape[0]),
+        "verified_pair_count": int(verified_pairs),
+        "valid_schedule_pair_count": int(len(valid_edges)),
+        "valid_edges": [list(edge) for edge in valid_edges],
+        "inlier_count": summarize_distribution(
+            [record["inlier_count"] for record in records]
+        ),
+        "source_grid_coverage": summarize_distribution(
+            [record["source_grid_coverage"] for record in records]
+        ),
+        "target_grid_coverage": summarize_distribution(
+            [record["target_grid_coverage"] for record in records]
+        ),
+        "source_stats": source_stats,
+        "pairs": records,
+    }
+
+
+def select_sift_first_centers(num_images, valid_edges, max_center_gap):
+    num_images = int(num_images)
+    max_center_gap = int(max_center_gap)
+    if num_images < 0:
+        raise ValueError("num_images must be >= 0")
+    if max_center_gap <= 0:
+        raise ValueError("max_center_gap must be >= 1")
+    valid_set = {
+        tuple(pair)
+        for pair in canonicalize_pair_array(
+            valid_edges,
+            num_images=num_images,
+        ).tolist()
+    }
+    if num_images == 0:
+        return {
+            "selected_centers": [],
+            "owner": [],
+            "frames": [],
+            "num_selected": 0,
+            "num_skipped": 0,
+        }
+
+    selected_centers = [0]
+    owner = [None] * num_images
+    owner[0] = 0
+    frames = [
+        {
+            "image_index": 0,
+            "owner": 0,
+            "selected": True,
+            "reason": "first_frame",
+        }
+    ]
+    last_center = 0
+    for image_idx in range(1, num_images):
+        gap = image_idx - last_center
+        supported = tuple(sorted((last_center, image_idx))) in valid_set
+        if gap >= max_center_gap:
+            selected = True
+            reason = "max_gap"
+        elif not supported:
+            selected = True
+            reason = "insufficient_sift_support"
+        else:
+            selected = False
+            reason = "skipped_supported"
+
+        if selected:
+            last_center = image_idx
+            selected_centers.append(image_idx)
+            owner[image_idx] = image_idx
+        else:
+            owner[image_idx] = last_center
+        frames.append(
+            {
+                "image_index": image_idx,
+                "owner": int(owner[image_idx]),
+                "selected": selected,
+                "reason": reason,
+                "supported_by_previous_center": supported,
+            }
+        )
+
+    for image_idx, current_owner in enumerate(owner):
+        if current_owner is None:
+            raise AssertionError(f"Frame {image_idx} has no owner")
+        if image_idx != current_owner:
+            edge = tuple(sorted((image_idx, int(current_owner))))
+            if edge not in valid_set:
+                raise AssertionError(
+                    f"Frame {image_idx} has invalid owner edge {edge}"
+                )
+    return {
+        "selected_centers": selected_centers,
+        "owner": [int(value) for value in owner],
+        "frames": frames,
+        "num_selected": int(len(selected_centers)),
+        "num_skipped": int(num_images - len(selected_centers)),
+    }
+
+
+def simulate_sift_schedule_thresholds(
+    pair_records,
+    num_images,
+    max_center_gap,
+    *,
+    inlier_thresholds=(64, 96, 128),
+    coverage_thresholds=(0.10, 0.15, 0.20),
+):
+    simulations = []
+    for min_inliers in inlier_thresholds:
+        for min_coverage in coverage_thresholds:
+            valid_edges = [
+                record["pair"]
+                for record in pair_records
+                if int(record["inlier_count"]) >= int(min_inliers)
+                and float(record["source_grid_coverage"]) >= float(min_coverage)
+                and float(record["target_grid_coverage"]) >= float(min_coverage)
+            ]
+            selection = select_sift_first_centers(
+                num_images,
+                valid_edges,
+                max_center_gap,
+            )
+            simulations.append(
+                {
+                    "min_pair_inliers": int(min_inliers),
+                    "min_grid_coverage": float(min_coverage),
+                    "valid_schedule_pair_count": int(len(valid_edges)),
+                    "selected_center_count": int(selection["num_selected"]),
+                    "skipped_center_count": int(selection["num_skipped"]),
+                    "selected_center_ratio": (
+                        float(selection["num_selected"] / num_images)
+                        if num_images
+                        else 0.0
+                    ),
+                }
+            )
+    return simulations
+
+
 def prepare_sift_database_for_refine(
     args,
     output_dir,
@@ -1177,6 +1555,7 @@ def build_projected_overlap_groups(
     max_samples=2048,
     reprojection_threshold=4.0,
     confidence_quantile=0.2,
+    selected_centers=None,
 ):
     t_start = time.time()
     extrinsic = np.asarray(extrinsic, dtype=np.float64)
@@ -1231,6 +1610,15 @@ def build_projected_overlap_groups(
         confidence_quantile,
     )
 
+    if selected_centers is None:
+        selected_centers = list(range(num_images))
+    else:
+        selected_centers = [int(center) for center in selected_centers]
+        if len(set(selected_centers)) != len(selected_centers):
+            raise ValueError("selected_centers must not contain duplicates")
+        if any(center < 0 or center >= num_images for center in selected_centers):
+            raise ValueError("selected_centers contains an out-of-range image index")
+
     groups = []
     candidate_details = {}
     candidate_counts = []
@@ -1244,7 +1632,7 @@ def build_projected_overlap_groups(
     selected_both = 0
 
     dino_k = min(int(dino_candidates), max(num_images - 1, 0))
-    for center in range(num_images):
+    for center in selected_centers:
         source = _prepare_projected_overlap_source(
             center,
             sample_xy,
@@ -1351,6 +1739,9 @@ def build_projected_overlap_groups(
         "actual_regular_grid_samples": int(sample_xy.shape[0]),
         "reprojection_threshold_lowres_px": float(reprojection_threshold),
         "depth_confidence_quantile": float(confidence_quantile),
+        "scheduled_centers": selected_centers,
+        "num_scheduled_centers": int(len(selected_centers)),
+        "num_unscheduled_centers": int(num_images - len(selected_centers)),
         "seconds": float(time.time() - t_start),
         "candidate_count": summarize_numeric(candidate_counts),
         "pose_candidate_count": summarize_numeric(pose_candidate_counts),
@@ -1370,6 +1761,125 @@ def build_projected_overlap_groups(
         **summarize_groups(groups, num_images),
     }
     return groups, stats, candidate_details
+
+
+def build_three_layer_vggsfm_groups(
+    selected_centers,
+    owner,
+    valid_sift_edges,
+    projected_candidate_details,
+    num_images,
+    max_neighbors,
+):
+    selected_centers = [int(center) for center in selected_centers]
+    owner = [int(value) for value in owner]
+    num_images = int(num_images)
+    max_neighbors = int(max_neighbors)
+    if len(owner) != num_images:
+        raise ValueError(f"Expected {num_images} owner entries, got {len(owner)}")
+    if max_neighbors <= 0:
+        raise ValueError("max_neighbors must be >= 1")
+    if len(set(selected_centers)) != len(selected_centers):
+        raise ValueError("selected_centers must not contain duplicates")
+    selected_set = set(selected_centers)
+    if any(center < 0 or center >= num_images for center in selected_centers):
+        raise ValueError("selected_centers contains an out-of-range image index")
+    if any(value not in selected_set for value in owner):
+        raise ValueError("Every owner must be a selected center")
+
+    valid_set = {
+        tuple(pair)
+        for pair in canonicalize_pair_array(
+            valid_sift_edges,
+            num_images=num_images,
+        ).tolist()
+    }
+    owned_by_center = defaultdict(list)
+    for image_idx, center in enumerate(owner):
+        if image_idx != center:
+            owned_by_center[center].append(image_idx)
+
+    groups = []
+    group_records = []
+    layer_counts = defaultdict(int)
+    overflow_groups = 0
+    for center_pos, center in enumerate(selected_centers):
+        owned = sorted(set(owned_by_center.get(center, [])))
+        bridges = []
+        adjacent = []
+        if center_pos > 0:
+            adjacent.append(selected_centers[center_pos - 1])
+        if center_pos + 1 < len(selected_centers):
+            adjacent.append(selected_centers[center_pos + 1])
+        for neighbor in adjacent:
+            if tuple(sorted((center, neighbor))) in valid_set and neighbor not in owned:
+                bridges.append(neighbor)
+
+        members = []
+        member_sources = {}
+        for neighbor in owned:
+            if neighbor not in member_sources:
+                members.append(neighbor)
+                member_sources[neighbor] = "owned_frame"
+                layer_counts["owned_frame"] += 1
+        for neighbor in bridges:
+            if neighbor not in member_sources:
+                members.append(neighbor)
+                member_sources[neighbor] = "adjacent_center_bridge"
+                layer_counts["adjacent_center_bridge"] += 1
+
+        forced_count = len(members)
+        remaining = max(0, max_neighbors - forced_count)
+        projected_fill = []
+        details = projected_candidate_details.get(center, [])
+        for detail in details:
+            if remaining <= 0:
+                break
+            neighbor = int(detail["image_index"])
+            if neighbor == center or neighbor in member_sources:
+                continue
+            members.append(neighbor)
+            projected_fill.append(neighbor)
+            member_sources[neighbor] = "projected_overlap_fill"
+            layer_counts["projected_overlap_fill"] += 1
+            remaining -= 1
+
+        overflow = forced_count > max_neighbors
+        overflow_groups += int(overflow)
+        if members:
+            groups.append([center, *members])
+        group_records.append(
+            {
+                "center": center,
+                "owned_frames": owned,
+                "adjacent_bridges": bridges,
+                "projected_overlap_fill": projected_fill,
+                "final_members": members,
+                "member_sources": {
+                    str(neighbor): member_sources[neighbor] for neighbor in members
+                },
+                "forced_neighbor_count": forced_count,
+                "group_size": int(1 + len(members)),
+                "overflow": overflow,
+            }
+        )
+
+    stats = {
+        "strategy": "sift_first_three_layer_projected_overlap",
+        "max_neighbors": max_neighbors,
+        "scheduled_centers": selected_centers,
+        "num_scheduled_centers": int(len(selected_centers)),
+        "num_unscheduled_centers": int(num_images - len(selected_centers)),
+        "layer_member_counts": {
+            "owned_frame": int(layer_counts["owned_frame"]),
+            "adjacent_center_bridge": int(layer_counts["adjacent_center_bridge"]),
+            "projected_overlap_fill": int(layer_counts["projected_overlap_fill"]),
+        },
+        "overflow_groups": int(overflow_groups),
+        "group_records": group_records,
+        **summarize_groups(groups, num_images),
+    }
+    return groups, stats
 
 
 def summarize_groups(groups, num_images):

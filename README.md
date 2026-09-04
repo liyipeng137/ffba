@@ -442,6 +442,47 @@ python run_merg3r_gluemap_pipeline.py \
 正式 projected-overlap 路径复用下方四个 `--projected_overlap_*` 参数；
 如果 sequence 阶段未产生 DINO similarity matrix，Stage A 会自动补算一次。
 
+### SIFT-first Center / Group V1
+
+默认 `--vggsfm_schedule_mode legacy` 保留原有 VGGSfM-first、full-center 执行
+顺序。实验模式：
+
+```text
+sift_first_full
+  先构建一次 SIFT DB
+  SIFT pairs = 旧 pose candidates + local temporal pairs
+  所有帧仍作为 center
+
+sift_first_sparse
+  在 sift_first_full 基础上
+  用 verified SIFT inliers + 双向 grid coverage 抽稀 center
+  group = owned frames + adjacent-center bridges + projected-overlap fill
+```
+
+当前质量基线使用 `neighbors_per_center=16`。目标模式示例：
+
+```bash
+python run_merg3r_gluemap_pipeline.py \
+  --dataset <images> \
+  --output_dir <output> \
+  --prior_match_topology star \
+  --ba_backend bae \
+  --bae_max_num_iterations 20 \
+  --num_refinement_iterations 3 \
+  --bae_optimize_intrinsics \
+  --bae_robust_loss huber \
+  --bae_huber_delta 1.0 \
+  --final_bae_huber_delta 2.0 \
+  --filter_reproj_error_threshold 1.0 \
+  --neighbors_per_center 16 \
+  --vggsfm_group_strategy projected_overlap \
+  --vggsfm_group_batch_size 3 \
+  --vggsfm_schedule_mode sift_first_sparse
+```
+
+SIFT-first 模式额外输出 `vggsfm_schedule.json`，包含 pair 来源、verified
+inlier/coverage、阈值 sweep、center/owner 原因和三层 group provenance。
+
 如果需要 PLY，可用 COLMAP 自带 converter 从 `points3D` 转出。
 
 ## 常用参数
@@ -466,9 +507,16 @@ python run_merg3r_gluemap_pipeline.py \
 | `--pair_k_pose` | `25` | 每帧按 coarse pose 选取的邻居数量 |
 | `--pair_pose_rotation_threshold` | `30.0` | pose pair 允许的最大视角差，单位为度 |
 | `--path_tracker` | required in practice | VGGSfM tracker checkpoint |
-| `--neighbors_per_center` | `25` | 每个 VGGSfM group 的邻居上限；`pose` 策略下 rotation-valid 优先，同层按 camera-center 距离排序 |
+| `--neighbors_per_center` | `16` | 每个 VGGSfM group 的邻居上限；V1 固定质量基线为 16 |
 | `--vggsfm_group_strategy` | `pose` | 正式 VGGSfM tracking 的 group 构建策略；可选 `pose` 或 `projected_overlap` |
 | `--vggsfm_group_batch_size` | `2` | 按 `(group_size, query_points)` 分桶后，每次 VGGSfM forward 的 group 数量；尾桶自动降为较小 batch |
+| `--vggsfm_schedule_mode` | `legacy` | `legacy`、`sift_first_full` 或 `sift_first_sparse` |
+| `--sift_temporal_window` | `2` | SIFT candidate graph 强制加入的时序窗口 |
+| `--sift_schedule_grid_size` | `8` | verified SIFT coverage 网格边数 |
+| `--sift_schedule_min_inliers_per_cell` | `2` | cell 被视为 occupied 的最少 verified inliers |
+| `--sift_schedule_min_pair_inliers` | `128` | valid schedule edge 的最少 verified inliers |
+| `--sift_schedule_min_grid_coverage` | `0.20` | pair 两端最小 grid coverage |
+| `--vggsfm_max_center_gap` | `2` | sparse mode 下 selected centers 最大时序间隔 |
 | `--export_vggsfm_groups_only` | off | Stage A 后按 audit strategy 导出 VGGSfM groups、contact sheets、JSON 和人工标签 CSV，然后跳过 tracker/refinement |
 | `--vggsfm_group_audit_strategy` | `pose` | `pose`、`projected_overlap` 或 `both`；仅影响 group audit 提前退出模式 |
 | `--projected_overlap_dino_candidates` | `30` | 每个 center 加入 projected-overlap 候选池的 DINO retrieval 数量 |

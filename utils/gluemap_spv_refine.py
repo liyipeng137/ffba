@@ -28,7 +28,7 @@ TRACKER_INPUT = "1024"
 class GluemapSpvRefineConfig:
     path_tracker: str
     device: str = "cuda"
-    neighbors_per_center: int = 25
+    neighbors_per_center: int = 16
     pair_pose_rotation_threshold: float = 30.0
     vggsfm_group_strategy: str = GROUP_STRATEGY
     vggsfm_group_batch_size: int = 2
@@ -36,6 +36,13 @@ class GluemapSpvRefineConfig:
     projected_overlap_samples: int = 2048
     projected_overlap_reproj_threshold: float = 4.0
     projected_overlap_conf_quantile: float = 0.2
+    vggsfm_schedule_mode: str = "legacy"
+    sift_temporal_window: int = 2
+    sift_schedule_grid_size: int = 8
+    sift_schedule_min_inliers_per_cell: int = 2
+    sift_schedule_min_pair_inliers: int = 128
+    sift_schedule_min_grid_coverage: float = 0.20
+    vggsfm_max_center_gap: int = 2
     vggsfm_query_points: int = 1024
     aliked_detection_threshold: float = 0.005
     vggsfm_vis_threshold: float = 0.5
@@ -89,6 +96,15 @@ def _make_refine_args(config: GluemapSpvRefineConfig):
         neighbors_per_center=config.neighbors_per_center,
         pair_pose_rotation_threshold=config.pair_pose_rotation_threshold,
         group_strategy=config.vggsfm_group_strategy,
+        vggsfm_schedule_mode=config.vggsfm_schedule_mode,
+        sift_temporal_window=config.sift_temporal_window,
+        sift_schedule_grid_size=config.sift_schedule_grid_size,
+        sift_schedule_min_inliers_per_cell=(
+            config.sift_schedule_min_inliers_per_cell
+        ),
+        sift_schedule_min_pair_inliers=config.sift_schedule_min_pair_inliers,
+        sift_schedule_min_grid_coverage=config.sift_schedule_min_grid_coverage,
+        vggsfm_max_center_gap=config.vggsfm_max_center_gap,
         vggsfm_group_batch_size=config.vggsfm_group_batch_size,
         skip_doppelgangers=True,
         valid_dg_threshold=0.8,
@@ -589,7 +605,31 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
         coarse_state.intrinsic_low, dtype=np.float64
     )
     extrinsic = np.asarray(coarse_state.extrinsic, dtype=np.float64)
-    pairs = np.asarray(coarse_state.pairs, dtype=np.int64)
+    legacy_pose_pairs = ref.canonicalize_pair_array(
+        coarse_state.pairs,
+        num_images=len(image_names),
+    )
+    schedule_mode = str(args.vggsfm_schedule_mode)
+    if schedule_mode not in {"legacy", "sift_first_full", "sift_first_sparse"}:
+        raise ValueError(f"Unsupported vggsfm_schedule_mode: {schedule_mode!r}")
+    if args.sift_temporal_window < 0:
+        raise ValueError("sift_temporal_window must be >= 0")
+    if args.vggsfm_max_center_gap <= 0:
+        raise ValueError("vggsfm_max_center_gap must be >= 1")
+    sift_candidate_pairs, sift_pair_graph_stats = ref.build_sift_candidate_pairs(
+        legacy_pose_pairs,
+        len(image_names),
+        args.sift_temporal_window,
+    )
+    temporal_pairs = ref.build_temporal_pairs(
+        len(image_names),
+        args.sift_temporal_window,
+    )
+    pairs = (
+        legacy_pose_pairs
+        if schedule_mode == "legacy"
+        else sift_candidate_pairs
+    )
     metadata = {"image_size_hw": image_size_hw}
 
     stats = {
@@ -599,6 +639,16 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
         "vggsfm_query_source": QUERY_SOURCE,
         "vggsfm_tracker_input": TRACKER_INPUT,
         "group_strategy": args.group_strategy,
+        "vggsfm_schedule_mode": schedule_mode,
+        "pair_graphs": {
+            **sift_pair_graph_stats,
+            "active_sift_pair_graph": (
+                "legacy_pose_pairs"
+                if schedule_mode == "legacy"
+                else "legacy_pose_pairs_union_temporal"
+            ),
+            "active_sift_pair_count": int(pairs.shape[0]),
+        },
         "ba_backend": config.ba_backend,
         "bae_optimize_intrinsics": config.bae_optimize_intrinsics,
         "bae_fix_gauge": config.bae_fix_gauge,
@@ -627,9 +677,95 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
         f"camera_model={CAMERA_MODEL}",
     )
 
+    prefilter_image_names = list(image_names)
+    prefilter_intrinsics_mapping = {idx: 0 for idx in range(len(image_names))}
+    features = None
+    sift_prefilter_stats = None
+    sift_schedule_stats = None
+    center_selection = {
+        "selected_centers": list(range(len(image_names))),
+        "owner": list(range(len(image_names))),
+        "frames": [
+            {
+                "image_index": idx,
+                "owner": idx,
+                "selected": True,
+                "reason": "full_center_mode",
+            }
+            for idx in range(len(image_names))
+        ],
+        "num_selected": len(image_names),
+        "num_skipped": 0,
+    }
+
+    if schedule_mode != "legacy":
+        _debug(
+            args,
+            "Preparing SIFT database before VGGSfM: "
+            f"mode={schedule_mode}, legacy_pairs={legacy_pose_pairs.shape[0]}, "
+            f"sift_pairs={pairs.shape[0]}, "
+            f"temporal_new={sift_pair_graph_stats['temporal_new_pair_count']}",
+        )
+        t0 = time.time()
+        features, sift_prefilter_stats = ref.prepare_sift_database_for_refine(
+            args,
+            output_dir,
+            output_dir,
+            image_names,
+            pairs,
+            CAMERA_MODEL,
+            prefilter_intrinsics_mapping,
+        )
+        stats["timing"]["prepare_sift_database_prefilter"] = time.time() - t0
+        t0 = time.time()
+        sift_schedule_stats = ref.analyze_sift_schedule_graph(
+            output_dir / "database_sift.db",
+            image_names,
+            pairs,
+            image_size_hw,
+            legacy_pose_pairs=legacy_pose_pairs,
+            temporal_pairs=temporal_pairs,
+            grid_size=args.sift_schedule_grid_size,
+            min_inliers_per_cell=args.sift_schedule_min_inliers_per_cell,
+            min_pair_inliers=args.sift_schedule_min_pair_inliers,
+            min_grid_coverage=args.sift_schedule_min_grid_coverage,
+        )
+        sift_schedule_stats["threshold_sweep"] = (
+            ref.simulate_sift_schedule_thresholds(
+                sift_schedule_stats["pairs"],
+                len(image_names),
+                args.vggsfm_max_center_gap,
+            )
+        )
+        stats["timing"]["sift_schedule_analysis"] = time.time() - t0
+        if schedule_mode == "sift_first_sparse":
+            center_selection = ref.select_sift_first_centers(
+                len(image_names),
+                sift_schedule_stats["valid_edges"],
+                args.vggsfm_max_center_gap,
+            )
+        stats["s_database"] = {
+            "mode": S_DATABASE_MODE,
+            "prefilter": sift_prefilter_stats,
+            "prefilter_database_ready": True,
+        }
+        stats["sift_schedule"] = {
+            key: value
+            for key, value in sift_schedule_stats.items()
+            if key != "pairs"
+        }
+        _debug(
+            args,
+            "SIFT schedule ready: "
+            f"verified={sift_schedule_stats['verified_pair_count']}, "
+            f"valid={sift_schedule_stats['valid_schedule_pair_count']}, "
+            f"centers={center_selection['num_selected']}/{len(image_names)}",
+        )
+
     _debug(
         args,
         "Running VGGSfM prior tracking: "
+        f"schedule_mode={schedule_mode}, "
         f"group_strategy={args.group_strategy}, "
         f"group_batch_size={args.vggsfm_group_batch_size}, "
         f"neighbors_per_center={args.neighbors_per_center}, "
@@ -645,8 +781,12 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
                 "vggsfm_group_strategy='projected_overlap'"
             )
         t0 = time.time()
-        tracking_groups, tracking_group_stats, _ = ref.build_projected_overlap_groups(
-            pairs=pairs,
+        (
+            projected_groups,
+            projected_group_stats,
+            projected_candidate_details,
+        ) = ref.build_projected_overlap_groups(
+            pairs=legacy_pose_pairs,
             extrinsic=extrinsic,
             intrinsics=initial_intrinsics_low_all,
             depth=coarse_state.raw_depth,
@@ -658,7 +798,27 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
             max_samples=int(config.projected_overlap_samples),
             reprojection_threshold=float(config.projected_overlap_reproj_threshold),
             confidence_quantile=float(config.projected_overlap_conf_quantile),
+            selected_centers=(
+                center_selection["selected_centers"]
+                if schedule_mode == "sift_first_sparse"
+                else None
+            ),
         )
+        if schedule_mode == "sift_first_sparse":
+            tracking_groups, tracking_group_stats = (
+                ref.build_three_layer_vggsfm_groups(
+                    center_selection["selected_centers"],
+                    center_selection["owner"],
+                    sift_schedule_stats["valid_edges"],
+                    projected_candidate_details,
+                    len(image_names),
+                    int(args.neighbors_per_center),
+                )
+            )
+            tracking_group_stats["projected_overlap_base"] = projected_group_stats
+        else:
+            tracking_groups = projected_groups
+            tracking_group_stats = projected_group_stats
         stats["timing"]["vggsfm_group_build"] = time.time() - t0
         _debug(
             args,
@@ -671,13 +831,48 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
             "vggsfm_group_strategy must be 'pose' or 'projected_overlap', "
             f"got {args.group_strategy!r}"
         )
+    elif schedule_mode == "sift_first_sparse":
+        raise ValueError(
+            "sift_first_sparse currently requires "
+            "--vggsfm_group_strategy projected_overlap"
+        )
+
+    if schedule_mode != "legacy":
+        schedule_audit = {
+            "mode": schedule_mode,
+            "config": {
+                "sift_temporal_window": int(args.sift_temporal_window),
+                "sift_schedule_grid_size": int(args.sift_schedule_grid_size),
+                "sift_schedule_min_inliers_per_cell": int(
+                    args.sift_schedule_min_inliers_per_cell
+                ),
+                "sift_schedule_min_pair_inliers": int(
+                    args.sift_schedule_min_pair_inliers
+                ),
+                "sift_schedule_min_grid_coverage": float(
+                    args.sift_schedule_min_grid_coverage
+                ),
+                "vggsfm_max_center_gap": int(args.vggsfm_max_center_gap),
+                "neighbors_per_center": int(args.neighbors_per_center),
+            },
+            "pair_graphs": sift_pair_graph_stats,
+            "sift_graph": sift_schedule_stats,
+            "center_selection": center_selection,
+            "groups": tracking_group_stats,
+        }
+        _write_json(output_dir / "vggsfm_schedule.json", schedule_audit)
+        stats["vggsfm_schedule"] = {
+            "path": str(output_dir / "vggsfm_schedule.json"),
+            "selected_centers": center_selection["num_selected"],
+            "skipped_centers": center_selection["num_skipped"],
+        }
 
     t0 = time.time()
     prior_tracks, prior_stats = ref.run_vggsfm_prior_tracks(
         args,
         coarse_state.high_images,
         None,
-        pairs,
+        legacy_pose_pairs,
         metadata,
         extrinsic,
         image_names,
@@ -719,25 +914,25 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
         f"time={stats['timing']['vggsfm_prior_tracks']:.2f}s",
     )
 
-    prefilter_image_names = list(image_names)
-    _debug(args, "Preparing prefilter SIFT database")
-    t0 = time.time()
-    prefilter_intrinsics_mapping = {idx: 0 for idx in range(len(image_names))}
-    features, sift_prefilter_stats = ref.prepare_sift_database_for_refine(
-        args,
-        output_dir,
-        output_dir,
-        image_names,
-        pairs,
-        CAMERA_MODEL,
-        prefilter_intrinsics_mapping,
-    )
-    stats["timing"]["prepare_sift_database_prefilter"] = time.time() - t0
-    stats["s_database"] = {
-        "mode": S_DATABASE_MODE,
-        "prefilter": sift_prefilter_stats,
-        "prefilter_database_ready": True,
-    }
+    if schedule_mode == "legacy":
+        _debug(args, "Preparing prefilter SIFT database after VGGSfM (legacy)")
+        t0 = time.time()
+        features, sift_prefilter_stats = ref.prepare_sift_database_for_refine(
+            args,
+            output_dir,
+            output_dir,
+            image_names,
+            pairs,
+            CAMERA_MODEL,
+            prefilter_intrinsics_mapping,
+        )
+        stats["timing"]["prepare_sift_database_prefilter"] = time.time() - t0
+        stats["timing"]["sift_schedule_analysis"] = 0.0
+        stats["s_database"] = {
+            "mode": S_DATABASE_MODE,
+            "prefilter": sift_prefilter_stats,
+            "prefilter_database_ready": True,
+        }
     s_counts = np.asarray(
         sift_prefilter_stats["observations_per_image"], dtype=np.int64
     )

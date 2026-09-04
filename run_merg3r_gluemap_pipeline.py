@@ -1,4 +1,5 @@
 import argparse
+import gc
 import json
 import time
 from dataclasses import dataclass
@@ -121,7 +122,7 @@ def parse_args():
         type=str,
         default="/root/.cache/torch/hub/checkpoints/vggsfm_v2_tracker.pt",
     )
-    parser.add_argument("--neighbors_per_center", type=int, default=25)
+    parser.add_argument("--neighbors_per_center", type=int, default=16)
     parser.add_argument(
         "--vggsfm_group_strategy",
         type=str,
@@ -142,6 +143,32 @@ def parse_args():
             "Groups are bucketed by group size and query-point count."
         ),
     )
+    parser.add_argument(
+        "--vggsfm_schedule_mode",
+        type=str,
+        default="legacy",
+        choices=["legacy", "sift_first_full", "sift_first_sparse"],
+        help=(
+            "VGGSfM scheduling mode. 'legacy' preserves the old VGGSfM-first "
+            "full-center path; 'sift_first_full' builds SIFT first but keeps all "
+            "centers; 'sift_first_sparse' enables SIFT-gated center thinning and "
+            "three-layer projected-overlap groups."
+        ),
+    )
+    parser.add_argument("--sift_temporal_window", type=int, default=2)
+    parser.add_argument("--sift_schedule_grid_size", type=int, default=8)
+    parser.add_argument(
+        "--sift_schedule_min_inliers_per_cell",
+        type=int,
+        default=2,
+    )
+    parser.add_argument("--sift_schedule_min_pair_inliers", type=int, default=128)
+    parser.add_argument(
+        "--sift_schedule_min_grid_coverage",
+        type=float,
+        default=0.20,
+    )
+    parser.add_argument("--vggsfm_max_center_gap", type=int, default=2)
     parser.add_argument(
         "--export_vggsfm_groups_only",
         action="store_true",
@@ -512,6 +539,14 @@ def run_merg3r_coarse_stage(args, output_dir):
     for idx, batch in enumerate(batches):
         batches[idx] = batch.to("cpu")
 
+    # Sequence construction may run DINO retrieval on CUDA.  Its tensors are
+    # no longer needed once the split and CPU retrieval matrix are retained,
+    # but the caching allocator can otherwise keep several GiB reserved and
+    # fragment the following Pi3X allocation on full-length scenes.
+    gc.collect()
+    if args.device.startswith("cuda"):
+        torch.cuda.empty_cache()
+
     model, _ = load_model(PIPELINE_MODEL, device=args.device)
     sequence.predictions = run_inference_step_by_step(
         model,
@@ -648,6 +683,7 @@ def write_stage_a_summary(output_dir, args, state, timing):
 
 
 def main():
+    pipeline_t_start = time.time()
     args = parse_args()
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError("CUDA is required unless --device cpu is used.")
@@ -664,6 +700,7 @@ def main():
                     "vggsfm_query_source": PIPELINE_QUERY_SOURCE,
                     "vggsfm_tracker_input": PIPELINE_TRACKER_INPUT,
                     "group_strategy": args.vggsfm_group_strategy,
+                    "vggsfm_schedule_mode": args.vggsfm_schedule_mode,
                     "track_mode": PIPELINE_TRACK_MODE,
                 },
                 "args": vars(args),
@@ -736,6 +773,15 @@ def main():
         pair_pose_rotation_threshold=args.pair_pose_rotation_threshold,
         vggsfm_group_strategy=args.vggsfm_group_strategy,
         vggsfm_group_batch_size=args.vggsfm_group_batch_size,
+        vggsfm_schedule_mode=args.vggsfm_schedule_mode,
+        sift_temporal_window=args.sift_temporal_window,
+        sift_schedule_grid_size=args.sift_schedule_grid_size,
+        sift_schedule_min_inliers_per_cell=(
+            args.sift_schedule_min_inliers_per_cell
+        ),
+        sift_schedule_min_pair_inliers=args.sift_schedule_min_pair_inliers,
+        sift_schedule_min_grid_coverage=args.sift_schedule_min_grid_coverage,
+        vggsfm_max_center_gap=args.vggsfm_max_center_gap,
         projected_overlap_dino_candidates=(args.projected_overlap_dino_candidates),
         projected_overlap_samples=args.projected_overlap_samples,
         projected_overlap_reproj_threshold=(args.projected_overlap_reproj_threshold),
@@ -775,10 +821,38 @@ def main():
         work_image_workers=args.image_pyramid_workers,
     )
     refine_result = run_gluemap_spv_refinement(state, output_dir, refine_config)
+    pipeline_summary = {
+        "vggsfm_schedule_mode": args.vggsfm_schedule_mode,
+        "num_input_images": int(state.extrinsic.shape[0]),
+        "num_output_images": int(len(refine_result.image_names)),
+        "num_dropped_images": int(
+            len(refine_result.stats["frame_filtering"]["dropped_indices"])
+        ),
+        "selected_centers": refine_result.stats.get(
+            "vggsfm_schedule",
+            {},
+        ).get("selected_centers", int(state.extrinsic.shape[0])),
+        "timing": {
+            "stage_a_seconds": float(timing["seconds"]),
+            "refinement_seconds": float(refine_result.stats["timing"]["total"]),
+            "end_to_end_seconds": float(time.time() - pipeline_t_start),
+        },
+        "output": {
+            "refined_dir": str(refine_result.refined_dir),
+            "virtual_refined_dir": (
+                str(refine_result.virtual_refined_dir)
+                if refine_result.virtual_refined_dir is not None
+                else None
+            ),
+        },
+    }
+    with open(output_dir / "pipeline_run_summary.json", "w") as f:
+        json.dump(pipeline_summary, f, indent=2)
     print(
         "[PIPELINE] Refinement done: "
         f"refined_dir={refine_result.refined_dir}, "
-        f"virtual_dir={refine_result.virtual_refined_dir}"
+        f"virtual_dir={refine_result.virtual_refined_dir}, "
+        f"end_to_end={pipeline_summary['timing']['end_to_end_seconds']:.2f}s"
     )
 
 
