@@ -162,6 +162,8 @@ class LoMaBackend:
 
         requested = torch.device(device)
         if requested.type == "cuda":
+            if requested.index is None:
+                requested = torch.device("cuda", torch.cuda.current_device())
             torch.cuda.set_device(requested)
             torch.cuda.reset_peak_memory_stats(requested)
         source = Path(__file__).resolve().parents[1] / "third_party" / "LoMa" / "src"
