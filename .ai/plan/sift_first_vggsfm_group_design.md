@@ -954,11 +954,12 @@ P0 先在 181_room 和 300_room 上只统计、不启用 center 抽稀，并离�
 与 `.ai/plan/vggsfm_prior_optimization_plan.md` 的关系：旧文档覆盖更广泛的 VGGSfM
 性能优化和实验方向；本文档是当前第一版实现的权威范围。若两者冲突，以本文档为准。
 
-## 19. V1 实施与首轮验收结果（2026-09-04）
+## 19. V1 实施与验收结果（2026-09-04 ～ 2026-09-07）
 
-V1 已实现三种运行模式；默认仍为 `legacy`。两组验收均使用第 12.1 节的上线参数，
-只切换 `--vggsfm_schedule_mode`。以下时间是单次端到端实测，不把 Stage A 的运行波动
-解释为调度收益。
+V1 已实现三种运行模式；默认仍为 `legacy`。验收均使用第 12.1 节的上线参数，
+只切换 `--vggsfm_schedule_mode`。720_room 因规模较大，两个模式都额外设置
+`--bae_max_observations 2000000`。以下时间是单次端到端实测，不把 Stage A 的运行波动
+解释为调度收益。表中的 `sparse` 指 `sift_first_sparse`。
 
 | 数据 | 模式 | centers | attempted query-views | dropped | final points | refine | end-to-end |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -966,6 +967,8 @@ V1 已实现三种运行模式；默认仍为 `legacy`。两组验收均使用�
 | 181_room | sparse | 147 | 2,408,448 | 6 | 90,570 | 219.9s | 280.7s |
 | 300_room | legacy | 300 | 4,915,200 | 0 | 282,543 | 626.6s | 696.1s |
 | 300_room | sparse | 162 | 2,654,208 | 0 | 227,235 | 474.5s | 565.3s |
+| 720_room | legacy | 720 | 11,796,480 | 0 | 108,220 | 1,763.9s | 1,926.1s |
+| 720_room | sparse | 373 | 6,111,232 | 0 | 123,012 | 1,260.2s | 1,408.2s |
 
 角度误差结果：
 
@@ -973,15 +976,99 @@ V1 已实现三种运行模式；默认仍为 `legacy`。两组验收均使用�
   median/p90 相对恶化约 3.28%/1.48%。掉帧多 1 帧；
 - `300_room`：P-only median/p90 改善约 2.70%/3.11%；S-only
   median/p90 相对恶化约 0.72%/0.31%。没有新增掉帧。
+- `720_room`：S-only median/p90 改善约 4.88%/3.19%，但 P-only
+  median/p90 相对恶化约 4.47%/4.81%；按 observation 加权的整体 angular mean
+  相对恶化约 3.35%。没有新增掉帧。
 
-结论：center 抽稀、三层 group 和 SIFT-first DB 复用均已按设计工作，角度误差和掉帧
-基本守住门槛，refinement 时间分别下降约 12.6% 和 24.3%。但 final points 分别下降
-约 12.7% 和 19.6%，尚不能声称“质量持平”。因此：
+### 19.1 720_room 大规模 capped BAE 验收
+
+720_room 用于验证抽稀在长序列上的收益和退化边界。两次运行都注册了 720/720 帧，
+且均受 2,000,000 observation 上限约束。
+
+调度与 prior 规模：
+
+| 指标 | legacy | sparse | sparse 相对变化 |
+| --- | ---: | ---: | ---: |
+| centers / groups | 720 | 373 | -48.2% |
+| attempted query-views | 11,796,480 | 6,111,232 | -48.2% |
+| prior tracks | 645,906 | 337,673 | -47.7% |
+| prior observations | 7,114,766 | 3,695,657 | -48.1% |
+| prior track length median / p90 | 12 / 17 | 12 / 17 | 持平 |
+| final SIFT pairs | 9,669 | 9,628 | -0.4% |
+| final SIFT matches | 3,233,156 | 3,254,385 | +0.7% |
+
+稀疏模式的 373 个 center 占全部帧的 51.8%。三层 group 中，347 个邻居来自 owned
+强边、572 个来自相邻 center bridge、5,049 个来自 projected-overlap fill，未使用
+overflow。结果说明 center 数和 VGGSfM query 量接近同比下降，而 SIFT 图规模基本保留。
+
+运行时间：
+
+| 阶段 | legacy | sparse | sparse 相对变化 |
+| --- | ---: | ---: | ---: |
+| Stage A | 161.7s | 147.4s | -8.8% |
+| group build | 24.7s | 13.1s | -47.2% |
+| VGGSfM prior | 350.7s | 243.3s | -30.6% |
+| ABA | 1,077.9s | 800.7s | -25.7% |
+| refinement | 1,763.9s | 1,260.2s | -28.6% |
+| end-to-end | 1,926.1s | 1,408.2s | -26.9% |
+
+端到端由约 32 分 06 秒降至 23 分 28 秒，节省约 8 分 38 秒；在长序列上，center
+抽稀确实转化成了明显的 VGGSfM 和 BA 时间收益。
+
+最终重建质量：
+
+| 指标 | legacy | sparse | sparse 相对变化 |
+| --- | ---: | ---: | ---: |
+| final points | 108,220 | 123,012 | +13.7% |
+| final observations | 1,992,424 | 1,990,884 | -0.08% |
+| final track length mean / median / p90 | 18.41 / 17 / 19 | 16.18 / 15 / 17 | track 变短 |
+| S-only points | 12,192 | 18,072 | +48.2% |
+| P-only points | 96,028 | 104,939 | +9.3% |
+| final BA median residual | 0.834 px | 0.866 px | +3.9% |
+| final BA raw MSE | 2.742 | 3.040 | +10.9% |
+| final BA weighted ending loss | 1.642 | 1.762 | +7.3% |
+
+这里不能把 `final points +13.7%` 直接解释成几何质量或原始覆盖提升。第三轮 refinement
+在 observation cap 之前，legacy 有 356,397 points / 3,806,703 observations，sparse
+只有 279,745 points / 2,790,882 observations；应用 cap 后分别成为 108,220 / 1,999,999
+和 123,012 / 1,999,992。sparse 的平均 track 更短，因此在相同 observation 预算内能留下
+更多 point。最终点数增加主要是 cap 下的结构性结果，而上游可用约束规模实际下降。
+
+按每帧 8×8 grid 统计最终 observation 的空间覆盖，sparse 的分布反而更均匀：
+
+| 指标 | legacy | sparse |
+| --- | ---: | ---: |
+| 每帧至少 1 observation 的 cell 比例（p10 / median / mean） | 46.9% / 70.3% / 68.5% | 51.6% / 75.0% / 72.5% |
+| 每帧至少 2 observations 的 cell 比例（p10 / median / mean） | 42.2% / 65.6% / 64.1% | 48.4% / 70.3% / 68.3% |
+| 至少 2 observations 覆盖低于 50% 的帧数 | 122 | 82 |
+
+相机轨迹整体稳定。将两套结果做 Sim(3) 对齐后，720 个共同相机的旋转差
+median/p90 为 0.058°/0.150°，相机中心误差相对场景 RMS 的 median/p90 为
+0.091%/0.207%。最大旋转差 12.80° 出现在 frame 656，但与共同 coarse pose 比较时，
+legacy 最终旋转改变量为 12.71°，sparse 为 3.60°，因此没有证据把该离群点归因于抽稀。
+
+### 19.2 当前结论与下一步
+
+center 抽稀、三层 group 和 SIFT-first DB 复用均已按设计工作。181_room 和 300_room
+的 refinement 时间分别下降约 12.6% 和 24.3%，720_room 的 refinement 和端到端时间
+分别下降 28.6% 和 26.9%。掉帧门槛守住，720_room 的空间覆盖低分位还有改善。
+
+但当前仍不能判定“质量持平或更好”：
+
+- 181_room 和 300_room 的 final points 分别下降约 12.7% 和 19.6%；
+- 720_room 虽然 final points 增加 13.7%，但这是固定 observation cap 与较短 track
+  共同造成的结果，cap 前的 points 和 observations 都少于 legacy；
+- 720_room 的 P-only angular median/p90 分别恶化 4.47%/4.81%，超过第 17.3 节的
+  3% 硬门槛，final BA residual 和 loss 也有小幅到中等幅度恶化。
+
+因此：
 
 - 保持 `legacy` 为默认和严格回退路径；
 - 将 `sift_first_sparse` 保持为实验模式；
-- 下一轮应优先调整 center 保留策略或补偿 skipped center 的 prior 覆盖，而不是继续
-  放松 SIFT 强边阈值；
-- 两次完整运行的 audit 位于
-  `/kiri/tmp/ffba_v1_eval_{181,300}_{legacy,sparse}`（181 legacy 实际目录后缀为
-  `legacy_retry`）。
+- 下一轮优先验证更保守的 center 抽稀，不引入新的复杂机制。对 720_room 的离线模拟显示，
+  保持 coverage threshold 0.20 和 `max_center_gap=2`，将 `min_pair_inliers` 提至 512
+  会保留 508/720 个 center（70.6%），可作为下一组 A/B 起点；
+- 不应通过继续放松 SIFT 强边阈值来补 VGGSfM prior 覆盖；
+- 完整运行的 audit 位于 `/kiri/tmp/ffba_v1_eval_{181,300}_{legacy,sparse}`
+  （181 legacy 实际目录后缀为 `legacy_retry`），以及
+  `/kiri/tmp/ffba_v1_eval_720_{legacy,sparse}_obs2m`。
