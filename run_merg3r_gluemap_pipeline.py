@@ -20,6 +20,7 @@ from utils.image_pyramid import (
     load_image_tensors_from_dir,
     scale_intrinsics_with_pyramid_records,
 )
+from utils.nerfstudio_prior import load_nerfstudio_prior
 from utils.gluemap_spv_refine import (
     CAMERA_MODEL as PIPELINE_CAMERA_MODEL,
     GROUP_STRATEGY as PIPELINE_GROUP_STRATEGY,
@@ -49,10 +50,12 @@ class Merg3rCoarseState:
     image_ids: np.ndarray
     pairs: np.ndarray
     pair_graph_stats: dict
-    raw_depth: np.ndarray
+    raw_depth: np.ndarray | None
     raw_depth_conf: np.ndarray | None
     retrieval_sim_matrix: np.ndarray | None
     image_pyramid: dict | None
+    initial_geometry_source: str = "feedforward"
+    source_metadata: dict | None = None
 
 
 def parse_args():
@@ -62,6 +65,31 @@ def parse_args():
     )
     parser.add_argument("--dataset", type=str, required=True)
     parser.add_argument("--output_dir", type=str, required=True)
+    parser.add_argument(
+        "--prior_transforms_json",
+        type=str,
+        default=None,
+        help=(
+            "Optional Nerfstudio transforms.json. When provided, its frames order "
+            "and camera-to-world poses replace the feed-forward coarse stage. "
+            "Prior-pose mode uses original-resolution images and requires BAE."
+        ),
+    )
+    parser.add_argument(
+        "--prior_dino_long_side",
+        type=int,
+        default=512,
+        help=(
+            "Temporary DINO retrieval image long side in prior-pose mode. This "
+            "does not change the SIFT/COLMAP working resolution."
+        ),
+    )
+    parser.add_argument(
+        "--prior_dino_batch_size",
+        type=int,
+        default=16,
+        help="DINO inference batch size used only in prior-pose mode.",
+    )
     parser.add_argument(
         "--pi3x_intrinsics_method",
         type=str,
@@ -127,11 +155,12 @@ def parse_args():
         "--vggsfm_group_strategy",
         type=str,
         default=PIPELINE_GROUP_STRATEGY,
-        choices=["pose", "projected_overlap"],
+        choices=["pose", "projected_overlap", "sift_pose_dino"],
         help=(
             "Group strategy used by formal VGGSfM prior tracking. "
             "'projected_overlap' ranks the union of rotation-valid pose and "
-            "DINO retrieval candidates using coarse projected overlap."
+            "DINO retrieval candidates using coarse projected overlap; "
+            "'sift_pose_dino' is the depth-free SIFT/Pose/DINO strategy."
         ),
     )
     parser.add_argument(
@@ -622,18 +651,113 @@ def run_merg3r_coarse_stage(args, output_dir):
         raw_depth_conf=raw_depth_conf,
         retrieval_sim_matrix=retrieval_sim_matrix,
         image_pyramid=image_pyramid_metadata,
+        initial_geometry_source="feedforward",
+        source_metadata=None,
     )
     return state, {"seconds": time.time() - t0}
 
 
+def run_prior_pose_initial_stage(args, output_dir):
+    t0 = time.time()
+    if args.prior_dino_batch_size <= 0:
+        raise ValueError("prior_dino_batch_size must be >= 1")
+    prior = load_nerfstudio_prior(
+        args.prior_transforms_json,
+        args.dataset,
+        subsample=args.subsample,
+        num_images=args.num_images,
+        num_workers=args.image_pyramid_workers,
+        retrieval_long_side=args.prior_dino_long_side,
+    )
+    print(
+        "[PIPELINE] Computing DINO retrieval matrix from temporary prior-pose "
+        f"retrieval images: shape={tuple(prior.retrieval_images.shape)}",
+        flush=True,
+    )
+    retrieval_sim_matrix = (
+        get_sim_matrix(
+            prior.retrieval_images,
+            alpha=args.alpha,
+            device=args.device,
+            subset_size=args.prior_dino_batch_size,
+        )
+        .detach()
+        .cpu()
+        .numpy()
+        .astype(np.float32, copy=False)
+    )
+    prior.retrieval_images = None
+    prior.audit["dino_batch_size"] = int(args.prior_dino_batch_size)
+    gc.collect()
+    if args.device.startswith("cuda"):
+        torch.cuda.empty_cache()
+
+    pairs = build_pose_pairs(
+        prior.extrinsic.shape[0],
+        prior.extrinsic,
+        args.pair_k_pose,
+        args.pair_pose_rotation_threshold,
+    )
+    pair_graph_stats = summarize_pair_graph(pairs, prior.extrinsic.shape[0])
+    final_predictions = {
+        "extrinsic": prior.extrinsic,
+        "intrinsic": prior.intrinsic,
+        "image_ids": prior.image_ids,
+    }
+    image_metadata = {
+        "enabled": False,
+        "reason": "prior_pose_uses_original_resolution",
+        "materialization": "original_resolution_memory",
+    }
+    state = Merg3rCoarseState(
+        high_images=prior.images,
+        low_image_names=list(prior.image_names),
+        high_image_names=list(prior.image_names),
+        low_image_size_hw=prior.image_size_hw,
+        high_image_size_hw=prior.image_size_hw,
+        final_predictions=final_predictions,
+        extrinsic=prior.extrinsic,
+        intrinsic_low=prior.intrinsic,
+        intrinsic_high=prior.intrinsic,
+        image_ids=prior.image_ids,
+        pairs=pairs,
+        pair_graph_stats=pair_graph_stats,
+        raw_depth=None,
+        raw_depth_conf=None,
+        retrieval_sim_matrix=retrieval_sim_matrix,
+        image_pyramid=image_metadata,
+        initial_geometry_source="nerfstudio_prior",
+        source_metadata=prior.audit,
+    )
+    with open(output_dir / "prior_pose_import.json", "w") as handle:
+        json.dump(prior.audit, handle, indent=2)
+    return state, {"seconds": time.time() - t0}
+
+
 def write_stage_a_summary(output_dir, args, state, timing):
+    has_depth = state.raw_depth is not None
+    feedforward_source = state.initial_geometry_source == "feedforward"
+    timing_summary = {"initial_geometry_seconds": timing["seconds"]}
+    if feedforward_source:
+        timing_summary["merg3r_coarse_seconds"] = timing["seconds"]
+    else:
+        timing_summary["prior_pose_import_seconds"] = timing["seconds"]
     summary = {
-        "source": "MERG3R/run_merg3r_gluemap_pipeline.py",
-        "stage": "merg3r_coarse",
+        "source": (
+            "MERG3R/run_merg3r_gluemap_pipeline.py"
+            if feedforward_source
+            else "nerfstudio_prior"
+        ),
+        "stage": "merg3r_coarse" if feedforward_source else "prior_pose_initial",
         "status": "stage_a_completed",
         "dataset": args.dataset,
+        "prior_transforms_json": args.prior_transforms_json,
         "pipeline_defaults": {
-            "model": PIPELINE_MODEL,
+            "model": (
+                PIPELINE_MODEL
+                if feedforward_source
+                else None
+            ),
             "camera_model": PIPELINE_CAMERA_MODEL,
             "s_database_mode": PIPELINE_S_DATABASE_MODE,
             "vggsfm_query_source": PIPELINE_QUERY_SOURCE,
@@ -651,8 +775,9 @@ def write_stage_a_summary(output_dir, args, state, timing):
         "intrinsic_high_shape": list(state.intrinsic_high.shape),
         "image_pyramid": state.image_pyramid,
         "raw_geometry": {
-            "depth_shape": list(state.raw_depth.shape),
-            "depth_coordinate_system": "low",
+            "has_depth": has_depth,
+            "depth_shape": list(state.raw_depth.shape) if has_depth else None,
+            "depth_coordinate_system": "low" if has_depth else None,
             "has_depth_conf": state.raw_depth_conf is not None,
             "depth_conf_shape": (
                 list(state.raw_depth_conf.shape)
@@ -675,7 +800,8 @@ def write_stage_a_summary(output_dir, args, state, timing):
             "num_pairs": int(state.pairs.shape[0]),
             "pair_graph": state.pair_graph_stats,
         },
-        "timing": {"merg3r_coarse_seconds": timing["seconds"]},
+        "source_metadata": state.source_metadata,
+        "timing": timing_summary,
         "config": vars(args),
     }
     with open(output_dir / "pipeline_stage_a_summary.json", "w") as f:
@@ -687,6 +813,38 @@ def main():
     args = parse_args()
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError("CUDA is required unless --device cpu is used.")
+    prior_pose_mode = args.prior_transforms_json is not None
+    if prior_pose_mode and args.ba_backend != "bae":
+        raise ValueError("Prior-pose mode currently requires --ba_backend bae")
+    if prior_pose_mode and args.vggsfm_group_strategy == "projected_overlap":
+        raise ValueError(
+            "Prior-pose mode has no depth and cannot use projected_overlap; "
+            "use --vggsfm_group_strategy sift_pose_dino"
+        )
+    if (
+        args.vggsfm_group_strategy == "sift_pose_dino"
+        and args.vggsfm_schedule_mode == "legacy"
+    ):
+        raise ValueError(
+            "sift_pose_dino requires --vggsfm_schedule_mode sift_first_full "
+            "or sift_first_sparse"
+        )
+    if (
+        args.vggsfm_schedule_mode == "sift_first_sparse"
+        and args.vggsfm_group_strategy == "pose"
+    ):
+        raise ValueError(
+            "sift_first_sparse requires --vggsfm_group_strategy "
+            "projected_overlap or sift_pose_dino"
+        )
+    if (
+        prior_pose_mode
+        and args.export_vggsfm_groups_only
+        and args.vggsfm_group_audit_strategy in {"projected_overlap", "both"}
+    ):
+        raise ValueError(
+            "Prior-pose mode cannot export depth-based projected-overlap groups"
+        )
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -694,7 +852,10 @@ def main():
         json.dump(
             {
                 "pipeline_defaults": {
-                    "model": PIPELINE_MODEL,
+                    "model": None if prior_pose_mode else PIPELINE_MODEL,
+                    "initial_geometry_source": (
+                        "nerfstudio_prior" if prior_pose_mode else "feedforward"
+                    ),
                     "camera_model": PIPELINE_CAMERA_MODEL,
                     "s_database_mode": PIPELINE_S_DATABASE_MODE,
                     "vggsfm_query_source": PIPELINE_QUERY_SOURCE,
@@ -709,7 +870,15 @@ def main():
             indent=2,
         )
 
-    state, timing = run_merg3r_coarse_stage(args, output_dir)
+    if prior_pose_mode:
+        print(
+            "[PIPELINE] Prior-pose mode enabled: using original-resolution "
+            "images and skipping Pi3X/MERG3R/depth.",
+            flush=True,
+        )
+        state, timing = run_prior_pose_initial_stage(args, output_dir)
+    else:
+        state, timing = run_merg3r_coarse_stage(args, output_dir)
     write_stage_a_summary(output_dir, args, state, timing)
 
     print(f"[PIPELINE] Stage A done: output_dir={output_dir}")

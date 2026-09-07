@@ -198,6 +198,70 @@ def test_three_layer_groups_reject_non_center_owner():
         )
 
 
+def test_sift_pose_dino_candidates_prioritize_valid_sift_evidence():
+    extrinsic = np.repeat(np.eye(4, dtype=np.float64)[None, :3], 5, axis=0)
+    retrieval = np.zeros((5, 5), dtype=np.float64)
+    retrieval[0, 4] = 0.99
+    records = [
+        {
+            "pair": [0, 1],
+            "inlier_count": 100,
+            "source_grid_coverage": 0.25,
+            "target_grid_coverage": 0.25,
+            "valid_schedule_edge": True,
+        },
+        {
+            "pair": [0, 2],
+            "inlier_count": 80,
+            "source_grid_coverage": 0.40,
+            "target_grid_coverage": 0.40,
+            "valid_schedule_edge": True,
+        },
+        {
+            "pair": [0, 3],
+            "inlier_count": 200,
+            "source_grid_coverage": 0.50,
+            "target_grid_coverage": 0.10,
+            "valid_schedule_edge": False,
+        },
+    ]
+
+    details, stats = ref.build_sift_pose_dino_candidate_details(
+        selected_centers=[0],
+        sift_pair_records=records,
+        pose_pairs=np.array([[0, 3]], dtype=np.int64),
+        temporal_pairs=np.array([[0, 1]], dtype=np.int64),
+        retrieval_sim_matrix=retrieval,
+        extrinsic=extrinsic,
+        rotation_threshold=30.0,
+        dino_candidates=1,
+    )
+
+    assert [item["image_index"] for item in details[0]] == [2, 1, 3, 4]
+    assert stats["strategy"] == "sift_pose_dino"
+    assert stats["valid_sift_candidate_count"]["mean"] == 2.0
+
+
+def test_three_layer_groups_support_depth_free_fill_provenance():
+    groups, stats = ref.build_three_layer_vggsfm_groups(
+        selected_centers=[0, 2],
+        owner=[0, 0, 2],
+        valid_sift_edges=np.array([[0, 1]], dtype=np.int64),
+        projected_candidate_details={
+            0: [{"image_index": 2}],
+            2: [{"image_index": 0}],
+        },
+        num_images=3,
+        max_neighbors=3,
+        fill_source_name="sift_pose_dino_fill",
+        strategy_name="sift_first_three_layer_sift_pose_dino",
+    )
+
+    assert groups == [[0, 1, 2], [2, 0]]
+    assert stats["strategy"] == "sift_first_three_layer_sift_pose_dino"
+    assert stats["layer_member_counts"]["sift_pose_dino_fill"] == 2
+
+
 def test_final_bae_huber_delta_defaults_to_legacy_behavior():
     args = SimpleNamespace(
         bae_huber_delta=1.0,

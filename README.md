@@ -361,8 +361,9 @@ output/
   pipeline_config.json
   pipeline_stage_a_summary.json
   refine_stats.json
+  prior_pose_import.json       # 仅 prior-pose 模式产生
 
-  image_pyramid/
+  image_pyramid/               # 仅 feed-forward 模式产生
     image_pyramid_manifest.json
 
   images/
@@ -370,7 +371,7 @@ output/
     frame_000001.png
     ...
 
-  pred_depth/
+  pred_depth/                  # 仅 feed-forward 模式产生
     depth_npy/
     depth_u16/
     depth_vis/
@@ -519,6 +520,56 @@ center），尚未完成正式质量验收，不应替代上面的可复现实�
 SIFT-first 模式额外输出 `vggsfm_schedule.json`，包含 pair 来源、verified
 inlier/coverage、阈值 sweep、center/owner 原因和三层 group provenance。
 
+### Nerfstudio Prior Pose 输入
+
+传入 `--prior_transforms_json` 后，Nerfstudio `transforms.json` 中的 pose 会替代
+Pi3X/MERG3R coarse pose。它只作为初值，后续仍由 BAE 优化。该模式：
+
+- 以 JSON `frames[]` 顺序作为图片和时序顺序；
+- 直接在原始图片分辨率上运行 SIFT、refinement 和输出 COLMAP model；
+- 跳过 Pi3X、subset alignment、depth 生成与 `pred_depth/` 导出；
+- 只支持 `--ba_backend bae`；
+- 使用 depth-free `sift_pose_dino` group，不支持 `projected_overlap`。
+
+789_room sparse 示例：
+
+```bash
+source /opt/conda/bin/activate
+conda activate gluemap-merg3r
+
+python run_merg3r_gluemap_pipeline.py \
+  --dataset /kiri/codex_use_data/789_room/image \
+  --prior_transforms_json /kiri/codex_use_data/789_room/transforms.json \
+  --output_dir /kiri/tmp/ffba_789_prior_sparse \
+  --prior_match_topology star \
+  --ba_backend bae \
+  --bae_max_num_iterations 20 \
+  --bae_max_observations 2000000 \
+  --num_refinement_iterations 3 \
+  --bae_optimize_intrinsics \
+  --bae_robust_loss huber \
+  --bae_huber_delta 1.0 \
+  --final_bae_huber_delta 2.0 \
+  --filter_reproj_error_threshold 1.0 \
+  --neighbors_per_center 16 \
+  --vggsfm_group_strategy sift_pose_dino \
+  --vggsfm_group_batch_size 3 \
+  --vggsfm_schedule_mode sift_first_sparse \
+  --sift_temporal_window 2 \
+  --sift_schedule_min_pair_inliers 128 \
+  --sift_schedule_min_grid_coverage 0.20 \
+  --vggsfm_max_center_gap 2
+```
+
+输入的 Nerfstudio OpenGL camera-to-world pose 会转换为 OpenCV/COLMAP
+world-to-camera。内参统一为 `fx=fy=mean((fl_x+fl_y)/2)`、`cx=w/2`、`cy=h/2`，
+输出仍使用 shared `SIMPLE_PINHOLE`，并忽略 JSON 中的 distortion 和
+`depth_file_path`。DINO retrieval 使用临时长边 512 的缩略图；VGGSfM 仍使用其内部
+1024×1024 resize/pad，这两者都不会改变原图 SIFT/COLMAP 坐标。
+
+运行会额外输出 `prior_pose_import.json`，用于审计 frame 映射、坐标转换、共享内参、
+轨迹范围和 DINO 临时输入尺寸。
+
 如果需要 PLY，可用 COLMAP 自带 converter 从 `points3D` 转出。
 
 ## 常用参数
@@ -527,6 +578,9 @@ inlier/coverage、阈值 sweep、center/owner 原因和三层 group provenance�
 | --- | --- | --- |
 | `--dataset` | required | 输入图片目录 |
 | `--output_dir` | required | 输出目录 |
+| `--prior_transforms_json` | unset | 可选 Nerfstudio transforms.json；启用原图分辨率 prior-pose 模式并跳过 feed-forward/depth |
+| `--prior_dino_long_side` | `512` | prior-pose 模式的临时 DINO retrieval 图片长边，不改变几何工作分辨率 |
+| `--prior_dino_batch_size` | `16` | prior-pose 模式的 DINO inference batch size |
 | `--device` | `cuda` | 推理和 refinement 设备 |
 | `--num_images` | `-1` | 限制图片数量，`-1` 表示全部 |
 | `--subsample` | `1` | 按顺序采样图片 |
@@ -544,7 +598,7 @@ inlier/coverage、阈值 sweep、center/owner 原因和三层 group provenance�
 | `--pair_pose_rotation_threshold` | `30.0` | pose pair 允许的最大视角差，单位为度 |
 | `--path_tracker` | required in practice | VGGSfM tracker checkpoint |
 | `--neighbors_per_center` | `16` | 每个 VGGSfM group 的邻居上限；V1 固定质量基线为 16 |
-| `--vggsfm_group_strategy` | `pose` | 正式 VGGSfM tracking 的 group 构建策略；可选 `pose` 或 `projected_overlap` |
+| `--vggsfm_group_strategy` | `pose` | VGGSfM group 策略；`pose`、depth-based `projected_overlap` 或 depth-free `sift_pose_dino` |
 | `--vggsfm_group_batch_size` | `2` | 按 `(group_size, query_points)` 分桶后，每次 VGGSfM forward 的 group 数量；尾桶自动降为较小 batch |
 | `--vggsfm_schedule_mode` | `legacy` | `legacy`、`sift_first_full` 或 `sift_first_sparse` |
 | `--sift_temporal_window` | `2` | SIFT candidate graph 强制加入的时序窗口 |

@@ -1763,6 +1763,160 @@ def build_projected_overlap_groups(
     return groups, stats, candidate_details
 
 
+def build_sift_pose_dino_candidate_details(
+    selected_centers,
+    sift_pair_records,
+    pose_pairs,
+    temporal_pairs,
+    retrieval_sim_matrix,
+    extrinsic,
+    *,
+    rotation_threshold,
+    dino_candidates=30,
+):
+    selected_centers = [int(center) for center in selected_centers]
+    extrinsic = np.asarray(extrinsic, dtype=np.float64)
+    num_images = int(extrinsic.shape[0])
+    retrieval_sim_matrix = np.asarray(retrieval_sim_matrix, dtype=np.float64)
+    if extrinsic.shape != (num_images, 3, 4):
+        raise ValueError(
+            f"Expected extrinsic shape ({num_images}, 3, 4), got {extrinsic.shape}"
+        )
+    if retrieval_sim_matrix.shape != (num_images, num_images):
+        raise ValueError(
+            "Expected retrieval similarity shape "
+            f"({num_images}, {num_images}), got {retrieval_sim_matrix.shape}"
+        )
+    dino_k = min(max(int(dino_candidates), 0), max(num_images - 1, 0))
+
+    pose_set = {
+        tuple(pair)
+        for pair in canonicalize_pair_array(pose_pairs, num_images=num_images).tolist()
+    }
+    temporal_set = {
+        tuple(pair)
+        for pair in canonicalize_pair_array(
+            temporal_pairs,
+            num_images=num_images,
+        ).tolist()
+    }
+    pair_records = {}
+    for record in sift_pair_records:
+        pair = tuple(
+            canonicalize_pair_array(
+                [record["pair"]],
+                num_images=num_images,
+            )[0].tolist()
+        )
+        pair_records[pair] = record
+    pair_neighbors = defaultdict(set)
+    for i, j in pose_set | temporal_set | set(pair_records):
+        pair_neighbors[int(i)].add(int(j))
+        pair_neighbors[int(j)].add(int(i))
+
+    centers = camera_centers_from_w2c(extrinsic)
+    viewing_axes = camera_viewing_axes_from_w2c(extrinsic)
+    details_by_center = {}
+    candidate_counts = []
+    valid_sift_counts = []
+    for center in selected_centers:
+        row = np.nan_to_num(
+            retrieval_sim_matrix[center],
+            nan=-np.inf,
+            posinf=np.inf,
+            neginf=-np.inf,
+        ).copy()
+        row[center] = -np.inf
+        dino_order = np.argsort(-row, kind="stable")[:dino_k]
+        dino_set = {int(idx) for idx in dino_order if int(idx) != center}
+
+        candidates = set(dino_set) | pair_neighbors.get(center, set())
+
+        details = []
+        for neighbor in sorted(candidates):
+            pair = tuple(sorted((center, neighbor)))
+            record = pair_records.get(pair)
+            inlier_count = int(record["inlier_count"]) if record is not None else 0
+            source_coverage = (
+                float(record["source_grid_coverage"]) if record is not None else 0.0
+            )
+            target_coverage = (
+                float(record["target_grid_coverage"]) if record is not None else 0.0
+            )
+            min_coverage = min(source_coverage, target_coverage)
+            valid_sift = bool(
+                record is not None and record.get("valid_schedule_edge", False)
+            )
+            dot = float(np.dot(viewing_axes[center], viewing_axes[neighbor]))
+            rotation_angle = float(
+                np.rad2deg(np.arccos(np.clip(dot, -1.0, 1.0)))
+            )
+            sources = []
+            if pair in pose_set and rotation_angle < float(rotation_threshold):
+                sources.append("pose")
+            if pair in temporal_set:
+                sources.append("temporal")
+            if neighbor in dino_set:
+                sources.append("dino")
+            details.append(
+                {
+                    "image_index": int(neighbor),
+                    "candidate_sources": sources,
+                    "valid_schedule_edge": valid_sift,
+                    "inlier_count": inlier_count,
+                    "source_grid_coverage": source_coverage,
+                    "target_grid_coverage": target_coverage,
+                    "min_grid_coverage": min_coverage,
+                    "dino_similarity": float(row[neighbor]),
+                    "rotation_angle_deg": rotation_angle,
+                    "rotation_valid": rotation_angle < float(rotation_threshold),
+                    "camera_center_distance": float(
+                        np.linalg.norm(centers[center] - centers[neighbor])
+                    ),
+                }
+            )
+
+        details.sort(
+            key=lambda item: (
+                -int(item["valid_schedule_edge"]),
+                -item["min_grid_coverage"],
+                -item["inlier_count"],
+                -item["dino_similarity"],
+                item["rotation_angle_deg"],
+                item["camera_center_distance"],
+                item["image_index"],
+            )
+        )
+        details_by_center[center] = details
+        candidate_counts.append(len(details))
+        valid_sift_counts.append(
+            sum(int(detail["valid_schedule_edge"]) for detail in details)
+        )
+
+    stats = {
+        "strategy": "sift_pose_dino",
+        "candidate_pool": "sift_pairs_union_rotation_valid_pose_temporal_dino_topk",
+        "scheduled_centers": selected_centers,
+        "num_scheduled_centers": int(len(selected_centers)),
+        "num_unscheduled_centers": int(num_images - len(selected_centers)),
+        "pose_pair_count": int(len(pose_set)),
+        "temporal_pair_count": int(len(temporal_set)),
+        "sift_pair_record_count": int(len(pair_records)),
+        "dino_candidates_per_center": int(dino_k),
+        "candidate_count": summarize_numeric(candidate_counts),
+        "valid_sift_candidate_count": summarize_numeric(valid_sift_counts),
+        "ranking": [
+            "valid_schedule_edge_desc",
+            "min_grid_coverage_desc",
+            "inlier_count_desc",
+            "dino_similarity_desc",
+            "rotation_angle_asc",
+            "camera_center_distance_asc",
+        ],
+    }
+    return details_by_center, stats
+
+
 def build_three_layer_vggsfm_groups(
     selected_centers,
     owner,
@@ -1770,6 +1924,9 @@ def build_three_layer_vggsfm_groups(
     projected_candidate_details,
     num_images,
     max_neighbors,
+    *,
+    fill_source_name="projected_overlap_fill",
+    strategy_name="sift_first_three_layer_projected_overlap",
 ):
     selected_centers = [int(center) for center in selected_centers]
     owner = [int(value) for value in owner]
@@ -1840,8 +1997,8 @@ def build_three_layer_vggsfm_groups(
                 continue
             members.append(neighbor)
             projected_fill.append(neighbor)
-            member_sources[neighbor] = "projected_overlap_fill"
-            layer_counts["projected_overlap_fill"] += 1
+            member_sources[neighbor] = fill_source_name
+            layer_counts[fill_source_name] += 1
             remaining -= 1
 
         overflow = forced_count > max_neighbors
@@ -1853,7 +2010,7 @@ def build_three_layer_vggsfm_groups(
                 "center": center,
                 "owned_frames": owned,
                 "adjacent_bridges": bridges,
-                "projected_overlap_fill": projected_fill,
+                fill_source_name: projected_fill,
                 "final_members": members,
                 "member_sources": {
                     str(neighbor): member_sources[neighbor] for neighbor in members
@@ -1865,7 +2022,7 @@ def build_three_layer_vggsfm_groups(
         )
 
     stats = {
-        "strategy": "sift_first_three_layer_projected_overlap",
+        "strategy": strategy_name,
         "max_neighbors": max_neighbors,
         "scheduled_centers": selected_centers,
         "num_scheduled_centers": int(len(selected_centers)),
@@ -1873,7 +2030,7 @@ def build_three_layer_vggsfm_groups(
         "layer_member_counts": {
             "owned_frame": int(layer_counts["owned_frame"]),
             "adjacent_center_bridge": int(layer_counts["adjacent_center_bridge"]),
-            "projected_overlap_fill": int(layer_counts["projected_overlap_fill"]),
+            fill_source_name: int(layer_counts[fill_source_name]),
         },
         "overflow_groups": int(overflow_groups),
         "group_records": group_records,

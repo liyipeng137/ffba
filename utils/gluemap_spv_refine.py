@@ -597,7 +597,11 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
     )
     save_work_images_seconds = time.time() - t0
     image_size_hw = tuple(coarse_state.high_image_size_hw)
-    depth_image_size_hw = tuple(coarse_state.low_image_size_hw)
+    depth_image_size_hw = (
+        tuple(coarse_state.low_image_size_hw)
+        if coarse_state.raw_depth is not None
+        else None
+    )
     initial_intrinsics_high_all = np.asarray(
         coarse_state.intrinsic_high, dtype=np.float64
     )
@@ -633,6 +637,12 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
     metadata = {"image_size_hw": image_size_hw}
 
     stats = {
+        "initial_geometry_source": getattr(
+            coarse_state,
+            "initial_geometry_source",
+            "feedforward",
+        ),
+        "has_initial_depth": coarse_state.raw_depth is not None,
         "track_mode": args.track_mode,
         "camera_model": CAMERA_MODEL,
         "s_database_mode": S_DATABASE_MODE,
@@ -662,7 +672,9 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
             "num_workers": int(config.work_image_workers),
             "source_low_image_names": list(coarse_state.low_image_names),
             "source_high_image_names": list(coarse_state.high_image_names),
-            "low_image_size_hw": list(depth_image_size_hw),
+            "low_image_size_hw": (
+                list(depth_image_size_hw) if depth_image_size_hw is not None else None
+            ),
             "high_image_size_hw": list(image_size_hw),
             "image_pyramid": coarse_state.image_pyramid,
         },
@@ -775,6 +787,10 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
     tracking_groups = None
     tracking_group_stats = None
     if args.group_strategy == "projected_overlap":
+        if coarse_state.raw_depth is None:
+            raise ValueError(
+                "vggsfm_group_strategy='projected_overlap' requires depth"
+            )
         if coarse_state.retrieval_sim_matrix is None:
             raise ValueError(
                 "retrieval_sim_matrix is required when "
@@ -826,15 +842,58 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
             f"groups={len(tracking_groups)}, "
             f"group_size={tracking_group_stats['group_size']}",
         )
+    elif args.group_strategy == "sift_pose_dino":
+        if schedule_mode == "legacy":
+            raise ValueError(
+                "vggsfm_group_strategy='sift_pose_dino' requires "
+                "--vggsfm_schedule_mode sift_first_full or sift_first_sparse"
+            )
+        if coarse_state.retrieval_sim_matrix is None:
+            raise ValueError(
+                "retrieval_sim_matrix is required when "
+                "vggsfm_group_strategy='sift_pose_dino'"
+            )
+        t0 = time.time()
+        sift_pose_dino_details, sift_pose_dino_stats = (
+            ref.build_sift_pose_dino_candidate_details(
+                center_selection["selected_centers"],
+                sift_schedule_stats["pairs"],
+                legacy_pose_pairs,
+                temporal_pairs,
+                coarse_state.retrieval_sim_matrix,
+                extrinsic,
+                rotation_threshold=float(args.pair_pose_rotation_threshold),
+                dino_candidates=int(config.projected_overlap_dino_candidates),
+            )
+        )
+        tracking_groups, tracking_group_stats = ref.build_three_layer_vggsfm_groups(
+            center_selection["selected_centers"],
+            center_selection["owner"],
+            sift_schedule_stats["valid_edges"],
+            sift_pose_dino_details,
+            len(image_names),
+            int(args.neighbors_per_center),
+            fill_source_name="sift_pose_dino_fill",
+            strategy_name="sift_first_three_layer_sift_pose_dino",
+        )
+        tracking_group_stats["sift_pose_dino_base"] = sift_pose_dino_stats
+        stats["timing"]["vggsfm_group_build"] = time.time() - t0
+        _debug(
+            args,
+            "Built depth-free SIFT/Pose/DINO VGGSfM groups: "
+            f"groups={len(tracking_groups)}, "
+            f"group_size={tracking_group_stats['group_size']}",
+        )
     elif args.group_strategy != "pose":
         raise ValueError(
-            "vggsfm_group_strategy must be 'pose' or 'projected_overlap', "
+            "vggsfm_group_strategy must be 'pose', 'projected_overlap', or "
+            "'sift_pose_dino', "
             f"got {args.group_strategy!r}"
         )
     elif schedule_mode == "sift_first_sparse":
         raise ValueError(
             "sift_first_sparse currently requires "
-            "--vggsfm_group_strategy projected_overlap"
+            "--vggsfm_group_strategy projected_overlap or sift_pose_dino"
         )
 
     if schedule_mode != "legacy":
@@ -989,26 +1048,38 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
     kept_indices = np.asarray(coverage_stats["kept_indices"], dtype=np.int64)
     initial_intrinsics_high = initial_intrinsics_high_all[kept_indices]
     initial_intrinsics_low = initial_intrinsics_low_all[kept_indices]
-    depth = coarse_state.raw_depth[kept_indices]
+    depth = (
+        coarse_state.raw_depth[kept_indices]
+        if coarse_state.raw_depth is not None
+        else None
+    )
     depth_conf = (
         coarse_state.raw_depth_conf[kept_indices]
         if coarse_state.raw_depth_conf is not None
         else None
     )
 
-    t0 = time.time()
-    depth_predictions = {"depth": depth}
-    depth_conf_threshold = None
-    if depth_conf is not None:
-        depth_predictions["depth_conf"] = depth_conf
-        depth_conf_threshold = 2.0
-    stats["depth_export"] = export_prediction_depth_maps(
-        depth_predictions,
-        image_names,
-        output_dir / "pred_depth",
-        conf_threshold=depth_conf_threshold,
-    )
-    stats["timing"]["depth_export"] = time.time() - t0
+    if depth is not None:
+        t0 = time.time()
+        depth_predictions = {"depth": depth}
+        depth_conf_threshold = None
+        if depth_conf is not None:
+            depth_predictions["depth_conf"] = depth_conf
+            depth_conf_threshold = 2.0
+        stats["depth_export"] = export_prediction_depth_maps(
+            depth_predictions,
+            image_names,
+            output_dir / "pred_depth",
+            conf_threshold=depth_conf_threshold,
+        )
+        stats["depth_export"]["enabled"] = True
+        stats["timing"]["depth_export"] = time.time() - t0
+    else:
+        stats["depth_export"] = {
+            "enabled": False,
+            "reason": "initial geometry uses prior pose without depth",
+        }
+        stats["timing"]["depth_export"] = 0.0
 
     t0 = time.time()
     (
@@ -1037,6 +1108,8 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
     )
 
     if args.build_virtual_tracks:
+        if depth is None:
+            raise ValueError("Virtual-track refinement requires depth")
         _debug(
             args,
             f"Building virtual tracks: verify_mode={args.virtual_verify_mode}",
