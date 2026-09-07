@@ -459,12 +459,16 @@ sift_first_sparse
   group = owned frames + adjacent-center bridges + projected-overlap fill
 ```
 
-当前质量基线使用 `neighbors_per_center=16`。目标模式示例：
+当前质量基线使用 `neighbors_per_center=16`。以下命令使用当前 V1 的默认抽稀阈值，
+可作为标准 sparse 实验的命令行参考：
 
 ```bash
+source /opt/conda/bin/activate
+conda activate gluemap-merg3r
+
 python run_merg3r_gluemap_pipeline.py \
-  --dataset <images> \
-  --output_dir <output> \
+  --dataset /path/to/images \
+  --output_dir /path/to/output_sparse \
   --prior_match_topology star \
   --ba_backend bae \
   --bae_max_num_iterations 20 \
@@ -477,8 +481,40 @@ python run_merg3r_gluemap_pipeline.py \
   --neighbors_per_center 16 \
   --vggsfm_group_strategy projected_overlap \
   --vggsfm_group_batch_size 3 \
-  --vggsfm_schedule_mode sift_first_sparse
+  --vggsfm_schedule_mode sift_first_sparse \
+  --sift_temporal_window 2 \
+  --sift_schedule_grid_size 8 \
+  --sift_schedule_min_inliers_per_cell 2 \
+  --sift_schedule_min_pair_inliers 128 \
+  --sift_schedule_min_grid_coverage 0.20 \
+  --vggsfm_max_center_gap 2
 ```
+
+启用 sparse 调度必须同时设置 `--vggsfm_schedule_mode sift_first_sparse` 和
+`--vggsfm_group_strategy projected_overlap`；后面六项显式写出了当前默认值，便于实验
+记录和复现。`sift_first_sparse` 会先构建
+SIFT DB，再根据 verified SIFT 强边选择部分帧作为 VGGSfM center；未被选为 center 的帧
+仍可作为 group neighbor，并继续参加最终注册和 BA。
+
+对于数百帧以上、BAE observation 可能过多的序列，可在相同命令中增加：
+
+```bash
+--bae_max_observations 2000000
+```
+
+该参数会在每轮 BAE 前按完整 track 裁剪 observation。启用 cap 后，`final points`
+会同时受到 track length 分布影响，因此不能只根据最终点数判断 sparse 是否提升质量。
+
+当前 sparse V1 仍是实验模式，`legacy` 仍为默认和质量回退路径。720_room 的首轮结果中，
+默认 `min_pair_inliers=128` 获得约 27% 端到端加速，但 P-only angular median/p90
+超过了 3% 退化门槛。下一轮若要测试更保守的 center 抽稀，可仅覆盖：
+
+```bash
+--sift_schedule_min_pair_inliers 512
+```
+
+这组 `512` 配置目前只是基于 720_room 阈值 sweep 得到的候选（预计保留 508/720 个
+center），尚未完成正式质量验收，不应替代上面的可复现实测配置。
 
 SIFT-first 模式额外输出 `vggsfm_schedule.json`，包含 pair 来源、verified
 inlier/coverage、阈值 sweep、center/owner 原因和三层 group provenance。
