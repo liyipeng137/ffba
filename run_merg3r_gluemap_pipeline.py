@@ -153,8 +153,12 @@ def parse_args():
     parser.add_argument("--prior_provider", choices=["vggsfm", "loma"], default="vggsfm")
     parser.add_argument(
         "--loma_dino_candidates", type=int, default=30,
-        help="Per-image DINO retrieval candidates for LoMa; all pose/temporal/DINO pairs are matched.",
+        help="Per-image DINO retrieval candidates for the LoMa pose/temporal/DINO pool.",
     )
+    parser.add_argument("--loma_pair_selection", choices=["all", "sift_guided"], default="sift_guided")
+    parser.add_argument("--loma_sufficient_neighbors", type=int, default=3)
+    parser.add_argument("--loma_insufficient_neighbors", type=int, default=5)
+    parser.add_argument("--loma_untried_neighbors", type=int, default=5)
     parser.add_argument("--neighbors_per_center", type=int, default=16)
     parser.add_argument(
         "--vggsfm_group_strategy",
@@ -827,6 +831,9 @@ def main():
             raise ValueError("LoMa V1 has no observation cap; use --bae_max_observations 0")
         if args.loma_dino_candidates <= 0:
             raise ValueError("loma_dino_candidates must be positive")
+        if min(args.loma_sufficient_neighbors, args.loma_insufficient_neighbors,
+               args.loma_untried_neighbors) < 0:
+            raise ValueError("LoMa neighbor counts must be nonnegative")
         if args.export_vggsfm_groups_only:
             raise ValueError("VGGSfM group export requires --prior_provider vggsfm")
     if prior_pose_mode and args.ba_backend != "bae":
@@ -877,6 +884,7 @@ def main():
                     "s_database_mode": PIPELINE_S_DATABASE_MODE,
                     "prior_provider": args.prior_provider,
                     "loma_dino_candidates": args.loma_dino_candidates if is_loma else None,
+                    "loma_pair_selection": args.loma_pair_selection if is_loma else None,
                     "vggsfm_query_source": None if is_loma else PIPELINE_QUERY_SOURCE,
                     "vggsfm_tracker_input": None if is_loma else PIPELINE_TRACKER_INPUT,
                     "group_strategy": "pose_union_dino_union_temporal" if is_loma else args.vggsfm_group_strategy,
@@ -957,6 +965,10 @@ def main():
     refine_config = GluemapSpvRefineConfig(
         prior_provider=args.prior_provider,
         loma_dino_candidates=args.loma_dino_candidates,
+        loma_pair_selection=args.loma_pair_selection,
+        loma_sufficient_neighbors=args.loma_sufficient_neighbors,
+        loma_insufficient_neighbors=args.loma_insufficient_neighbors,
+        loma_untried_neighbors=args.loma_untried_neighbors,
         path_tracker=args.path_tracker,
         device=args.device,
         neighbors_per_center=args.neighbors_per_center,
@@ -1013,6 +1025,7 @@ def main():
     refine_result = run_gluemap_spv_refinement(state, output_dir, refine_config)
     pipeline_summary = {
         "prior_provider": args.prior_provider,
+        "loma_pair_selection": refine_result.stats.get("pair_graphs", {}).get("loma_selection") if is_loma else None,
         "vggsfm_schedule_mode": None if is_loma else args.vggsfm_schedule_mode,
         "num_input_images": int(state.extrinsic.shape[0]),
         "num_output_images": int(len(refine_result.image_names)),

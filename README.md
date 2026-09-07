@@ -526,8 +526,18 @@ inlier/coverage、阈值 sweep、center/owner 原因和三层 group provenance�
 LoMa 路径先完成 SIFT 匹配，使用两套 pair 图：
 
 - SIFT：当前 pose neighbors（含 rotation threshold）并上 temporal pairs，默认时序窗口 ±2。
-- LoMa：pose pairs ∪ 每图 DINO top-30 ∪ temporal pairs，无向去重后全部匹配。
-  SIFT 的 `sufficient / insufficient / untried` 标注仅用于诊断，不删减候选。
+- LoMa 候选池：pose pairs ∪ 每图 DINO top-30 ∪ temporal pairs，无向去重。
+  默认 `--loma_pair_selection sift_guided`：保留全部 temporal，每图从剩余候选中
+  最多选择 sufficient / insufficient / untried 各 3 / 5 / 5 个邻居。
+  任一方向选中就执行，某类不足不跨类补齐。使用 `--loma_pair_selection all`
+  可恢复首版全候选匹配，作为对照。
+
+Sufficient 先按双向 SIFT 覆盖率的较小值、内点数、DINO 相似度降序排列；
+insufficient/untried 先按 DINO 相似度，再按覆盖率和内点数排列，不优先选零匹配边。
+逐次选择时，优先选与本帧已保留邻居的序号间隔超过 `sift_temporal_window` 的候选，
+没有此类候选时按原排序补足本类名额。类别按 sufficient → insufficient → untried
+顺序处理，以 temporal 邻居初始化；序号间隔只用于减少相邻重复视图，不保证几何差异。
+排序最终以图像序号打破并列，选择结果可复现。
 
 每张工作图使用原生路径预处理提取一次特征，保留 LoMa-B 默认 2048 个关键点及
 0.1 匹配阈值。固定 feature ID 经过 pycolmap 两视图几何验证后写入 prior DB，
@@ -541,6 +551,10 @@ python run_merg3r_gluemap_pipeline.py \
   --dataset /path/to/images \
   --output_dir /path/to/output_loma \
   --prior_provider loma \
+  --loma_pair_selection sift_guided \
+  --loma_sufficient_neighbors 3 \
+  --loma_insufficient_neighbors 5 \
+  --loma_untried_neighbors 5 \
   --ba_backend bae \
   --bae_max_observations 0 \
   --bae_optimize_intrinsics
@@ -553,12 +567,13 @@ LoMa V1 只支持 BAE，不启用 observation cap；传入正的 `bae_max_observ
 
 模型从仓库 `third_party/LoMa/src` 加载，依赖见其 `pyproject.toml`；首次加载会使用
 上游的权重下载与缓存机制。特征只缓存在本次进程的 CPU 内存中。
-输出 `prior_loma_pairs.json`（候选来源、SIFT 标注和匹配结果）、
+输出 `prior_loma_pairs.json`（全候选来源、SIFT 标注、选择方向/原因及已执行边的匹配结果）、
 `prior_loma_stats.json`（分阶段时间、验证图连通性、唯一观测及最终轨长统计）、
 `database_loma_prior.db`，并沿用 `refine_stats.json` 和原有 COLMAP 输出目录。
 
-已通过 CPU 上的真实 pycolmap 几何验证、DB 合并/重映射及三图成轨测试；
-LoMa 权重推理和 BAE 的 GPU 端到端验证待运行，速度与质量收益尚无实测结论。
+全候选版本已在 789 图、Ubuntu/4090 上完成用户实测，端到端 2144.90 s，
+尚未达到加速目标，详见 `logs/loma_789_data/`。
+3/5/5 筛选版本已通过 CPU 选择逻辑、真实 pycolmap 几何与 DB 衔接测试，GPU 质量/速度对照待运行。
 详细设计见 [LoMa prior V1](.ai/plan/loma_prior_lite_design.md)。
 
 ### Nerfstudio Prior Pose 输入

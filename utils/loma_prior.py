@@ -1,4 +1,4 @@
-"""Indexed LoMa prior matches; selection is independent of SIFT success.
+"""Indexed LoMa prior matches with independent recall and SIFT-guided selection.
 
 Torch and the vendored model are imported only by the inference adapter. Pair
 construction, annotation, geometry verification and DB export also run on CPU.
@@ -140,6 +140,143 @@ def annotate_loma_pairs_with_sift(pair_records, sift_pairs, sift_schedule):
             )
         annotated.append(result)
     return annotated
+
+
+def select_loma_pairs(
+    pair_records,
+    retrieval_matrix,
+    *,
+    mode="sift_guided",
+    sufficient_neighbors=3,
+    insufficient_neighbors=5,
+    untried_neighbors=5,
+    temporal_window=2,
+):
+    """Select from the annotated pool, retaining either endpoint's choice.
+
+    Temporal edges do not consume quotas. Each image selects independently;
+    incoming choices never consume its outgoing quota. Temporal separation is
+    a soft diversity preference, not an overlap or geometric validity test.
+    """
+    quotas = {
+        "sufficient": sufficient_neighbors,
+        "insufficient": insufficient_neighbors,
+        "untried": untried_neighbors,
+    }
+    if mode not in {"all", "sift_guided"}:
+        raise ValueError(f"Unsupported LoMa pair selection: {mode}")
+    if any(value < 0 for value in quotas.values()) or temporal_window < 0:
+        raise ValueError("LoMa neighbor counts and temporal window must be nonnegative")
+    similarity = np.asarray(retrieval_matrix, dtype=np.float64)
+    if similarity.ndim != 2 or similarity.shape[0] != similarity.shape[1]:
+        raise ValueError("LoMa selection requires a square DINO retrieval matrix")
+    n = len(similarity)
+    records = [
+        {**record, "selected": False, "executed": False, "selection": []}
+        for record in pair_records
+    ]
+    adjacency = [[] for _ in range(n)]
+    seen = set()
+    for index, record in enumerate(records):
+        i, j = record["pair"]
+        if not 0 <= i < j < n or (i, j) in seen:
+            raise ValueError("LoMa selection requires unique canonical candidate pairs")
+        seen.add((i, j))
+        if record["sift_support"] not in quotas:
+            raise ValueError(f"Unknown SIFT support: {record['sift_support']}")
+        adjacency[i].append((j, index))
+        adjacency[j].append((i, index))
+        if mode == "all" or "temporal" in record["sources"]:
+            record["selected"] = True
+            record["selection"].append(
+                {"reason": "all_candidates" if mode == "all" else "temporal"}
+            )
+
+    directed_counts = []
+    for i, neighbors in enumerate(adjacency):
+        counts = dict.fromkeys(quotas, 0)
+        selected_neighbors = [
+            j for j, idx in neighbors if "temporal" in records[idx]["sources"]
+        ]
+
+        def rank_key(candidate, support):
+            j, idx = candidate
+            sift = records[idx]["sift"]
+            coverage = (
+                min(sift["source_grid_coverage"], sift["target_grid_coverage"])
+                if sift
+                else 0.0
+            )
+            inliers = sift["inlier_count"] if sift else 0
+            sim = float(similarity[i, j])
+            sim = sim if np.isfinite(sim) else -np.inf
+            # Reliable edges prioritize verified SIFT support. Weak/untried
+            # edges prioritize retrieval plausibility, never the lowest count.
+            return (
+                (-coverage, -inliers, -sim, j)
+                if support == "sufficient"
+                else (-sim, -coverage, -inliers, j)
+            )
+
+        if mode == "sift_guided":
+            for support, limit in quotas.items():
+                candidates = sorted(
+                    [
+                        (j, idx)
+                        for j, idx in neighbors
+                        if "temporal" not in records[idx]["sources"]
+                        and records[idx]["sift_support"] == support
+                    ],
+                    key=lambda item: rank_key(item, support),
+                )
+                for rank in range(1, min(limit, len(candidates)) + 1):
+                    diverse = [
+                        item
+                        for item in candidates
+                        if all(
+                            abs(item[0] - other) > temporal_window
+                            for other in selected_neighbors
+                        )
+                    ]
+                    j, idx = (diverse or candidates)[0]
+                    candidates.remove((j, idx))
+                    selected_neighbors.append(j)
+                    counts[support] += 1
+                    sim = float(similarity[i, j])
+                    records[idx]["selected"] = True
+                    records[idx]["selection"].append(
+                        {
+                            "reason": support,
+                            "source": i,
+                            "target": j,
+                            "rank": rank,
+                            "dino_similarity": sim if np.isfinite(sim) else None,
+                            "temporally_separated": bool(diverse),
+                        }
+                    )
+        directed_counts.append(counts)
+
+    selected = [record for record in records if record["selected"]]
+    for record in records:
+        if not record["selected"]:
+            record["selection"].append({"reason": "not_selected_within_class_quota"})
+    stats = {
+        "mode": mode,
+        "quotas_per_image": quotas,
+        "temporal_window": temporal_window,
+        "ranking": "sufficient: coverage/inliers/DINO; others: DINO/coverage/inliers; image ID tie-break",
+        "diversity": "prefer neighbors farther than temporal_window from earlier choices; soft fallback",
+        "num_candidate_pairs": len(records),
+        "num_selected_pairs": len(selected),
+        "num_skipped_pairs": len(records) - len(selected),
+        "temporal_pairs": sum("temporal" in record["sources"] for record in records),
+        "selected_by_sift_support": dict(
+            Counter(record["sift_support"] for record in selected)
+        ),
+        "directed_choices_per_image": directed_counts,
+        "graph": _graph_stats([record["pair"] for record in selected], n),
+    }
+    return records, stats
 
 
 def normalized_to_work_pixels(keypoints, height, width):

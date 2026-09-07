@@ -76,6 +76,10 @@ class GluemapSpvRefineConfig:
     work_image_workers: int = 16
     prior_provider: str = "vggsfm"
     loma_dino_candidates: int = 30
+    loma_pair_selection: str = "sift_guided"
+    loma_sufficient_neighbors: int = 3
+    loma_insufficient_neighbors: int = 5
+    loma_untried_neighbors: int = 5
 
 
 @dataclass
@@ -100,11 +104,20 @@ def _make_refine_args(config: GluemapSpvRefineConfig):
             raise ValueError("LoMa V1 has no observation cap; use --bae_max_observations 0")
         if config.loma_dino_candidates <= 0:
             raise ValueError("loma_dino_candidates must be positive")
+        if config.loma_pair_selection not in {"all", "sift_guided"}:
+            raise ValueError("loma_pair_selection must be all or sift_guided")
+        if min(config.loma_sufficient_neighbors, config.loma_insufficient_neighbors,
+               config.loma_untried_neighbors) < 0:
+            raise ValueError("LoMa neighbor counts must be nonnegative")
     use_virtual_tracks = config.ba_backend == "ceres"
     return SimpleNamespace(
         path_tracker=config.path_tracker,
         prior_provider=config.prior_provider,
         loma_dino_candidates=config.loma_dino_candidates,
+        loma_pair_selection=config.loma_pair_selection,
+        loma_sufficient_neighbors=config.loma_sufficient_neighbors,
+        loma_insufficient_neighbors=config.loma_insufficient_neighbors,
+        loma_untried_neighbors=config.loma_untried_neighbors,
         track_mode="SPV" if use_virtual_tracks else "SP",
         neighbors_per_center=config.neighbors_per_center,
         pair_pose_rotation_threshold=config.pair_pose_rotation_threshold,
@@ -797,6 +810,7 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
             annotate_loma_pairs_with_sift,
             build_loma_candidate_pairs,
             run_loma_prior,
+            select_loma_pairs,
         )
 
         t0 = time.time()
@@ -805,24 +819,40 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
             dino_topk=args.loma_dino_candidates,
         )
         loma_records = annotate_loma_pairs_with_sift(loma_records, pairs, sift_schedule_stats)
+        loma_records, selection_stats = select_loma_pairs(
+            loma_records, coarse_state.retrieval_sim_matrix,
+            mode=args.loma_pair_selection,
+            sufficient_neighbors=args.loma_sufficient_neighbors,
+            insufficient_neighbors=args.loma_insufficient_neighbors,
+            untried_neighbors=args.loma_untried_neighbors,
+            temporal_window=args.sift_temporal_window,
+        )
         stats["pair_graphs"]["loma"] = graph_stats
+        stats["pair_graphs"]["loma_selection"] = selection_stats
         stats["timing"]["loma_pair_build"] = time.time() - t0
         # Save planned work before inference, including untried SIFT candidates.
         _write_json(output_dir / "prior_loma_pairs.json", {
             "image_names": image_names, "graph": graph_stats,
+            "selection": selection_stats,
             "sift_support_config": sift_schedule_stats["config"], "pairs": loma_records,
         })
-        _debug(args, f"Running LoMa-B prior: {len(loma_records)} pairs, no track/observation cap")
+        selected_records = [record for record in loma_records if record["selected"]]
+        _debug(args, f"Running LoMa-B prior: selected={len(selected_records)}/{len(loma_records)} pairs, "
+               f"selection={args.loma_pair_selection}, no track/observation cap")
         loma_result = run_loma_prior(
             [images_dir / name for name in image_names], image_size_hw,
-            initial_intrinsics_high_all, loma_records, device=args.device,
+            initial_intrinsics_high_all, selected_records, device=args.device,
         )
         stats["loma"] = loma_result.stats
+        stats["loma"]["pair_selection"] = selection_stats
         stats["timing"]["loma_prior_matches"] = loma_result.stats["timing"]["total"]
         _write_json(output_dir / "prior_loma_stats.json", loma_result.stats)
+        executed_records = {tuple(record["pair"]): record for record in loma_result.pair_records}
         _write_json(output_dir / "prior_loma_pairs.json", {
             "image_names": image_names, "graph": graph_stats,
-            "sift_support_config": sift_schedule_stats["config"], "pairs": loma_result.pair_records,
+            "selection": selection_stats,
+            "sift_support_config": sift_schedule_stats["config"],
+            "pairs": [executed_records.get(tuple(record["pair"]), record) for record in loma_records],
         })
         # No synthetic tracks: the indexed graph is triangulated downstream.
         prior_tracks = []

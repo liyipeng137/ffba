@@ -89,6 +89,138 @@ def test_pixel_centers_roundtrip_without_half_pixel_shift_or_clamping():
     )
 
 
+def _selection_record(
+    i, j, support="untried", temporal=False, inliers=100, coverage=0.1
+):
+    return {
+        "pair": [i, j],
+        "sources": ["temporal"] if temporal else ["dino"],
+        "sift_support": support,
+        "sift": None
+        if support == "untried"
+        else {
+            "inlier_count": inliers,
+            "source_grid_coverage": coverage,
+            "target_grid_coverage": coverage,
+        },
+    }
+
+
+def test_selection_preserves_temporal_zero_quotas_and_all_mode():
+    pool = [_selection_record(0, 1, temporal=True), _selection_record(0, 2)]
+    similarity = np.ones((3, 3))
+    records, stats = loma.select_loma_pairs(
+        pool,
+        similarity,
+        sufficient_neighbors=0,
+        insufficient_neighbors=0,
+        untried_neighbors=0,
+    )
+    assert [r["pair"] for r in records if r["selected"]] == [[0, 1]]
+    assert not records[1]["executed"] and "raw_matches" not in records[1]
+    assert stats["graph"]["components"] == [[0, 1], [2]]
+    all_records, _ = loma.select_loma_pairs(pool, similarity, mode="all")
+    assert all(r["selected"] for r in all_records)
+    assert all("selected" not in r for r in pool)  # input audit stays immutable
+    with pytest.raises(ValueError, match="nonnegative"):
+        loma.select_loma_pairs(pool, similarity, insufficient_neighbors=-1)
+
+
+def test_selection_limits_each_class_without_refill_or_incoming_degree_cap():
+    n = 31
+    pool = [
+        _selection_record(
+            0, j, ("sufficient", "insufficient", "untried")[(j - 1) // 10]
+        )
+        for j in range(1, n)
+    ]
+    records, stats = loma.select_loma_pairs(pool, np.ones((n, n)))
+    assert stats["directed_choices_per_image"][0] == {
+        "sufficient": 3,
+        "insufficient": 5,
+        "untried": 5,
+    }
+    assert stats["directed_choices_per_image"][1] == {
+        "sufficient": 1,
+        "insufficient": 0,
+        "untried": 0,
+    }
+    assert stats["graph"]["degree"][0] == 30  # all leaf choices are retained
+    assert all(r["selected"] for r in records)
+    for r in records:
+        assert any(choice.get("source") == r["pair"][1] for choice in r["selection"])
+
+
+def test_selection_ranks_reliable_support_and_plausible_weak_edges_with_soft_diversity():
+    pool = [
+        _selection_record(0, 1, "sufficient", inliers=200, coverage=0.3),
+        _selection_record(0, 2, "sufficient", inliers=300, coverage=0.4),
+        _selection_record(0, 3, "insufficient", inliers=0),
+        _selection_record(0, 4, "insufficient", inliers=90),
+        _selection_record(0, 5, "untried"),
+        _selection_record(0, 6, "untried"),
+        _selection_record(0, 9, "untried"),
+    ]
+    sim = np.zeros((10, 10))
+    sim[0, [1, 2, 3, 4, 5, 6, 9]] = [0.9, 0.8, 0.1, 0.9, 0.9, 0.8, 0.7]
+    records, _ = loma.select_loma_pairs(
+        pool,
+        sim,
+        sufficient_neighbors=1,
+        insufficient_neighbors=1,
+        untried_neighbors=2,
+        temporal_window=1,
+    )
+    choices = [
+        (r["pair"][1], c["reason"], c["rank"])
+        for r in records
+        for c in r["selection"]
+        if c.get("source") == 0
+    ]
+    assert choices == [
+        (2, "sufficient", 1),
+        (4, "insufficient", 1),
+        (6, "untried", 1),
+        (9, "untried", 2),
+    ]
+    # If all candidates are adjacent, diversity must not prevent quota filling.
+    records, _ = loma.select_loma_pairs(
+        pool, sim, untried_neighbors=3, temporal_window=100
+    )
+    assert (
+        sum(
+            c.get("source") == 0 and c["reason"] == "untried"
+            for r in records
+            for c in r["selection"]
+        )
+        == 3
+    )
+
+
+def test_selection_is_deterministic_and_within_pool_and_pair_bound():
+    n = 50
+    rng = np.random.default_rng(13)
+    sim = rng.normal(size=(n, n))
+    pool = [
+        _selection_record(
+            i,
+            j,
+            ("sufficient", "insufficient", "untried")[(i + j) % 3],
+            temporal=j - i <= 2,
+        )
+        for i in range(n)
+        for j in range(i + 1, n)
+    ]
+    a, stats = loma.select_loma_pairs(pool, sim)
+    b, _ = loma.select_loma_pairs(list(reversed(pool)), sim)
+    assert {tuple(r["pair"]): r["selection"] for r in a} == {
+        tuple(r["pair"]): r["selection"] for r in b
+    }
+    assert stats["num_selected_pairs"] <= stats["temporal_pairs"] + n * 13
+    assert stats["graph"]["num_components"] == 1
+    assert stats["num_skipped_pairs"] > 0
+
+
 def _synthetic_features():
     rng = np.random.default_rng(19)
     points = rng.uniform([-1.2, -0.8, 4], [1.2, 0.8, 8], (100, 3))
@@ -291,6 +423,12 @@ def test_provider_config_preserves_vggsfm_and_disallows_hidden_loma_cap():
         Config(path_tracker="not-used", prior_provider="loma", ba_backend="bae")
     )
     assert loma_args.bae_max_observations == 0
+    assert loma_args.loma_pair_selection == "sift_guided"
+    assert (
+        loma_args.loma_sufficient_neighbors,
+        loma_args.loma_insufficient_neighbors,
+        loma_args.loma_untried_neighbors,
+    ) == (3, 5, 5)
     assert not loma_args.build_virtual_tracks
     with pytest.raises(ValueError, match="no observation cap"):
         make(
@@ -329,13 +467,22 @@ def test_cli_default_provider_and_intrinsics_can_be_disabled(monkeypatch):
     )
     args = ns["parse_args"]()
     assert args.loma_dino_candidates == 30
+    assert args.loma_pair_selection == "sift_guided"
+    assert (
+        args.loma_sufficient_neighbors,
+        args.loma_insufficient_neighbors,
+        args.loma_untried_neighbors,
+    ) == (3, 5, 5)
     assert args.bae_max_observations == 0
     assert args.bae_optimize_intrinsics is False
 
 
-@pytest.mark.parametrize("has_depth,drop_middle", [(False, False), (True, True)])
+@pytest.mark.parametrize(
+    "has_depth,drop_middle,prune_pairs",
+    [(False, False, False), (True, True, False), (False, False, True)],
+)
 def test_refinement_routes_loma_through_sift_merge_and_shared_backend(
-    tmp_path, monkeypatch, has_depth, drop_middle
+    tmp_path, monkeypatch, has_depth, drop_middle, prune_pairs
 ):
     """Actual orchestration/DB merge, synthetic inference and stubbed BA solver."""
     pycolmap = pytest.importorskip("pycolmap")
@@ -389,7 +536,7 @@ def test_refinement_routes_loma_through_sift_merge_and_shared_backend(
                 "source_grid_coverage": 0,
                 "target_grid_coverage": 0,
             }
-            for pair in ([0, 1], [0, 2], [1, 2])
+            for pair in _args[2].tolist()
         ],
         "verified_pair_count": 0,
         "valid_schedule_pair_count": 0,
@@ -468,6 +615,8 @@ def test_refinement_routes_loma_through_sift_merge_and_shared_backend(
 
     def run(*args, **kwargs):
         events.append("loma")
+        if prune_pairs:
+            assert [r["pair"] for r in args[3]] == [[0, 1], [1, 2]]
         return original_run(*args, **kwargs, backend=SyntheticBackend(feature_data))
 
     monkeypatch.setattr(loma, "run_loma_prior", run)
@@ -501,6 +650,8 @@ def test_refinement_routes_loma_through_sift_merge_and_shared_backend(
                     combined[10:], feature_data[old]["keypoints"]
                 )
             assert (db.read_matches(1, 2) >= 10).all()  # SIFT-first offsets preserved
+            if prune_pairs:
+                assert not db.exists_matches(1, 3)
         finally:
             db.close()
         return (
@@ -558,6 +709,8 @@ def test_refinement_routes_loma_through_sift_merge_and_shared_backend(
         vggsfm_schedule_mode="sift_first_sparse",
         vggsfm_max_center_gap=0,
         bae_optimize_intrinsics=False,
+        sift_temporal_window=1 if prune_pairs else 2,
+        loma_untried_neighbors=0 if prune_pairs else 5,
     )
     result = ns["run_gluemap_spv_refinement"](state, tmp_path, config)
     assert events == ["sift", "loma", "refine"]
@@ -568,6 +721,12 @@ def test_refinement_routes_loma_through_sift_merge_and_shared_backend(
     assert not (tmp_path / "database_vggsfm_prior.db").exists()
     assert not (tmp_path / "vggsfm_schedule.json").exists()
     assert (tmp_path / "prior_loma_pairs.json").exists()
+    if prune_pairs:
+        audit = json.loads((tmp_path / "prior_loma_pairs.json").read_text())
+        assert audit["selection"]["num_selected_pairs"] == 2
+        skipped = next(r for r in audit["pairs"] if r["pair"] == [0, 2])
+        assert not skipped["selected"] and not skipped["executed"]
+        assert "inlier_matches" not in skipped
     assert json.loads((tmp_path / "refine_stats.json").read_text())["loma"][
         "final_tracks"
     ]

@@ -1,11 +1,49 @@
 # SIFT + LoMa 轻量 Prior V1 设计
 
-状态：V1 provider 已接入并通过 CPU 几何/数据库/编排测试；真实 LoMa + BAE GPU 验证待运行  
+状态：全候选 V1 已完成 789 图 GPU 实测；新增默认 3/5/5 pair 筛选，CPU 测试通过，GPU 对照待运行
 更新时间：2026-09-07  
 实验分支：`codex/loma-prior-lite`  
 分支起点：`codex/prior-pose-input` / `fedf938`  
 主入口：[`run_merg3r_gluemap_pipeline.py`](../../run_merg3r_gluemap_pipeline.py)  
 LoMa 源码：[`third_party/LoMa`](../../third_party/LoMa)
+
+## 当前修订：SIFT 引导的 3/5/5 pair 筛选
+
+本节记录首轮 GPU 结果后的已授权修订，优先于下文历史 V1 中“只标注、全部执行、
+不设来源配额”的表述。全候选 V1 保留为 `--loma_pair_selection all` 对照；
+默认改为 `sift_guided`。默认 provider 仍是 VGGSfM。
+
+- SIFT pair 图与 LoMa 的 pose ∪ DINO top-30 ∪ temporal 候选池保持原样。
+- 全保留 temporal ±2（实际窗口沿用 `sift_temporal_window`）；从剩余候选中，
+  每图主动选择 sufficient 最多 3、insufficient 最多 5、untried 最多 5 个邻居。
+- 三类互斥，指 SIFT 支持类别，不是 pose/DINO 来源。Temporal 不占名额，
+  某类不足不跨类补齐；每图独立选择，任一端选中即保留，无向去重后只匹配一次。
+  入边不消耗该帧主动选择名额，因此最终 degree 可以超过 13。
+- Sufficient 的基础排序为 `min(source_coverage, target_coverage)`、SIFT 内点数、
+  当前图到候选图的 DINO 相似度降序；insufficient/untried 为 DINO 相似度、
+  最小覆盖率、内点数降序。未尝试边不填伪造 SIFT 数据；非有限 DINO 值排最后。
+  这层分类和排序不采用“内点越少越优先”的反向筛选。
+- 逐次选择时，优先考虑与该帧已选邻居的序号间隔均大于时序窗口的候选；
+  无此候选时从剩余基础排序首位选择，不因此少选。已选邻居以 temporal 初始化，
+  然后按 sufficient → insufficient → untried 更新。该软偏好只是时序去冗余，
+  不声称已实现基于真实视角差异或空间共视的选择。
+- 基础排序最终以图像 ID 打破并列；无向边保留所有选择方向、类内次序及去冗余原因。
+  不运行动态增配、匹配后提前停止或弱帧自适应配额。
+- 789 张图按窗口 2，执行数量上界为 `1575 + 789 × 13 = 11832`；实际数量必须
+  由候选池计算，不能将此上界当作已测 pair 数。相对首轮 22973 对，上界减少 48.5%。
+
+参数：`--loma_pair_selection {sift_guided,all}`；
+`--loma_sufficient_neighbors 3 --loma_insufficient_neighbors 5 --loma_untried_neighbors 5`。
+每类允许 0，禁止负值。全候选模式忽略这些选择名额。
+关键点数、检测分辨率、匹配/几何阈值、track 建立与 BAE 保持原设置，cap 继续关闭。
+
+`prior_loma_pairs.json` 保留完整候选池，新增 `selected`、`executed`、`selection`。
+未执行的 pair 不写伪造的零匹配/零内点结果。`pair_selection` 统计区分候选/选中/跳过数量、
+每帧主动选择数、选中图连通分量与 degree；验证图统计仅针对实际执行的结果。
+
+验证：新增测试覆盖 3/5/5 上限、时序保留、不跨类补齐、入边保留、排序与时序软偏好、
+确定性、全候选回退，以及未选中边不进入模型或 DB 的编排衔接。云端 3/5/5 对照尚未运行。
+首轮统计文件未包含逐 pair 审计和 DINO 矩阵，当前无法在本机计算其精确筛选名单。
 
 ## 1. 目标与结论
 
