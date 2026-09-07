@@ -6,6 +6,8 @@ construction, annotation, geometry verification and DB export also run on CPU.
 
 from collections import Counter
 from dataclasses import dataclass
+from contextlib import contextmanager
+from functools import partial
 import importlib
 from pathlib import Path
 import sys
@@ -292,9 +294,9 @@ def normalized_to_work_pixels(keypoints, height, width):
 
 
 class LoMaBackend:
-    """Native path preprocessing, once per image; descriptors cached on CPU."""
+    """Native LoMa inference with optional batching and CPU/CUDA feature cache."""
 
-    def __init__(self, device):
+    def __init__(self, device, feature_cache="cpu"):
         import torch
 
         requested = torch.device(device)
@@ -324,6 +326,10 @@ class LoMaBackend:
             )
         self.torch = torch
         self.device = requested
+        self.feature_cache = feature_cache
+        self.phase_seconds = Counter()
+        self._events = []
+        self.extraction_stats = {}
         self.model = module.LoMa(module.LoMaB()).eval().to(requested)
         self.filter_matches = module.filter_matches
         self.metadata = {
@@ -336,9 +342,60 @@ class LoMaBackend:
             "compile": self.model.cfg.compile,
             "torch_version": torch.__version__,
             "device": str(requested),
-            "cache": "CPU, native descriptor dtype, per-run only",
+            "cache": f"{feature_cache}, native descriptor dtype, per-run only",
             "preprocessing": "native path API: DaD resize and DeDoDe 784x784; original work coordinates",
         }
+
+    @contextmanager
+    def _measure(self, name):
+        if self.device.type == "cuda":
+            start = self.torch.cuda.Event(enable_timing=True)
+            end = self.torch.cuda.Event(enable_timing=True)
+            start.record()
+            yield
+            end.record()
+            self._events.append((name, start, end))
+        else:
+            start = time.perf_counter()
+            yield
+            self.phase_seconds[name] += time.perf_counter() - start
+
+    def collect_events(self):
+        # Results are already copied to CPU at batch boundaries. No global
+        # synchronization between detector/descriptor/matcher kernels.
+        for name, start, end in self._events:
+            end.synchronize()
+            self.phase_seconds[name] += start.elapsed_time(end) / 1000
+        self._events.clear()
+
+    def _upload(self, tensors):
+        tensor = self.torch.cat(tensors, dim=0)
+        if tensor.device.type == "cpu" and self.device.type == "cuda":
+            tensor = tensor.pin_memory()
+        return tensor.to(self.device, non_blocking=self.device.type == "cuda")
+
+    def _feature(self, points, descriptions, height, width):
+        with self._measure("d2h"):
+            cpu_points = points.detach().cpu()
+            cached_descriptions = (
+                descriptions.detach().cpu()
+                if self.feature_cache == "cpu"
+                else descriptions.detach()
+            )
+        return {
+            "keypoints": normalized_to_work_pixels(
+                cpu_points[0].numpy(), height, width
+            ),
+            "normalized": cpu_points
+            if self.feature_cache == "cpu"
+            else points.detach(),
+            "descriptors": cached_descriptions,
+            "image_size_hw": (height, width),
+        }
+
+    def close(self):
+        self._events.clear()
+        self.model = None
 
     def synchronize(self):
         if self.device.type == "cuda":
@@ -348,6 +405,8 @@ class LoMaBackend:
         if self.device.type != "cuda":
             return {"cuda_peak_bytes": None}
         return {
+            "cuda_allocated_bytes": self.torch.cuda.memory_allocated(self.device),
+            "cuda_reserved_bytes": self.torch.cuda.memory_reserved(self.device),
             "cuda_peak_allocated_bytes": self.torch.cuda.max_memory_allocated(
                 self.device
             ),
@@ -356,39 +415,185 @@ class LoMaBackend:
             ),
         }
 
+    def reset_memory_peak(self):
+        if self.device.type == "cuda":
+            self.torch.cuda.reset_peak_memory_stats(self.device)
+
     def extract(self, path):
+        start = time.perf_counter()
         with self.torch.inference_mode():
             points, descriptions, height, width = self.model.detect_and_describe(
                 str(path)
             )
-        points = points.detach().cpu()
-        return {
-            "keypoints": normalized_to_work_pixels(points[0].numpy(), height, width),
-            "normalized": points,
-            "descriptors": descriptions.detach().cpu(),
-            "image_size_hw": (height, width),
-        }
+        feature = self._feature(points, descriptions, height, width)
+        self.collect_events()
+        self.phase_seconds["native_extract_wall"] += time.perf_counter() - start
+        return feature
+
+    def extract_batched(self, paths, batch_size, workers):
+        from utils.loma_execution import (
+            bucket_batches,
+            image_shape,
+            prepare_image,
+            prefetch_batches,
+        )
+
+        detector = self.model._detector
+        shape = partial(
+            image_shape,
+            resize=detector.resize,
+            keep_aspect_ratio=detector.keep_aspect_ratio,
+        )
+        prepare = partial(
+            prepare_image,
+            resize=detector.resize,
+            keep_aspect_ratio=detector.keep_aspect_ratio,
+        )
+        shapes = [shape(path) for path in paths]
+        batches = bucket_batches(range(len(paths)), lambda i: shapes[i], batch_size)
+        stats = {"mode": "batched", "batch_size_histogram": {}, "buckets": []}
+        self.extraction_stats = stats
+        histogram = Counter()
+        buckets = Counter()
+        bucket_images = Counter()
+        iterator = prefetch_batches(
+            batches, lambda i: prepare(paths[i]), workers, stats
+        )
+        try:
+            for prepared in iterator:
+                ids = [i for i, _ in prepared]
+                try:
+                    with self.torch.inference_mode():
+                        self.phase_seconds["preprocess_tasks"] += sum(
+                            data["seconds"] for _, data in prepared
+                        )
+                        with self._measure("h2d"):
+                            detector_images = self._upload(
+                                [
+                                    self.torch.from_numpy(data["detector"])[None]
+                                    for _, data in prepared
+                                ]
+                            )
+                            descriptor_images = self._upload(
+                                [
+                                    self.torch.from_numpy(data["descriptor"])[None]
+                                    for _, data in prepared
+                                ]
+                            )
+                        with self._measure("detector"):
+                            points = detector.detect(
+                                {"image": detector_images},
+                                num_keypoints=self.model.cfg.num_keypoints,
+                            )["keypoints"]
+                        with self._measure("descriptor"):
+                            descriptions = self.model._descriptor.describe_keypoints(
+                                descriptor_images, points
+                            )["descriptions"]
+                        features = [
+                            self._feature(
+                                points[k : k + 1],
+                                descriptions[k : k + 1],
+                                *data["image_size_hw"],
+                            )
+                            for k, (_, data) in enumerate(prepared)
+                        ]
+                    self.collect_events()
+                    histogram[len(ids)] += 1
+                    buckets[shapes[ids[0]]] += 1
+                    bucket_images[shapes[ids[0]]] += len(ids)
+                    del (
+                        detector_images,
+                        descriptor_images,
+                        points,
+                        descriptions,
+                        prepared,
+                    )
+                    for i, feature in zip(ids, features, strict=True):
+                        yield i, feature
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"LoMa extraction batch images={ids}, batch={len(ids)}, "
+                        f"completed_images={sum(size * count for size, count in histogram.items())}, "
+                        f"cache={self.feature_cache}, memory={self.memory_stats()}: {exc}"
+                    ) from exc
+        finally:
+            iterator.close()
+            stats["batch_size_histogram"] = dict(histogram)
+            stats["buckets"] = [
+                {
+                    "detector_size_wh": list(size),
+                    "images": bucket_images[size],
+                    "forward_calls": count,
+                }
+                for size, count in buckets.items()
+            ]
+
+    def match_batch(self, pairs):
+        """Match one homogeneous shape bucket; return one output per input pair."""
+        if not pairs:
+            return []
+        if not len(pairs[0][0]["keypoints"]) or not len(pairs[0][1]["keypoints"]):
+            return [
+                (np.empty((0, 2), dtype=np.uint32), np.empty(0, dtype=np.float32))
+                for _ in pairs
+            ]
+        with self.torch.inference_mode():
+            with self._measure("h2d_or_cache_gather"):
+                inputs = [
+                    self._upload([pair[side][field] for pair in pairs])
+                    for field in ("normalized", "descriptors")
+                    for side in (0, 1)
+                ]
+            with self._measure("matcher"):
+                result = self.model(*inputs)
+                indices, _, scores, _ = self.filter_matches(
+                    result["scores"], self.model.cfg.filter_threshold
+                )
+            # Transfer O(B*N) outputs, not O(B*N*N) assignment matrices.
+            with self._measure("d2h"):
+                indices = indices.cpu().numpy()
+                scores = scores.float().cpu().numpy()
+        self.collect_events()
+        outputs = []
+        for ids, values in zip(indices, scores, strict=True):
+            valid = ids >= 0
+            outputs.append(
+                (
+                    np.column_stack((np.flatnonzero(valid), ids[valid])).astype(
+                        np.uint32
+                    ),
+                    values[valid],
+                )
+            )
+        return outputs
 
     def match(self, feature0, feature1):
         if not len(feature0["keypoints"]) or not len(feature1["keypoints"]):
             return np.empty((0, 2), dtype=np.uint32), np.empty(0, dtype=np.float32)
         with self.torch.inference_mode():
-            result = self.model(
-                feature0["normalized"].to(self.device),
-                feature1["normalized"].to(self.device),
-                feature0["descriptors"].to(self.device),
-                feature1["descriptors"].to(self.device),
-            )
-            indices, _, scores, _ = self.filter_matches(
-                result["scores"], self.model.cfg.filter_threshold
-            )
-            valid = indices[0] >= 0
-            matches = self.torch.stack(
-                (self.torch.where(valid)[0], indices[0][valid]), dim=-1
-            )
-            return matches.cpu().numpy().astype(np.uint32), scores[0][
-                valid
-            ].float().cpu().numpy()
+            with self._measure("h2d_or_cache_gather"):
+                inputs = (
+                    feature0["normalized"].to(self.device),
+                    feature1["normalized"].to(self.device),
+                    feature0["descriptors"].to(self.device),
+                    feature1["descriptors"].to(self.device),
+                )
+            with self._measure("matcher"):
+                result = self.model(*inputs)
+                indices, _, scores, _ = self.filter_matches(
+                    result["scores"], self.model.cfg.filter_threshold
+                )
+                valid = indices[0] >= 0
+                matches = self.torch.stack(
+                    (self.torch.where(valid)[0], indices[0][valid]), dim=-1
+                )
+            with self._measure("d2h"):
+                output = (
+                    matches.cpu().numpy().astype(np.uint32),
+                    scores[0][valid].float().cpu().numpy(),
+                )
+        self.collect_events()
+        return output
 
 
 def _camera(pycolmap, intrinsic, image_size_hw, camera_id=1):
@@ -447,80 +652,274 @@ class LoMaPriorResult:
 
 
 def run_loma_prior(
-    image_paths, image_size_hw, intrinsics, pair_records, device="cuda", backend=None
+    image_paths,
+    image_size_hw,
+    intrinsics,
+    pair_records,
+    device="cuda",
+    backend=None,
+    *,
+    match_batch_size=1,
+    extract_batch_size=1,
+    preprocess_workers=0,
+    geometry_workers=1,
+    feature_cache="cpu",
 ):
+    from utils.loma_execution import validate_execution
+
+    validate_execution(
+        device,
+        match_batch_size,
+        extract_batch_size,
+        preprocess_workers,
+        geometry_workers,
+        feature_cache,
+    )
+    start = time.perf_counter()
+    owned = backend is None
+    if owned:
+        try:
+            backend = LoMaBackend(device, feature_cache=feature_cache)
+        except Exception as exc:
+            raise RuntimeError(
+                f"LoMa model loading failed on {device}, cache={feature_cache}: {exc}"
+            ) from exc
+    try:
+        return _run_loma_prior(
+            image_paths,
+            image_size_hw,
+            intrinsics,
+            pair_records,
+            backend,
+            start,
+            match_batch_size,
+            extract_batch_size,
+            preprocess_workers,
+            geometry_workers,
+            feature_cache,
+        )
+    finally:
+        if owned:
+            backend.close()
+
+
+def _verify_pair(pair, points0, points1, matches, intrinsic0, intrinsic1, size):
     import pycolmap
 
     start = time.perf_counter()
-    if backend is None:
-        backend = LoMaBackend(device)
-    backend.synchronize()
-    timing = {"model_load": time.perf_counter() - start}
-    t0 = time.perf_counter()
-    cache = []
-    for position, path in enumerate(image_paths, start=1):
-        feature = backend.extract(path)
-        if tuple(feature["image_size_hw"]) != tuple(image_size_hw):
-            raise ValueError(f"LoMa work image size differs from geometry: {path}")
-        cache.append(feature)
-        if position % 100 == 0 or position == len(image_paths):
-            print(
-                f"[LOMA-PRIOR] Extracted {position}/{len(image_paths)} images",
-                flush=True,
-            )
-    backend.synchronize()
-    timing["feature_extraction"] = time.perf_counter() - t0
-    timing.update(matching=0.0, geometric_verification=0.0)
-    cameras = [
-        _camera(pycolmap, intrinsic, image_size_hw, i + 1)
-        for i, intrinsic in enumerate(intrinsics)
-    ]
-    if len(cameras) != len(cache):
-        raise ValueError("LoMa intrinsics/image count mismatch")
-    options = pycolmap.TwoViewGeometryOptions()
-    geometries = {}
-    records = []
-    for position, record in enumerate(pair_records, start=1):
-        i, j = record["pair"]
-        t0 = time.perf_counter()
-        matches, scores = backend.match(cache[i], cache[j])
-        backend.synchronize()
-        timing["matching"] += time.perf_counter() - t0
-        matches = np.asarray(matches, dtype=np.uint32).reshape(-1, 2)
-        if len(matches) and (
-            matches[:, 0].max() >= len(cache[i]["keypoints"])
-            or matches[:, 1].max() >= len(cache[j]["keypoints"])
-        ):
-            raise ValueError(f"LoMa returned invalid feature indices for {(i, j)}")
-        t0 = time.perf_counter()
+    try:
         geometry = pycolmap.TwoViewGeometry()
         if len(matches):
+            options = pycolmap.TwoViewGeometryOptions()
+            options.ransac.num_threads = 1
             geometry = pycolmap.estimate_two_view_geometry(
-                cameras[i],
-                cache[i]["keypoints"],
-                cameras[j],
-                cache[j]["keypoints"],
+                _camera(pycolmap, intrinsic0, size),
+                points0,
+                _camera(pycolmap, intrinsic1, size),
+                points1,
                 matches,
                 options,
             )
-        timing["geometric_verification"] += time.perf_counter() - t0
+        return geometry, time.perf_counter() - start
+    except Exception as exc:
+        raise RuntimeError(f"LoMa pair {pair} verification failed: {exc}") from exc
+
+
+def _run_loma_prior(
+    image_paths,
+    image_size_hw,
+    intrinsics,
+    pair_records,
+    backend,
+    start,
+    match_batch_size,
+    extract_batch_size,
+    preprocess_workers,
+    geometry_workers,
+    feature_cache,
+):
+    import pycolmap
+    from utils.loma_execution import GeometryQueue, bucket_batches
+
+    backend.synchronize()
+    timing = {"model_load": time.perf_counter() - start}
+
+    def memory_snapshot():
+        snapshot = backend.memory_stats() if hasattr(backend, "memory_stats") else {}
+        if hasattr(backend, "reset_memory_peak"):
+            backend.reset_memory_peak()
+        return snapshot
+
+    memory = {"model_load": memory_snapshot()}
+    print(
+        f"[LOMA-PRIOR] Execution: match_batch={match_batch_size}, "
+        f"extract_batch={extract_batch_size}, preprocess_workers={preprocess_workers}, "
+        f"geometry_workers={geometry_workers}, feature_cache={feature_cache}",
+        flush=True,
+    )
+    t0 = time.perf_counter()
+    cache = [None] * len(image_paths)
+    if len(intrinsics) != len(cache):
+        raise ValueError("LoMa intrinsics/image count mismatch")
+    extraction = (
+        backend.extract_batched(image_paths, extract_batch_size, preprocess_workers)
+        if extract_batch_size > 1 or preprocess_workers > 0
+        else ((i, backend.extract(path)) for i, path in enumerate(image_paths))
+    )
+    try:
+        for position, (i, feature) in enumerate(extraction, start=1):
+            if not 0 <= i < len(cache) or cache[i] is not None:
+                raise ValueError(
+                    f"LoMa extraction returned duplicate/invalid image index {i}"
+                )
+            if tuple(feature["image_size_hw"]) != tuple(image_size_hw):
+                raise ValueError(
+                    f"LoMa work image size differs from geometry: {image_paths[i]}"
+                )
+            cache[i] = feature
+            if position % 100 == 0 or position == len(image_paths):
+                print(
+                    f"[LOMA-PRIOR] Extracted {position}/{len(image_paths)} images",
+                    flush=True,
+                )
+    finally:
+        extraction.close()
+    if any(feature is None for feature in cache):
+        raise ValueError("LoMa extraction did not return every image")
+    backend.synchronize()
+    timing["feature_extraction"] = time.perf_counter() - t0
+    memory["feature_extraction"] = memory_snapshot()
+    cache_bytes = sum(
+        t.numel() * t.element_size()
+        for feature in cache
+        for name in ("normalized", "descriptors")
+        if (t := feature.get(name)) is not None
+    )
+    timing.update(matching=0.0, geometric_verification=0.0, schema_version=2)
+    options = pycolmap.TwoViewGeometryOptions()
+    options.ransac.num_threads = 1
+    geometries = {}
+    records = [dict(record) for record in pair_records]
+    # Reject invalid/duplicate input before dispatch; restoration assumes one job per pair.
+    canonical = _pairs([record["pair"] for record in records], len(cache))
+    if len(canonical) != len(records) or any(
+        tuple(record["pair"]) not in canonical for record in records
+    ):
+        raise ValueError("LoMa execution requires unique canonical pairs")
+
+    def consume(position, output):
+        geometry, seconds = output
+        timing["geometric_verification"] += seconds
         inliers = len(geometry.inlier_matches)
         if inliers:
-            geometries[(i, j)] = geometry
-        records.append(
-            {
-                **record,
-                "executed": True,
-                "raw_matches": len(matches),
-                "inlier_matches": inliers,
-                "geometry_config": int(geometry.config),
-                "match_score_mean": float(np.mean(scores)) if len(scores) else None,
-            }
+            geometries[tuple(records[position]["pair"])] = geometry
+        records[position].update(
+            executed=True, inlier_matches=inliers, geometry_config=int(geometry.config)
         )
-        if position % 100 == 0 or position == len(pair_records):
-            print(
-                f"[LOMA-PRIOR] Matched {position}/{len(pair_records)} pairs", flush=True
+
+    def shape_key(position):
+        pair = records[position]["pair"]
+        return tuple(
+            (
+                len(cache[i]["keypoints"]),
+                tuple(cache[i]["descriptors"].shape[2:])
+                if "descriptors" in cache[i]
+                else (),
+                str(cache[i]["descriptors"].dtype)
+                if "descriptors" in cache[i]
+                else "synthetic",
             )
+            for i in pair
+        )
+
+    batches = (
+        bucket_batches(range(len(records)), shape_key, match_batch_size)
+        if match_batch_size > 1
+        else ([i] for i in range(len(records)))
+    )
+    batch_histogram = Counter()
+    bucket_stats = {}
+    completed = 0
+    match_start = time.perf_counter()
+    with GeometryQueue(
+        geometry_workers, max(2 * match_batch_size, geometry_workers), consume
+    ) as queue:
+        for batch in batches:
+            queue.collect()
+            t0 = time.perf_counter()
+            inputs = [
+                (cache[records[p]["pair"][0]], cache[records[p]["pair"][1]])
+                for p in batch
+            ]
+            try:
+                outputs = (
+                    backend.match_batch(inputs)
+                    if match_batch_size > 1
+                    else [backend.match(*inputs[0])]
+                )
+                backend.synchronize()
+            except Exception as exc:
+                raise RuntimeError(
+                    f"LoMa matching pairs={[records[p]['pair'] for p in batch]}, batch={len(batch)}, completed_pairs={completed}/{len(records)}, cache={feature_cache}, cache_bytes={cache_bytes}: {exc}"
+                ) from exc
+            timing["matching"] += time.perf_counter() - t0
+            if len(outputs) != len(batch):
+                raise ValueError(
+                    "LoMa batch returned a different number of pair results"
+                )
+            batch_histogram[len(batch)] += 1
+            key = str(shape_key(batch[0]))
+            bucket = bucket_stats.setdefault(
+                key, {"pairs": 0, "calls": 0, "batch_size_histogram": {}}
+            )
+            bucket["pairs"] += len(batch)
+            bucket["calls"] += 1
+            bucket["batch_size_histogram"][len(batch)] = (
+                bucket["batch_size_histogram"].get(len(batch), 0) + 1
+            )
+            for position, (matches, scores) in zip(batch, outputs, strict=True):
+                i, j = records[position]["pair"]
+                matches = np.asarray(matches, dtype=np.uint32).reshape(-1, 2)
+                if len(scores) != len(matches):
+                    raise ValueError(f"LoMa score/match count mismatch for {(i, j)}")
+                if len(matches) and (
+                    matches[:, 0].max() >= len(cache[i]["keypoints"])
+                    or matches[:, 1].max() >= len(cache[j]["keypoints"])
+                ):
+                    raise ValueError(
+                        f"LoMa returned invalid feature indices for {(i, j)}"
+                    )
+                records[position].update(
+                    raw_matches=len(matches),
+                    match_score_mean=float(np.mean(scores)) if len(scores) else None,
+                )
+                queue.submit(
+                    position,
+                    _verify_pair,
+                    (i, j),
+                    cache[i]["keypoints"],
+                    cache[j]["keypoints"],
+                    matches,
+                    intrinsics[i],
+                    intrinsics[j],
+                    image_size_hw,
+                )
+            previous = completed
+            completed += len(batch)
+            if completed // 100 != previous // 100 or completed == len(records):
+                print(
+                    f"[LOMA-PRIOR] Matched {completed}/{len(records)} pairs", flush=True
+                )
+    timing["match_and_verify_wall"] = time.perf_counter() - match_start
+    timing["geometry_queue_wait"] = queue.stats["queue_wait_seconds"]
+    timing["semantics"] = {
+        "matching": "sum of batch wall durations including transfers",
+        "geometric_verification": "sum of CPU task wall durations; overlaps across workers and with matching",
+        "match_and_verify_wall": "elapsed pipeline wall duration; do not add overlapping task durations",
+        "backend_phases": "CUDA event seconds on GPU; CPU wall seconds otherwise. preprocess_tasks sums worker durations. native_extract_wall includes native preprocessing and inference without a kernel breakdown",
+    }
+    timing["backend_phases"] = dict(getattr(backend, "phase_seconds", {}))
+    geometries = dict(sorted(geometries.items()))
     stats = {
         "provider": "loma",
         "model": backend.metadata,
@@ -531,6 +930,19 @@ def run_loma_prior(
         "verified_graph": _graph_stats(geometries, len(cache)),
         "num_keypoints": [len(feature["keypoints"]) for feature in cache],
         "timing": timing,
+        "execution": {
+            "match_batch_size": match_batch_size,
+            "extract_batch_size": extract_batch_size,
+            "preprocess_workers": preprocess_workers,
+            "geometry_workers": geometry_workers,
+            "feature_cache": feature_cache,
+            "feature_cache_bytes": cache_bytes,
+            "matching_batch_histogram": dict(batch_histogram),
+            "matching_buckets": bucket_stats,
+            "extraction": getattr(backend, "extraction_stats", {})
+            or {"mode": "native_path", "forward_calls": len(cache)},
+            "geometry": queue.stats,
+        },
         "track_assembly": "existing pycolmap triangulation; no custom union or pruning",
     }
     result = LoMaPriorResult(
@@ -557,7 +969,16 @@ def run_loma_prior(
             "unique_observations": int(unique.sum()),
         }
     stats["support_counts_overlap"] = True
-    stats["memory"] = backend.memory_stats() if hasattr(backend, "memory_stats") else {}
+    memory["match_and_verify"] = memory_snapshot()
+    stats["memory"] = {
+        name: max(stage[name] for stage in memory.values() if name in stage)
+        for name in ("cuda_peak_allocated_bytes", "cuda_peak_reserved_bytes")
+        if any(name in stage for stage in memory.values())
+    }
+    stats["memory"]["stages"] = memory
+    stats["memory"]["scope"] = (
+        "process CUDA allocator; per-stage peaks reset at stage boundaries; includes other live allocations"
+    )
     timing["total"] = time.perf_counter() - start
     return result
 

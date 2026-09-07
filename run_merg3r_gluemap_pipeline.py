@@ -159,6 +159,16 @@ def parse_args():
     parser.add_argument("--loma_sufficient_neighbors", type=int, default=3)
     parser.add_argument("--loma_insufficient_neighbors", type=int, default=5)
     parser.add_argument("--loma_untried_neighbors", type=int, default=5)
+    parser.add_argument("--loma_match_batch_size", type=int, default=1,
+                        help="LoMa pairs per matcher forward; shape buckets, no padding.")
+    parser.add_argument("--loma_extract_batch_size", type=int, default=1,
+                        help="LoMa images per detector/descriptor forward.")
+    parser.add_argument("--loma_preprocess_workers", type=int, default=0,
+                        help="LoMa CPU image preprocessing threads; 0 runs synchronously.")
+    parser.add_argument("--loma_geometry_workers", type=int, default=1,
+                        help="LoMa two-view geometry workers; >1 overlaps verification and matching.")
+    parser.add_argument("--loma_feature_cache", choices=["cpu", "cuda"], default="cpu",
+                        help="Per-run normalized keypoint/descriptor cache placement.")
     parser.add_argument("--neighbors_per_center", type=int, default=16)
     parser.add_argument(
         "--vggsfm_group_strategy",
@@ -825,6 +835,12 @@ def main():
     prior_pose_mode = args.prior_transforms_json is not None
     is_loma = args.prior_provider == "loma"
     if is_loma:
+        from utils.loma_execution import validate_execution
+
+        validate_execution(
+            args.device, args.loma_match_batch_size, args.loma_extract_batch_size,
+            args.loma_preprocess_workers, args.loma_geometry_workers, args.loma_feature_cache,
+        )
         if args.ba_backend != "bae":
             raise ValueError("LoMa V1 requires --ba_backend bae")
         if args.bae_max_observations > 0:
@@ -969,6 +985,11 @@ def main():
         loma_sufficient_neighbors=args.loma_sufficient_neighbors,
         loma_insufficient_neighbors=args.loma_insufficient_neighbors,
         loma_untried_neighbors=args.loma_untried_neighbors,
+        loma_match_batch_size=args.loma_match_batch_size,
+        loma_extract_batch_size=args.loma_extract_batch_size,
+        loma_preprocess_workers=args.loma_preprocess_workers,
+        loma_geometry_workers=args.loma_geometry_workers,
+        loma_feature_cache=args.loma_feature_cache,
         path_tracker=args.path_tracker,
         device=args.device,
         neighbors_per_center=args.neighbors_per_center,
@@ -1025,6 +1046,7 @@ def main():
     refine_result = run_gluemap_spv_refinement(state, output_dir, refine_config)
     pipeline_summary = {
         "prior_provider": args.prior_provider,
+        "loma_execution": refine_result.stats.get("loma", {}).get("execution") if is_loma else None,
         "loma_pair_selection": refine_result.stats.get("pair_graphs", {}).get("loma_selection") if is_loma else None,
         "vggsfm_schedule_mode": None if is_loma else args.vggsfm_schedule_mode,
         "num_input_images": int(state.extrinsic.shape[0]),

@@ -259,6 +259,13 @@ class SyntheticBackend:
         ids = np.arange(len(feature0["keypoints"]), dtype=np.uint32)
         return np.column_stack((ids, ids)), np.ones(len(ids))
 
+    def match_batch(self, pairs):
+        return [self.match(a, b) for a, b in pairs]
+
+    def extract_batched(self, paths, batch_size, workers):
+        for i in reversed(range(len(paths))):
+            yield i, self.extract(paths[i])
+
 
 def test_real_geometry_db_roundtrip_and_dropped_frame_remap(tmp_path):
     pycolmap = pytest.importorskip("pycolmap")
@@ -430,6 +437,32 @@ def test_provider_config_preserves_vggsfm_and_disallows_hidden_loma_cap():
         loma_args.loma_untried_neighbors,
     ) == (3, 5, 5)
     assert not loma_args.build_virtual_tracks
+    settings = dict(
+        loma_match_batch_size=8,
+        loma_extract_batch_size=2,
+        loma_preprocess_workers=4,
+        loma_geometry_workers=4,
+        loma_feature_cache="cuda",
+    )
+    configured = make(
+        Config(
+            path_tracker="",
+            prior_provider="loma",
+            ba_backend="bae",
+            device="cuda",
+            **settings,
+        )
+    )
+    assert {name: getattr(configured, name) for name in settings} == settings
+    with pytest.raises(ValueError, match="preprocess_workers"):
+        make(
+            Config(
+                path_tracker="",
+                prior_provider="loma",
+                ba_backend="bae",
+                loma_preprocess_workers=-1,
+            )
+        )
     with pytest.raises(ValueError, match="no observation cap"):
         make(
             Config(
@@ -452,6 +485,13 @@ def test_cli_default_provider_and_intrinsics_can_be_disabled(monkeypatch):
     defaults = ns["parse_args"]()
     assert defaults.prior_provider == "vggsfm"
     assert defaults.bae_optimize_intrinsics is True
+    assert (
+        defaults.loma_match_batch_size,
+        defaults.loma_extract_batch_size,
+        defaults.loma_preprocess_workers,
+        defaults.loma_geometry_workers,
+        defaults.loma_feature_cache,
+    ) == (1, 1, 0, 1, "cpu")
     monkeypatch.setattr(
         "sys.argv",
         [
@@ -615,6 +655,23 @@ def test_refinement_routes_loma_through_sift_merge_and_shared_backend(
 
     def run(*args, **kwargs):
         events.append("loma")
+        if has_depth:
+            assert {
+                key: kwargs[key]
+                for key in (
+                    "match_batch_size",
+                    "extract_batch_size",
+                    "preprocess_workers",
+                    "geometry_workers",
+                    "feature_cache",
+                )
+            } == dict(
+                match_batch_size=2,
+                extract_batch_size=2,
+                preprocess_workers=2,
+                geometry_workers=2,
+                feature_cache="cpu",
+            )
         if prune_pairs:
             assert [r["pair"] for r in args[3]] == [[0, 1], [1, 2]]
         return original_run(*args, **kwargs, backend=SyntheticBackend(feature_data))
@@ -711,6 +768,10 @@ def test_refinement_routes_loma_through_sift_merge_and_shared_backend(
         bae_optimize_intrinsics=False,
         sift_temporal_window=1 if prune_pairs else 2,
         loma_untried_neighbors=0 if prune_pairs else 5,
+        loma_match_batch_size=2 if has_depth else 1,
+        loma_extract_batch_size=2 if has_depth else 1,
+        loma_preprocess_workers=2 if has_depth else 0,
+        loma_geometry_workers=2 if has_depth else 1,
     )
     result = ns["run_gluemap_spv_refinement"](state, tmp_path, config)
     assert events == ["sift", "loma", "refine"]

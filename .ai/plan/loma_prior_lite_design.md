@@ -1,11 +1,20 @@
 # SIFT + LoMa 轻量 Prior V1 设计
 
-状态：全候选 V1 已完成 789 图 GPU 实测；新增默认 3/5/5 pair 筛选，CPU 测试通过，GPU 对照待运行
-更新时间：2026-09-07  
+状态：全候选与 3/5/5 已完成 789 图 GPU 实测；执行加速已实现并通过本地 CPU 检查，GPU 数值/速度待验收
+更新时间：2026-09-08
 实验分支：`codex/loma-prior-lite`  
 分支起点：`codex/prior-pose-input` / `fedf938`  
 主入口：[`run_merg3r_gluemap_pipeline.py`](../../run_merg3r_gluemap_pipeline.py)  
 LoMa 源码：[`third_party/LoMa`](../../third_party/LoMa)
+
+## 新增设计：批处理与执行流水加速
+
+详见 [LoMa 执行加速设计](loma_execution_acceleration_design.md)。已增加
+`loma_match_batch_size`、`loma_extract_batch_size`、`loma_preprocess_workers`、
+`loma_geometry_workers`、`loma_feature_cache`。对照默认分别为 `1 / 1 / 0 / 1 / cpu`，
+首轮组合试验为 `8 / 2 / 4 / 4 / cuda`，本轮保持 LoMa-B 与现有 3/5/5。
+参数已贯通主入口与 prior 执行器；提取预处理、稳定索引、有限在途队列、缓存释放、
+计时口径与分项验证顺序见新文档。下文早期 V1 的 CPU-only cache 描述是历史实现状态。
 
 ## 当前修订：SIFT 引导的 3/5/5 pair 筛选
 
@@ -42,8 +51,13 @@ LoMa 源码：[`third_party/LoMa`](../../third_party/LoMa)
 每帧主动选择数、选中图连通分量与 degree；验证图统计仅针对实际执行的结果。
 
 验证：新增测试覆盖 3/5/5 上限、时序保留、不跨类补齐、入边保留、排序与时序软偏好、
-确定性、全候选回退，以及未选中边不进入模型或 DB 的编排衔接。云端 3/5/5 对照尚未运行。
-首轮统计文件未包含逐 pair 审计和 DINO 矩阵，当前无法在本机计算其精确筛选名单。
+确定性、全候选回退，以及未选中边不进入模型或 DB 的编排衔接。
+云端 3/5/5 已实测：选中 9331/22973 对，prior 644.41 s，端到端 1442.05 s；
+相对全候选端到端减少 32.8%，最终 P-only 点减少约 4.1%。验证图保持一个连通分量，
+第 261 帧验证后节点从 858 降到 554，仍需检查最终弱帧覆盖。两轮 SIFT DB 不同，
+不能将全部质量变化归因于 pair 筛选。证据见
+[运行数据](../../logs/ffba_789_loma_355/)。本机现有统计文件未包含逐 pair 审计和
+DINO 矩阵，不能据此复原精确筛选名单。
 
 ## 1. 目标与结论
 

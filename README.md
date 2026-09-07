@@ -566,15 +566,54 @@ LoMa V1 只支持 BAE，不启用 observation cap；传入正的 `bae_max_observ
 有深度前馈输入和 `--prior_transforms_json /path/to/transforms.json` 均可使用同一 LoMa pair 规则。
 
 模型从仓库 `third_party/LoMa/src` 加载，依赖见其 `pyproject.toml`；首次加载会使用
-上游的权重下载与缓存机制。特征只缓存在本次进程的 CPU 内存中。
+上游的权重下载与缓存机制。特征默认缓存在本次进程的 CPU 内存中，也可显式选择 CUDA。
 输出 `prior_loma_pairs.json`（全候选来源、SIFT 标注、选择方向/原因及已执行边的匹配结果）、
 `prior_loma_stats.json`（分阶段时间、验证图连通性、唯一观测及最终轨长统计）、
 `database_loma_prior.db`，并沿用 `refine_stats.json` 和原有 COLMAP 输出目录。
 
 全候选版本已在 789 图、Ubuntu/4090 上完成用户实测，端到端 2144.90 s，
 尚未达到加速目标，详见 `logs/loma_789_data/`。
-3/5/5 筛选版本已通过 CPU 选择逻辑、真实 pycolmap 几何与 DB 衔接测试，GPU 质量/速度对照待运行。
+3/5/5 版本的 789 图实测执行 9,331 pairs，prior 644.41 s、端到端 1,442.05 s，
+详见 `logs/ffba_789_loma_355/`；两次运行的 SIFT 输入有差异，不能直接作为严格质量 A/B。
 详细设计见 [LoMa prior V1](.ai/plan/loma_prior_lite_design.md)。
+
+LoMa 执行加速已接入，默认参数 `1 / 1 / 0 / 1 / cpu` 保留逐图提取、逐对匹配、
+串行几何验证。在原有 LoMa 测试命令后添加以下参数可试跑组合配置：
+
+```bash
+  --loma_match_batch_size 8 \
+  --loma_extract_batch_size 2 \
+  --loma_preprocess_workers 4 \
+  --loma_geometry_workers 4 \
+  --loma_feature_cache cuda
+```
+
+提取按 detector 输入尺寸分桶，matching 按两端特征形状分桶；尾批直接运行。
+预处理最多保留两个提取 batch，几何验证队列上限为
+`max(2 * loma_match_batch_size, loma_geometry_workers)`，每个 RANSAC 任务内部线程数为 1。
+这些限制控制在途内存，不删 pairs/关键点/观测；LoMa-B、3/5/5 与 BAE 配置沿用当前设置。
+CPU/CUDA cache 都仅在本次 prior 生命周期内使用，CUDA cache 在进入 BAE 前释放。
+OOM 会携带阶段、batch 和缓存信息报错，不自动改变配置重试。
+
+`prior_loma_stats.json` 的 `execution` 记录生效配置、实际 batch 分布、cache 字节和队列峰值；
+`memory.stages` 记录各阶段 CUDA allocator 峰值（包含进程中其他存活的分配）。
+`timing.schema_version=2`：`geometric_verification` 是任务累计耗时，可能互相重叠；
+看 `match_and_verify_wall` 和 `total` 判断实际速度，不直接相加 matching 与 geometry。
+新提取路径记录预处理/H2D/detector/descriptor/D2H；默认原生提取只记录整体耗时。
+
+本机已通过 CPU 调度、原生预处理一致性、真实 pycolmap 几何与 DB 衔接测试。
+GPU 数值及速度尚待 Ubuntu/4090 验证。可先在仓库根目录用少量**工作图**做独立检查：
+
+```bash
+PYTHONPATH=. python scripts/check_loma_execution.py \
+  --images_dir /path/to/work_images --num_images 6 \
+  --match_batch_sizes 1 4 8 --extract_batch_sizes 1 2 \
+  --preprocess_workers 4 --output /path/to/loma_execution_check.json
+```
+
+该脚本固定一份原生特征对照 matching batch 与 CPU/CUDA cache，然后检查提取的
+关键点集合、互为最近邻的描述子及重映射匹配；输出数值差异报告，不替代几何/BAE 质量验收。
+完整方案与分项验证顺序见 [LoMa 执行加速](.ai/plan/loma_execution_acceleration_design.md)。
 
 ### Nerfstudio Prior Pose 输入
 

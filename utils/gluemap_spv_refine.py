@@ -80,6 +80,11 @@ class GluemapSpvRefineConfig:
     loma_sufficient_neighbors: int = 3
     loma_insufficient_neighbors: int = 5
     loma_untried_neighbors: int = 5
+    loma_match_batch_size: int = 1
+    loma_extract_batch_size: int = 1
+    loma_preprocess_workers: int = 0
+    loma_geometry_workers: int = 1
+    loma_feature_cache: str = "cpu"
 
 
 @dataclass
@@ -98,6 +103,12 @@ def _make_refine_args(config: GluemapSpvRefineConfig):
     if config.prior_provider not in {"vggsfm", "loma"}:
         raise ValueError(f"Unsupported prior provider: {config.prior_provider}")
     if config.prior_provider == "loma":
+        from utils.loma_execution import validate_execution
+
+        validate_execution(
+            config.device, config.loma_match_batch_size, config.loma_extract_batch_size,
+            config.loma_preprocess_workers, config.loma_geometry_workers, config.loma_feature_cache,
+        )
         if config.ba_backend != "bae":
             raise ValueError("LoMa V1 requires --ba_backend bae")
         if config.bae_max_observations > 0:
@@ -118,6 +129,11 @@ def _make_refine_args(config: GluemapSpvRefineConfig):
         loma_sufficient_neighbors=config.loma_sufficient_neighbors,
         loma_insufficient_neighbors=config.loma_insufficient_neighbors,
         loma_untried_neighbors=config.loma_untried_neighbors,
+        loma_match_batch_size=config.loma_match_batch_size,
+        loma_extract_batch_size=config.loma_extract_batch_size,
+        loma_preprocess_workers=config.loma_preprocess_workers,
+        loma_geometry_workers=config.loma_geometry_workers,
+        loma_feature_cache=config.loma_feature_cache,
         track_mode="SPV" if use_virtual_tracks else "SP",
         neighbors_per_center=config.neighbors_per_center,
         pair_pose_rotation_threshold=config.pair_pose_rotation_threshold,
@@ -842,6 +858,11 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
         loma_result = run_loma_prior(
             [images_dir / name for name in image_names], image_size_hw,
             initial_intrinsics_high_all, selected_records, device=args.device,
+            match_batch_size=args.loma_match_batch_size,
+            extract_batch_size=args.loma_extract_batch_size,
+            preprocess_workers=args.loma_preprocess_workers,
+            geometry_workers=args.loma_geometry_workers,
+            feature_cache=args.loma_feature_cache,
         )
         stats["loma"] = loma_result.stats
         stats["loma"]["pair_selection"] = selection_stats
