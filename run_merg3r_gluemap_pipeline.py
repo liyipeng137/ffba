@@ -150,6 +150,11 @@ def parse_args():
         type=str,
         default="/root/.cache/torch/hub/checkpoints/vggsfm_v2_tracker.pt",
     )
+    parser.add_argument("--prior_provider", choices=["vggsfm", "loma"], default="vggsfm")
+    parser.add_argument(
+        "--loma_dino_candidates", type=int, default=30,
+        help="Per-image DINO retrieval candidates for LoMa; all pose/temporal/DINO pairs are matched.",
+    )
     parser.add_argument("--neighbors_per_center", type=int, default=16)
     parser.add_argument(
         "--vggsfm_group_strategy",
@@ -291,7 +296,7 @@ def parse_args():
     parser.add_argument(
         "--bae_optimize_intrinsics",
         default=True,
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
         help=(
             "Let the BAE backend optimize SIMPLE_PINHOLE f while fixing cx/cy. "
             "Ignored by the Ceres backend."
@@ -814,15 +819,26 @@ def main():
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError("CUDA is required unless --device cpu is used.")
     prior_pose_mode = args.prior_transforms_json is not None
+    is_loma = args.prior_provider == "loma"
+    if is_loma:
+        if args.ba_backend != "bae":
+            raise ValueError("LoMa V1 requires --ba_backend bae")
+        if args.bae_max_observations > 0:
+            raise ValueError("LoMa V1 has no observation cap; use --bae_max_observations 0")
+        if args.loma_dino_candidates <= 0:
+            raise ValueError("loma_dino_candidates must be positive")
+        if args.export_vggsfm_groups_only:
+            raise ValueError("VGGSfM group export requires --prior_provider vggsfm")
     if prior_pose_mode and args.ba_backend != "bae":
         raise ValueError("Prior-pose mode currently requires --ba_backend bae")
-    if prior_pose_mode and args.vggsfm_group_strategy == "projected_overlap":
+    if not is_loma and prior_pose_mode and args.vggsfm_group_strategy == "projected_overlap":
         raise ValueError(
             "Prior-pose mode has no depth and cannot use projected_overlap; "
             "use --vggsfm_group_strategy sift_pose_dino"
         )
     if (
-        args.vggsfm_group_strategy == "sift_pose_dino"
+        not is_loma
+        and args.vggsfm_group_strategy == "sift_pose_dino"
         and args.vggsfm_schedule_mode == "legacy"
     ):
         raise ValueError(
@@ -830,7 +846,8 @@ def main():
             "or sift_first_sparse"
         )
     if (
-        args.vggsfm_schedule_mode == "sift_first_sparse"
+        not is_loma
+        and args.vggsfm_schedule_mode == "sift_first_sparse"
         and args.vggsfm_group_strategy == "pose"
     ):
         raise ValueError(
@@ -858,11 +875,13 @@ def main():
                     ),
                     "camera_model": PIPELINE_CAMERA_MODEL,
                     "s_database_mode": PIPELINE_S_DATABASE_MODE,
-                    "vggsfm_query_source": PIPELINE_QUERY_SOURCE,
-                    "vggsfm_tracker_input": PIPELINE_TRACKER_INPUT,
-                    "group_strategy": args.vggsfm_group_strategy,
-                    "vggsfm_schedule_mode": args.vggsfm_schedule_mode,
-                    "track_mode": PIPELINE_TRACK_MODE,
+                    "prior_provider": args.prior_provider,
+                    "loma_dino_candidates": args.loma_dino_candidates if is_loma else None,
+                    "vggsfm_query_source": None if is_loma else PIPELINE_QUERY_SOURCE,
+                    "vggsfm_tracker_input": None if is_loma else PIPELINE_TRACKER_INPUT,
+                    "group_strategy": "pose_union_dino_union_temporal" if is_loma else args.vggsfm_group_strategy,
+                    "vggsfm_schedule_mode": None if is_loma else args.vggsfm_schedule_mode,
+                    "track_mode": "SP" if is_loma else PIPELINE_TRACK_MODE,
                 },
                 "args": vars(args),
             },
@@ -936,6 +955,8 @@ def main():
         return
 
     refine_config = GluemapSpvRefineConfig(
+        prior_provider=args.prior_provider,
+        loma_dino_candidates=args.loma_dino_candidates,
         path_tracker=args.path_tracker,
         device=args.device,
         neighbors_per_center=args.neighbors_per_center,
@@ -991,13 +1012,14 @@ def main():
     )
     refine_result = run_gluemap_spv_refinement(state, output_dir, refine_config)
     pipeline_summary = {
-        "vggsfm_schedule_mode": args.vggsfm_schedule_mode,
+        "prior_provider": args.prior_provider,
+        "vggsfm_schedule_mode": None if is_loma else args.vggsfm_schedule_mode,
         "num_input_images": int(state.extrinsic.shape[0]),
         "num_output_images": int(len(refine_result.image_names)),
         "num_dropped_images": int(
             len(refine_result.stats["frame_filtering"]["dropped_indices"])
         ),
-        "selected_centers": refine_result.stats.get(
+        "selected_centers": None if is_loma else refine_result.stats.get(
             "vggsfm_schedule",
             {},
         ).get("selected_centers", int(state.extrinsic.shape[0])),

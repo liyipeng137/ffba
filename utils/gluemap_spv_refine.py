@@ -74,6 +74,8 @@ class GluemapSpvRefineConfig:
     save_virtual_tracks_debug: bool = False
     debug_print: bool = True
     work_image_workers: int = 16
+    prior_provider: str = "vggsfm"
+    loma_dino_candidates: int = 30
 
 
 @dataclass
@@ -89,9 +91,20 @@ class GluemapSpvRefineResult:
 
 
 def _make_refine_args(config: GluemapSpvRefineConfig):
+    if config.prior_provider not in {"vggsfm", "loma"}:
+        raise ValueError(f"Unsupported prior provider: {config.prior_provider}")
+    if config.prior_provider == "loma":
+        if config.ba_backend != "bae":
+            raise ValueError("LoMa V1 requires --ba_backend bae")
+        if config.bae_max_observations > 0:
+            raise ValueError("LoMa V1 has no observation cap; use --bae_max_observations 0")
+        if config.loma_dino_candidates <= 0:
+            raise ValueError("loma_dino_candidates must be positive")
     use_virtual_tracks = config.ba_backend == "ceres"
     return SimpleNamespace(
         path_tracker=config.path_tracker,
+        prior_provider=config.prior_provider,
+        loma_dino_candidates=config.loma_dino_candidates,
         track_mode="SPV" if use_virtual_tracks else "SP",
         neighbors_per_center=config.neighbors_per_center,
         pair_pose_rotation_threshold=config.pair_pose_rotation_threshold,
@@ -119,7 +132,7 @@ def _make_refine_args(config: GluemapSpvRefineConfig):
         vggsfm_score_threshold=config.vggsfm_score_threshold,
         vggsfm_fine_tracking=config.vggsfm_fine_tracking,
         s_database_mode=S_DATABASE_MODE,
-        prior_snap_to_sift=True,
+        prior_snap_to_sift=config.prior_provider != "loma",
         prior_snap_threshold=config.prior_snap_threshold,
         prior_keep_unsnapped=True,
         prior_keypoint_merge_threshold=config.prior_keypoint_merge_threshold,
@@ -613,12 +626,13 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
         coarse_state.pairs,
         num_images=len(image_names),
     )
-    schedule_mode = str(args.vggsfm_schedule_mode)
+    is_loma = args.prior_provider == "loma"
+    schedule_mode = "sift_first_full" if is_loma else str(args.vggsfm_schedule_mode)
     if schedule_mode not in {"legacy", "sift_first_full", "sift_first_sparse"}:
         raise ValueError(f"Unsupported vggsfm_schedule_mode: {schedule_mode!r}")
     if args.sift_temporal_window < 0:
         raise ValueError("sift_temporal_window must be >= 0")
-    if args.vggsfm_max_center_gap <= 0:
+    if not is_loma and args.vggsfm_max_center_gap <= 0:
         raise ValueError("vggsfm_max_center_gap must be >= 1")
     sift_candidate_pairs, sift_pair_graph_stats = ref.build_sift_candidate_pairs(
         legacy_pose_pairs,
@@ -646,10 +660,11 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
         "track_mode": args.track_mode,
         "camera_model": CAMERA_MODEL,
         "s_database_mode": S_DATABASE_MODE,
-        "vggsfm_query_source": QUERY_SOURCE,
-        "vggsfm_tracker_input": TRACKER_INPUT,
-        "group_strategy": args.group_strategy,
-        "vggsfm_schedule_mode": schedule_mode,
+        "prior_provider": args.prior_provider,
+        "vggsfm_query_source": None if is_loma else QUERY_SOURCE,
+        "vggsfm_tracker_input": None if is_loma else TRACKER_INPUT,
+        "group_strategy": "pose_union_dino_union_temporal" if is_loma else args.group_strategy,
+        "vggsfm_schedule_mode": None if is_loma else schedule_mode,
         "pair_graphs": {
             **sift_pair_graph_stats,
             "active_sift_pair_graph": (
@@ -713,7 +728,7 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
     if schedule_mode != "legacy":
         _debug(
             args,
-            "Preparing SIFT database before VGGSfM: "
+            f"Preparing SIFT database before {'LoMa' if is_loma else 'VGGSfM'}: "
             f"mode={schedule_mode}, legacy_pairs={legacy_pose_pairs.shape[0]}, "
             f"sift_pairs={pairs.shape[0]}, "
             f"temporal_new={sift_pair_graph_stats['temporal_new_pair_count']}",
@@ -742,13 +757,14 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
             min_pair_inliers=args.sift_schedule_min_pair_inliers,
             min_grid_coverage=args.sift_schedule_min_grid_coverage,
         )
-        sift_schedule_stats["threshold_sweep"] = (
-            ref.simulate_sift_schedule_thresholds(
-                sift_schedule_stats["pairs"],
-                len(image_names),
-                args.vggsfm_max_center_gap,
+        if not is_loma:
+            sift_schedule_stats["threshold_sweep"] = (
+                ref.simulate_sift_schedule_thresholds(
+                    sift_schedule_stats["pairs"],
+                    len(image_names),
+                    args.vggsfm_max_center_gap,
+                )
             )
-        )
         stats["timing"]["sift_schedule_analysis"] = time.time() - t0
         if schedule_mode == "sift_first_sparse":
             center_selection = ref.select_sift_first_centers(
@@ -770,208 +786,247 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
             args,
             "SIFT schedule ready: "
             f"verified={sift_schedule_stats['verified_pair_count']}, "
-            f"valid={sift_schedule_stats['valid_schedule_pair_count']}, "
-            f"centers={center_selection['num_selected']}/{len(image_names)}",
+            f"valid={sift_schedule_stats['valid_schedule_pair_count']}"
+            + (" (LoMa support annotation only)" if is_loma else
+               f", centers={center_selection['num_selected']}/{len(image_names)}"),
         )
 
-    _debug(
-        args,
-        "Running VGGSfM prior tracking: "
-        f"schedule_mode={schedule_mode}, "
-        f"group_strategy={args.group_strategy}, "
-        f"group_batch_size={args.vggsfm_group_batch_size}, "
-        f"neighbors_per_center={args.neighbors_per_center}, "
-        f"query_points={args.vggsfm_query_points}, "
-        f"query_source={QUERY_SOURCE}, tracker_input={TRACKER_INPUT}",
-    )
-    tracking_groups = None
-    tracking_group_stats = None
-    if args.group_strategy == "projected_overlap":
-        if coarse_state.raw_depth is None:
-            raise ValueError(
-                "vggsfm_group_strategy='projected_overlap' requires depth"
-            )
-        if coarse_state.retrieval_sim_matrix is None:
-            raise ValueError(
-                "retrieval_sim_matrix is required when "
-                "vggsfm_group_strategy='projected_overlap'"
-            )
-        t0 = time.time()
-        (
-            projected_groups,
-            projected_group_stats,
-            projected_candidate_details,
-        ) = ref.build_projected_overlap_groups(
-            pairs=legacy_pose_pairs,
-            extrinsic=extrinsic,
-            intrinsics=initial_intrinsics_low_all,
-            depth=coarse_state.raw_depth,
-            depth_conf=coarse_state.raw_depth_conf,
-            retrieval_sim_matrix=coarse_state.retrieval_sim_matrix,
-            max_neighbors=int(args.neighbors_per_center),
-            rotation_threshold=float(args.pair_pose_rotation_threshold),
-            dino_candidates=int(config.projected_overlap_dino_candidates),
-            max_samples=int(config.projected_overlap_samples),
-            reprojection_threshold=float(config.projected_overlap_reproj_threshold),
-            confidence_quantile=float(config.projected_overlap_conf_quantile),
-            selected_centers=(
-                center_selection["selected_centers"]
-                if schedule_mode == "sift_first_sparse"
-                else None
-            ),
+    loma_result = None
+    if is_loma:
+        from utils.loma_prior import (
+            annotate_loma_pairs_with_sift,
+            build_loma_candidate_pairs,
+            run_loma_prior,
         )
-        if schedule_mode == "sift_first_sparse":
-            tracking_groups, tracking_group_stats = (
-                ref.build_three_layer_vggsfm_groups(
-                    center_selection["selected_centers"],
-                    center_selection["owner"],
-                    sift_schedule_stats["valid_edges"],
-                    projected_candidate_details,
-                    len(image_names),
-                    int(args.neighbors_per_center),
-                )
-            )
-            tracking_group_stats["projected_overlap_base"] = projected_group_stats
-        else:
-            tracking_groups = projected_groups
-            tracking_group_stats = projected_group_stats
-        stats["timing"]["vggsfm_group_build"] = time.time() - t0
+
+        t0 = time.time()
+        loma_records, graph_stats = build_loma_candidate_pairs(
+            legacy_pose_pairs, temporal_pairs, coarse_state.retrieval_sim_matrix,
+            dino_topk=args.loma_dino_candidates,
+        )
+        loma_records = annotate_loma_pairs_with_sift(loma_records, pairs, sift_schedule_stats)
+        stats["pair_graphs"]["loma"] = graph_stats
+        stats["timing"]["loma_pair_build"] = time.time() - t0
+        # Save planned work before inference, including untried SIFT candidates.
+        _write_json(output_dir / "prior_loma_pairs.json", {
+            "image_names": image_names, "graph": graph_stats,
+            "sift_support_config": sift_schedule_stats["config"], "pairs": loma_records,
+        })
+        _debug(args, f"Running LoMa-B prior: {len(loma_records)} pairs, no track/observation cap")
+        loma_result = run_loma_prior(
+            [images_dir / name for name in image_names], image_size_hw,
+            initial_intrinsics_high_all, loma_records, device=args.device,
+        )
+        stats["loma"] = loma_result.stats
+        stats["timing"]["loma_prior_matches"] = loma_result.stats["timing"]["total"]
+        _write_json(output_dir / "prior_loma_stats.json", loma_result.stats)
+        _write_json(output_dir / "prior_loma_pairs.json", {
+            "image_names": image_names, "graph": graph_stats,
+            "sift_support_config": sift_schedule_stats["config"], "pairs": loma_result.pair_records,
+        })
+        # No synthetic tracks: the indexed graph is triangulated downstream.
+        prior_tracks = []
+        _debug(args, f"LoMa prior done: verified_pairs={len(loma_result.geometries)}, "
+               f"unique_observations={loma_result.stats['unique_matched_observations']}")
+    else:
         _debug(
             args,
-            "Built projected-overlap VGGSfM groups: "
-            f"groups={len(tracking_groups)}, "
-            f"group_size={tracking_group_stats['group_size']}",
+            "Running VGGSfM prior tracking: "
+            f"schedule_mode={schedule_mode}, "
+            f"group_strategy={args.group_strategy}, "
+            f"group_batch_size={args.vggsfm_group_batch_size}, "
+            f"neighbors_per_center={args.neighbors_per_center}, "
+            f"query_points={args.vggsfm_query_points}, "
+            f"query_source={QUERY_SOURCE}, tracker_input={TRACKER_INPUT}",
         )
-    elif args.group_strategy == "sift_pose_dino":
-        if schedule_mode == "legacy":
-            raise ValueError(
-                "vggsfm_group_strategy='sift_pose_dino' requires "
-                "--vggsfm_schedule_mode sift_first_full or sift_first_sparse"
-            )
-        if coarse_state.retrieval_sim_matrix is None:
-            raise ValueError(
-                "retrieval_sim_matrix is required when "
-                "vggsfm_group_strategy='sift_pose_dino'"
-            )
-        t0 = time.time()
-        sift_pose_dino_details, sift_pose_dino_stats = (
-            ref.build_sift_pose_dino_candidate_details(
-                center_selection["selected_centers"],
-                sift_schedule_stats["pairs"],
-                legacy_pose_pairs,
-                temporal_pairs,
-                coarse_state.retrieval_sim_matrix,
-                extrinsic,
+        tracking_groups = None
+        tracking_group_stats = None
+        if args.group_strategy == "projected_overlap":
+            if coarse_state.raw_depth is None:
+                raise ValueError(
+                    "vggsfm_group_strategy='projected_overlap' requires depth"
+                )
+            if coarse_state.retrieval_sim_matrix is None:
+                raise ValueError(
+                    "retrieval_sim_matrix is required when "
+                    "vggsfm_group_strategy='projected_overlap'"
+                )
+            t0 = time.time()
+            (
+                projected_groups,
+                projected_group_stats,
+                projected_candidate_details,
+            ) = ref.build_projected_overlap_groups(
+                pairs=legacy_pose_pairs,
+                extrinsic=extrinsic,
+                intrinsics=initial_intrinsics_low_all,
+                depth=coarse_state.raw_depth,
+                depth_conf=coarse_state.raw_depth_conf,
+                retrieval_sim_matrix=coarse_state.retrieval_sim_matrix,
+                max_neighbors=int(args.neighbors_per_center),
                 rotation_threshold=float(args.pair_pose_rotation_threshold),
                 dino_candidates=int(config.projected_overlap_dino_candidates),
+                max_samples=int(config.projected_overlap_samples),
+                reprojection_threshold=float(config.projected_overlap_reproj_threshold),
+                confidence_quantile=float(config.projected_overlap_conf_quantile),
+                selected_centers=(
+                    center_selection["selected_centers"]
+                    if schedule_mode == "sift_first_sparse"
+                    else None
+                ),
             )
+            if schedule_mode == "sift_first_sparse":
+                tracking_groups, tracking_group_stats = (
+                    ref.build_three_layer_vggsfm_groups(
+                        center_selection["selected_centers"],
+                        center_selection["owner"],
+                        sift_schedule_stats["valid_edges"],
+                        projected_candidate_details,
+                        len(image_names),
+                        int(args.neighbors_per_center),
+                    )
+                )
+                tracking_group_stats["projected_overlap_base"] = projected_group_stats
+            else:
+                tracking_groups = projected_groups
+                tracking_group_stats = projected_group_stats
+            stats["timing"]["vggsfm_group_build"] = time.time() - t0
+            _debug(
+                args,
+                "Built projected-overlap VGGSfM groups: "
+                f"groups={len(tracking_groups)}, "
+                f"group_size={tracking_group_stats['group_size']}",
+            )
+        elif args.group_strategy == "sift_pose_dino":
+            if schedule_mode == "legacy":
+                raise ValueError(
+                    "vggsfm_group_strategy='sift_pose_dino' requires "
+                    "--vggsfm_schedule_mode sift_first_full or sift_first_sparse"
+                )
+            if coarse_state.retrieval_sim_matrix is None:
+                raise ValueError(
+                    "retrieval_sim_matrix is required when "
+                    "vggsfm_group_strategy='sift_pose_dino'"
+                )
+            t0 = time.time()
+            sift_pose_dino_details, sift_pose_dino_stats = (
+                ref.build_sift_pose_dino_candidate_details(
+                    center_selection["selected_centers"],
+                    sift_schedule_stats["pairs"],
+                    legacy_pose_pairs,
+                    temporal_pairs,
+                    coarse_state.retrieval_sim_matrix,
+                    extrinsic,
+                    rotation_threshold=float(args.pair_pose_rotation_threshold),
+                    dino_candidates=int(config.projected_overlap_dino_candidates),
+                )
+            )
+            tracking_groups, tracking_group_stats = ref.build_three_layer_vggsfm_groups(
+                center_selection["selected_centers"],
+                center_selection["owner"],
+                sift_schedule_stats["valid_edges"],
+                sift_pose_dino_details,
+                len(image_names),
+                int(args.neighbors_per_center),
+                fill_source_name="sift_pose_dino_fill",
+                strategy_name="sift_first_three_layer_sift_pose_dino",
+            )
+            tracking_group_stats["sift_pose_dino_base"] = sift_pose_dino_stats
+            stats["timing"]["vggsfm_group_build"] = time.time() - t0
+            _debug(
+                args,
+                "Built depth-free SIFT/Pose/DINO VGGSfM groups: "
+                f"groups={len(tracking_groups)}, "
+                f"group_size={tracking_group_stats['group_size']}",
+            )
+        elif args.group_strategy != "pose":
+            raise ValueError(
+                "vggsfm_group_strategy must be 'pose', 'projected_overlap', or "
+                "'sift_pose_dino', "
+                f"got {args.group_strategy!r}"
+            )
+        elif schedule_mode == "sift_first_sparse":
+            raise ValueError(
+                "sift_first_sparse currently requires "
+                "--vggsfm_group_strategy projected_overlap or sift_pose_dino"
+            )
+
+        if schedule_mode != "legacy":
+            schedule_audit = {
+                "mode": schedule_mode,
+                "config": {
+                    "sift_temporal_window": int(args.sift_temporal_window),
+                    "sift_schedule_grid_size": int(args.sift_schedule_grid_size),
+                    "sift_schedule_min_inliers_per_cell": int(
+                        args.sift_schedule_min_inliers_per_cell
+                    ),
+                    "sift_schedule_min_pair_inliers": int(
+                        args.sift_schedule_min_pair_inliers
+                    ),
+                    "sift_schedule_min_grid_coverage": float(
+                        args.sift_schedule_min_grid_coverage
+                    ),
+                    "vggsfm_max_center_gap": int(args.vggsfm_max_center_gap),
+                    "neighbors_per_center": int(args.neighbors_per_center),
+                },
+                "pair_graphs": sift_pair_graph_stats,
+                "sift_graph": sift_schedule_stats,
+                "center_selection": center_selection,
+                "groups": tracking_group_stats,
+            }
+            _write_json(output_dir / "vggsfm_schedule.json", schedule_audit)
+            stats["vggsfm_schedule"] = {
+                "path": str(output_dir / "vggsfm_schedule.json"),
+                "selected_centers": center_selection["num_selected"],
+                "skipped_centers": center_selection["num_skipped"],
+            }
+
+        t0 = time.time()
+        prior_tracks, prior_stats = ref.run_vggsfm_prior_tracks(
+            args,
+            coarse_state.high_images,
+            None,
+            legacy_pose_pairs,
+            metadata,
+            extrinsic,
+            image_names,
+            groups=tracking_groups,
+            group_stats=tracking_group_stats,
         )
-        tracking_groups, tracking_group_stats = ref.build_three_layer_vggsfm_groups(
-            center_selection["selected_centers"],
-            center_selection["owner"],
-            sift_schedule_stats["valid_edges"],
-            sift_pose_dino_details,
-            len(image_names),
-            int(args.neighbors_per_center),
-            fill_source_name="sift_pose_dino_fill",
-            strategy_name="sift_first_three_layer_sift_pose_dino",
-        )
-        tracking_group_stats["sift_pose_dino_base"] = sift_pose_dino_stats
-        stats["timing"]["vggsfm_group_build"] = time.time() - t0
+        stats["timing"]["vggsfm_prior_tracks"] = time.time() - t0
+        stats["vggsfm"] = prior_stats
+        group_stats = prior_stats["group_stats"]
+        valid_neighbors = group_stats.get("selected_rotation_valid_neighbors")
+        unfiltered_neighbors = group_stats.get("selected_unfiltered_neighbors")
+        neighbor_priority_summary = ""
+        if valid_neighbors is not None and unfiltered_neighbors is not None:
+            neighbor_priority_summary = (
+                f"neighbor_order={group_stats['neighbor_order']}, "
+                f"valid_neighbors_mean={valid_neighbors['mean']:.2f}, "
+                f"unfiltered_neighbors_mean={unfiltered_neighbors['mean']:.2f}, "
+            )
+        workload = prior_stats["workload"]
+        query_track_stats = prior_stats["query_track_stats"]
+        track_length = query_track_stats["track_length"]
         _debug(
             args,
-            "Built depth-free SIFT/Pose/DINO VGGSfM groups: "
-            f"groups={len(tracking_groups)}, "
-            f"group_size={tracking_group_stats['group_size']}",
+            "VGGSfM prior done: "
+            f"groups={prior_stats['num_groups']}, "
+            f"tracks={prior_stats['num_tracks']}, "
+            f"observations={prior_stats['num_observations']}, "
+            f"{neighbor_priority_summary}"
+            f"attempted_query_views={workload['attempted_query_views']}, "
+            f"forming_track_rate={query_track_stats['forming_track_rate']:.3f}, "
+            f"track_length_median={track_length['median']:.2f}, "
+            f"track_length_p90={track_length['p90']:.2f}, "
+            f"fmap_precompute={prior_stats['precompute_fmaps']['seconds']:.2f}s, "
+            f"fmap_cache={prior_stats['precompute_fmaps']['storage_dtype']}@"
+            f"{prior_stats['precompute_fmaps']['storage_device']}, "
+            f"fmap_resident="
+            f"{prior_stats['precompute_fmaps']['resident_on_tracker_device']}, "
+            f"group_tracking={prior_stats['group_tracking_time']:.2f}s, "
+            f"time={stats['timing']['vggsfm_prior_tracks']:.2f}s",
         )
-    elif args.group_strategy != "pose":
-        raise ValueError(
-            "vggsfm_group_strategy must be 'pose', 'projected_overlap', or "
-            "'sift_pose_dino', "
-            f"got {args.group_strategy!r}"
-        )
-    elif schedule_mode == "sift_first_sparse":
-        raise ValueError(
-            "sift_first_sparse currently requires "
-            "--vggsfm_group_strategy projected_overlap or sift_pose_dino"
-        )
-
-    if schedule_mode != "legacy":
-        schedule_audit = {
-            "mode": schedule_mode,
-            "config": {
-                "sift_temporal_window": int(args.sift_temporal_window),
-                "sift_schedule_grid_size": int(args.sift_schedule_grid_size),
-                "sift_schedule_min_inliers_per_cell": int(
-                    args.sift_schedule_min_inliers_per_cell
-                ),
-                "sift_schedule_min_pair_inliers": int(
-                    args.sift_schedule_min_pair_inliers
-                ),
-                "sift_schedule_min_grid_coverage": float(
-                    args.sift_schedule_min_grid_coverage
-                ),
-                "vggsfm_max_center_gap": int(args.vggsfm_max_center_gap),
-                "neighbors_per_center": int(args.neighbors_per_center),
-            },
-            "pair_graphs": sift_pair_graph_stats,
-            "sift_graph": sift_schedule_stats,
-            "center_selection": center_selection,
-            "groups": tracking_group_stats,
-        }
-        _write_json(output_dir / "vggsfm_schedule.json", schedule_audit)
-        stats["vggsfm_schedule"] = {
-            "path": str(output_dir / "vggsfm_schedule.json"),
-            "selected_centers": center_selection["num_selected"],
-            "skipped_centers": center_selection["num_skipped"],
-        }
-
-    t0 = time.time()
-    prior_tracks, prior_stats = ref.run_vggsfm_prior_tracks(
-        args,
-        coarse_state.high_images,
-        None,
-        legacy_pose_pairs,
-        metadata,
-        extrinsic,
-        image_names,
-        groups=tracking_groups,
-        group_stats=tracking_group_stats,
-    )
-    stats["timing"]["vggsfm_prior_tracks"] = time.time() - t0
-    stats["vggsfm"] = prior_stats
-    group_stats = prior_stats["group_stats"]
-    valid_neighbors = group_stats.get("selected_rotation_valid_neighbors")
-    unfiltered_neighbors = group_stats.get("selected_unfiltered_neighbors")
-    neighbor_priority_summary = ""
-    if valid_neighbors is not None and unfiltered_neighbors is not None:
-        neighbor_priority_summary = (
-            f"neighbor_order={group_stats['neighbor_order']}, "
-            f"valid_neighbors_mean={valid_neighbors['mean']:.2f}, "
-            f"unfiltered_neighbors_mean={unfiltered_neighbors['mean']:.2f}, "
-        )
-    workload = prior_stats["workload"]
-    query_track_stats = prior_stats["query_track_stats"]
-    track_length = query_track_stats["track_length"]
-    _debug(
-        args,
-        "VGGSfM prior done: "
-        f"groups={prior_stats['num_groups']}, "
-        f"tracks={prior_stats['num_tracks']}, "
-        f"observations={prior_stats['num_observations']}, "
-        f"{neighbor_priority_summary}"
-        f"attempted_query_views={workload['attempted_query_views']}, "
-        f"forming_track_rate={query_track_stats['forming_track_rate']:.3f}, "
-        f"track_length_median={track_length['median']:.2f}, "
-        f"track_length_p90={track_length['p90']:.2f}, "
-        f"fmap_precompute={prior_stats['precompute_fmaps']['seconds']:.2f}s, "
-        f"fmap_cache={prior_stats['precompute_fmaps']['storage_dtype']}@"
-        f"{prior_stats['precompute_fmaps']['storage_device']}, "
-        f"fmap_resident="
-        f"{prior_stats['precompute_fmaps']['resident_on_tracker_device']}, "
-        f"group_tracking={prior_stats['group_tracking_time']:.2f}s, "
-        f"time={stats['timing']['vggsfm_prior_tracks']:.2f}s",
-    )
 
     if schedule_mode == "legacy":
         _debug(args, "Preparing prefilter SIFT database after VGGSfM (legacy)")
@@ -995,7 +1050,8 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
     s_counts = np.asarray(
         sift_prefilter_stats["observations_per_image"], dtype=np.int64
     )
-    p_counts = ref.count_track_observations(prior_tracks, len(image_names))
+    p_counts = (loma_result.observation_counts() if is_loma
+                else ref.count_track_observations(prior_tracks, len(image_names)))
     _debug(args, ref.format_count_summary("S observations/frame", s_counts))
     _debug(args, ref.format_count_summary("P observations/frame", p_counts))
     _debug(
@@ -1046,6 +1102,13 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
         )
 
     kept_indices = np.asarray(coverage_stats["kept_indices"], dtype=np.int64)
+    if is_loma:
+        loma_result = loma_result.subset(kept_indices)
+        stats["loma"]["frame_filtering"] = {
+            "kept_original_indices": kept_indices.tolist(),
+            "remaining_verified_pairs": len(loma_result.geometries),
+            "remaining_unique_observations": int(loma_result.observation_counts().sum()),
+        }
     initial_intrinsics_high = initial_intrinsics_high_all[kept_indices]
     initial_intrinsics_low = initial_intrinsics_low_all[kept_indices]
     depth = (
@@ -1178,43 +1241,53 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
         f"matches={sift_final_stats['num_matches']}",
     )
 
-    _debug(args, "Writing VGGSfM prior database")
-    t0 = time.time()
-    stats["prior_database"] = ref.write_tracks_database(
-        str(output_dir / "database_vggsfm_prior.db"),
-        image_names,
-        image_size_hw,
-        intrinsic,
-        CAMERA_MODEL,
-        prior_tracks,
-        features=features,
-        snap_to_features=True,
-        snap_threshold=args.prior_snap_threshold,
-        keep_unsnapped=True,
-        merge_threshold=args.prior_keypoint_merge_threshold,
-        snap_target="sift",
-        match_topology=args.prior_match_topology,
-    )
-    stats["timing"]["write_prior_db"] = time.time() - t0
-    prior_db_stats = stats["prior_database"]
-    snap_stats = prior_db_stats["snap"]
-    _debug(
-        args,
-        "Prior DB written: "
-        f"tracks={prior_db_stats['num_tracks']}, "
-        f"topology={prior_db_stats['keypoint_merge']['match_topology']}, "
-        f"pairs={prior_db_stats['num_pairs']}, "
-        f"raw_kp={prior_db_stats['keypoint_merge']['raw_total']}, "
-        f"merged_kp={prior_db_stats['keypoint_merge']['merged_total']}, "
-        f"snapped={snap_stats['snapped_observations']}",
-    )
+    prior_database_path = output_dir / ("database_loma_prior.db" if is_loma else "database_vggsfm_prior.db")
+    if is_loma:
+        from utils.loma_prior import write_loma_database
+
+        t0 = time.time()
+        stats["prior_database"] = write_loma_database(
+            prior_database_path, image_names, image_size_hw, intrinsic, loma_result,
+        )
+        stats["timing"]["write_prior_db"] = time.time() - t0
+    else:
+        _debug(args, "Writing VGGSfM prior database")
+        t0 = time.time()
+        stats["prior_database"] = ref.write_tracks_database(
+            str(output_dir / "database_vggsfm_prior.db"),
+            image_names,
+            image_size_hw,
+            intrinsic,
+            CAMERA_MODEL,
+            prior_tracks,
+            features=features,
+            snap_to_features=True,
+            snap_threshold=args.prior_snap_threshold,
+            keep_unsnapped=True,
+            merge_threshold=args.prior_keypoint_merge_threshold,
+            snap_target="sift",
+            match_topology=args.prior_match_topology,
+        )
+        stats["timing"]["write_prior_db"] = time.time() - t0
+        prior_db_stats = stats["prior_database"]
+        snap_stats = prior_db_stats["snap"]
+        _debug(
+            args,
+            "Prior DB written: "
+            f"tracks={prior_db_stats['num_tracks']}, "
+            f"topology={prior_db_stats['keypoint_merge']['match_topology']}, "
+            f"pairs={prior_db_stats['num_pairs']}, "
+            f"raw_kp={prior_db_stats['keypoint_merge']['raw_total']}, "
+            f"merged_kp={prior_db_stats['keypoint_merge']['merged_total']}, "
+            f"snapped={snap_stats['snapped_observations']}",
+        )
 
     from gluemap.utils.colmap import merge_colmap_databases  # noqa: PLC0415
 
-    _debug(args, "Merging VGGSfM prior and SIFT databases")
+    _debug(args, f"Merging {args.prior_provider} prior and SIFT databases")
     t0 = time.time()
     merge_colmap_databases(
-        str(output_dir / "database_vggsfm_prior.db"),
+        str(prior_database_path),
         str(output_dir / "database_sift.db"),
         str(output_dir / "database_merged.db"),
         primary_features_first=False,
@@ -1304,6 +1377,15 @@ def run_gluemap_spv_refinement(coarse_state, output_dir, config):
     )
     stats["timing"]["augmented_refinement"] = time.time() - t0
     stats["augmented_refinement"] = augmented_stats
+    if is_loma:
+        from utils.loma_prior import summarize_final_tracks
+
+        t0 = time.time()
+        stats["loma"]["final_tracks"] = summarize_final_tracks(
+            reconstruction, ref.build_s_keypoint_count(reconstruction, features), loma_result,
+        )
+        stats["timing"]["loma_final_track_audit"] = time.time() - t0
+        _write_json(output_dir / "prior_loma_stats.json", stats["loma"])
 
     refined_dir = output_dir / "refined_gluemap_aba"
     refined_dir.mkdir(parents=True, exist_ok=True)

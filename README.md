@@ -520,6 +520,47 @@ center），尚未完成正式质量验收，不应替代上面的可复现实�
 SIFT-first 模式额外输出 `vggsfm_schedule.json`，包含 pair 来源、verified
 inlier/coverage、阈值 sweep、center/owner 原因和三层 group provenance。
 
+### SIFT + LoMa Prior V1（实验）
+
+通过 `--prior_provider loma` 选择 LoMa-B，默认 provider 仍为 VGGSfM。
+LoMa 路径先完成 SIFT 匹配，使用两套 pair 图：
+
+- SIFT：当前 pose neighbors（含 rotation threshold）并上 temporal pairs，默认时序窗口 ±2。
+- LoMa：pose pairs ∪ 每图 DINO top-30 ∪ temporal pairs，无向去重后全部匹配。
+  SIFT 的 `sufficient / insufficient / untried` 标注仅用于诊断，不删减候选。
+
+每张工作图使用原生路径预处理提取一次特征，保留 LoMa-B 默认 2048 个关键点及
+0.1 匹配阈值。固定 feature ID 经过 pycolmap 两视图几何验证后写入 prior DB，
+再使用现有数据库合并、三角化、SelectTrack、几何过滤和 BAE 流程。LoMa 坐标不 snap 到 SIFT。
+VGGSfM 的 group、center、query 与 `prior_match_topology` 参数不控制 LoMa。
+
+在已具备主流程及 LoMa 依赖的 GPU 环境中运行：
+
+```bash
+python run_merg3r_gluemap_pipeline.py \
+  --dataset /path/to/images \
+  --output_dir /path/to/output_loma \
+  --prior_provider loma \
+  --ba_backend bae \
+  --bae_max_observations 0 \
+  --bae_optimize_intrinsics
+```
+
+LoMa V1 只支持 BAE，不启用 observation cap；传入正的 `bae_max_observations`
+会报错提示，避免沿用旧测试命令时无意裁剪。内参优化默认开启，可用
+`--no-bae_optimize_intrinsics` 关闭。其余 BAE 和既有过滤参数沿用当前命令配置。
+有深度前馈输入和 `--prior_transforms_json /path/to/transforms.json` 均可使用同一 LoMa pair 规则。
+
+模型从仓库 `third_party/LoMa/src` 加载，依赖见其 `pyproject.toml`；首次加载会使用
+上游的权重下载与缓存机制。特征只缓存在本次进程的 CPU 内存中。
+输出 `prior_loma_pairs.json`（候选来源、SIFT 标注和匹配结果）、
+`prior_loma_stats.json`（分阶段时间、验证图连通性、唯一观测及最终轨长统计）、
+`database_loma_prior.db`，并沿用 `refine_stats.json` 和原有 COLMAP 输出目录。
+
+已通过 CPU 上的真实 pycolmap 几何验证、DB 合并/重映射及三图成轨测试；
+LoMa 权重推理和 BAE 的 GPU 端到端验证待运行，速度与质量收益尚无实测结论。
+详细设计见 [LoMa prior V1](.ai/plan/loma_prior_lite_design.md)。
+
 ### Nerfstudio Prior Pose 输入
 
 传入 `--prior_transforms_json` 后，Nerfstudio `transforms.json` 中的 pose 会替代
@@ -529,7 +570,7 @@ Pi3X/MERG3R coarse pose。它只作为初值，后续仍由 BAE 优化。该模�
 - 直接在原始图片分辨率上运行 SIFT、refinement 和输出 COLMAP model；
 - 跳过 Pi3X、subset alignment、depth 生成与 `pred_depth/` 导出；
 - 只支持 `--ba_backend bae`；
-- 使用 depth-free `sift_pose_dino` group，不支持 `projected_overlap`。
+- VGGSfM 使用 depth-free `sift_pose_dino` group，不支持 `projected_overlap`；LoMa 使用上述独立 pair 图。
 
 789_room sparse 示例：
 
