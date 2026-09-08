@@ -5,6 +5,7 @@ channels:
   - conda-forge
 dependencies:
   - python=3.11
+  - pyyaml
   - eigen=3.4.0
   - libstdcxx-ng=15.2.0
   - boost=1.85.0

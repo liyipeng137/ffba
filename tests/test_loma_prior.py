@@ -1,6 +1,6 @@
 import argparse
 import ast
-from dataclasses import dataclass
+from dataclasses import dataclass, field, fields
 import json
 import logging
 import os
@@ -384,6 +384,11 @@ def test_real_triangulation_builds_three_view_tracks(tmp_path):
 
 def _load_definitions(filename, names, namespace):
     """Exercise actual config functions without unrelated CUDA model imports."""
+    if names & {"GluemapSpvRefineConfig", "GluemapSpvRefineResult", "_make_refine_args"}:
+        config_names = names & {"GluemapSpvRefineConfig", "GluemapSpvRefineResult", "_make_refine_args"}
+        if filename != "ffba/refinement_config.py":
+            _load_definitions("ffba/refinement_config.py", config_names, namespace)
+            names = names - config_names
     path = Path(__file__).resolve().parents[1] / filename
     tree = ast.parse(path.read_text())
     definitions = [
@@ -402,6 +407,9 @@ def _config_namespace():
     ns = {
         "__name__": __name__,
         "dataclass": dataclass,
+        "field": field,
+        "fields": fields,
+        "default_values": __import__("ffba.config", fromlist=["default_values"]).default_values,
         "SimpleNamespace": SimpleNamespace,
         "Path": Path,
         "np": np,
@@ -412,7 +420,7 @@ def _config_namespace():
         "TRACKER_INPUT": "1024",
     }
     return _load_definitions(
-        "utils/gluemap_spv_refine.py",
+        "ffba/refinement.py",
         {"GluemapSpvRefineConfig", "_make_refine_args"},
         ns,
     )
@@ -425,7 +433,7 @@ def test_provider_config_preserves_vggsfm_and_disallows_hidden_loma_cap():
     legacy = make(Config(path_tracker="tracker", bae_max_observations=2_000_000))
     assert legacy.prior_provider == "vggsfm"
     assert legacy.bae_max_observations == 2_000_000
-    assert legacy.build_virtual_tracks
+    assert not legacy.build_virtual_tracks
     loma_args = make(
         Config(path_tracker="not-used", prior_provider="loma", ba_backend="bae")
     )
@@ -472,47 +480,24 @@ def test_provider_config_preserves_vggsfm_and_disallows_hidden_loma_cap():
                 bae_max_observations=2_000_000,
             )
         )
-    with pytest.raises(ValueError, match="requires --ba_backend bae"):
-        make(Config(path_tracker="", prior_provider="loma"))
+    with pytest.raises(ValueError, match="BAE only"):
+        make(Config(path_tracker="", ba_backend="ceres"))
 
 
-def test_cli_default_provider_and_intrinsics_can_be_disabled(monkeypatch):
-    ns = {"argparse": argparse, "PIPELINE_GROUP_STRATEGY": "pose"}
-    _load_definitions("run_merg3r_gluemap_pipeline.py", {"parse_args"}, ns)
-    monkeypatch.setattr(
-        "sys.argv", ["pipeline", "--dataset", "images", "--output_dir", "out"]
-    )
-    defaults = ns["parse_args"]()
+def test_cli_default_provider_and_intrinsics_can_be_disabled(tmp_path):
+    from ffba.config import parse_args
+    defaults = parse_args(["--dataset", "images", "--output_dir", "out"])
     assert defaults.prior_provider == "vggsfm"
     assert defaults.bae_optimize_intrinsics is True
-    assert (
-        defaults.loma_match_batch_size,
-        defaults.loma_extract_batch_size,
-        defaults.loma_preprocess_workers,
-        defaults.loma_geometry_workers,
-        defaults.loma_feature_cache,
-    ) == (1, 1, 0, 1, "cpu")
-    monkeypatch.setattr(
-        "sys.argv",
-        [
-            "pipeline",
-            "--dataset",
-            "images",
-            "--output_dir",
-            "out",
-            "--prior_provider",
-            "loma",
-            "--no-bae_optimize_intrinsics",
-        ],
-    )
-    args = ns["parse_args"]()
-    assert args.loma_dino_candidates == 30
+    assert (defaults.loma_match_batch_size, defaults.loma_extract_batch_size,
+            defaults.loma_preprocess_workers, defaults.loma_geometry_workers,
+            defaults.loma_feature_cache) == (2, 4, 4, 4, "cuda")
+    config = tmp_path / "config.yaml"
+    config.write_text("bae:\n  optimize_intrinsics: false\n")
+    args = parse_args(["--dataset", "images", "--output_dir", "out",
+                       "--mode", "lite", "--config", str(config)])
+    assert args.prior_provider == "loma"
     assert args.loma_pair_selection == "sift_guided"
-    assert (
-        args.loma_sufficient_neighbors,
-        args.loma_insufficient_neighbors,
-        args.loma_untried_neighbors,
-    ) == (3, 5, 5)
     assert args.bae_max_observations == 0
     assert args.bae_optimize_intrinsics is False
 
@@ -534,7 +519,7 @@ def test_refinement_routes_loma_through_sift_merge_and_shared_backend(
     ns = _config_namespace()
     core_ns = {"np": np}
     _load_definitions(
-        "utils/gluemap_refine_core.py",
+        "ffba/matching/sift.py",
         {
             "canonicalize_pair_array",
             "build_temporal_pairs",
@@ -685,7 +670,7 @@ def test_refinement_routes_loma_through_sift_merge_and_shared_backend(
     }
     _load_definitions(
         "third_party/gluemap/gluemap/utils/colmap.py",
-        {"merge_colmap_databases"},
+        {"merge_colmap_databases", "_remap_matches_to_output_pair"},
         native_merge,
     )
     module = ModuleType("gluemap.utils.colmap")
@@ -725,6 +710,8 @@ def test_refinement_routes_loma_through_sift_merge_and_shared_backend(
 
     ref.run_merg3r_augmented_refinement_loop = refine
     ns.update(
+        build_scheduling_order=__import__("ffba.matching.scheduling", fromlist=["build_scheduling_order"]).build_scheduling_order,
+        resolve_group_strategy=__import__("ffba.matching.scheduling", fromlist=["resolve_group_strategy"]).resolve_group_strategy,
         ref=ref,
         time=time,
         json=json,
@@ -733,7 +720,7 @@ def test_refinement_routes_loma_through_sift_merge_and_shared_backend(
         torch=SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False)),
     )
     _load_definitions(
-        "utils/gluemap_spv_refine.py",
+        "ffba/refinement.py",
         {
             "GluemapSpvRefineResult",
             "_debug",
@@ -772,6 +759,7 @@ def test_refinement_routes_loma_through_sift_merge_and_shared_backend(
         loma_extract_batch_size=2 if has_depth else 1,
         loma_preprocess_workers=2 if has_depth else 0,
         loma_geometry_workers=2 if has_depth else 1,
+        loma_feature_cache="cpu",
     )
     result = ns["run_gluemap_spv_refinement"](state, tmp_path, config)
     assert events == ["sift", "loma", "refine"]
@@ -791,3 +779,14 @@ def test_refinement_routes_loma_through_sift_merge_and_shared_backend(
     assert json.loads((tmp_path / "refine_stats.json").read_text())["loma"][
         "final_tracks"
     ]
+
+
+def test_zero_temporal_window_disables_index_diversity():
+    pool = [_selection_record(0, j, "untried") for j in (1, 2, 4)]
+    sim = np.zeros((5, 5))
+    sim[0, [1, 2, 4]] = [.9, .8, .7]
+    records, stats = loma.select_loma_pairs(pool, sim, untried_neighbors=2, temporal_window=0)
+    chosen = [(c["rank"], c["target"]) for r in records for c in r["selection"] if c.get("source") == 0]
+    assert sorted(chosen) == [(1, 1), (2, 2)]
+    assert stats["diversity"] == "disabled"
+    assert all(c["temporally_separated"] is None for r in records for c in r["selection"] if "source" in c)

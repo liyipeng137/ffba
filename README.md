@@ -1,796 +1,155 @@
-# FeedForwardWithBA / MERG3R + GlueMap 主流程说明
+# FeedForwardWithBA
 
-本文档以当前主入口 [run_merg3r_gluemap_pipeline.py](run_merg3r_gluemap_pipeline.py) 为准。
+使用 Pi3X 前馈重建或已有相机初值，结合 SIFT、VGGSfM / LoMa 和 BAE，生成 COLMAP 稀疏重建。
+正式入口是 [run_merg3r_gluemap_pipeline.py](run_merg3r_gluemap_pipeline.py)，算法与执行参数统一在 [config.yaml](config.yaml)。
 
-这个项目的目标不是保留原始 MERG3R 或 GlueMap 的独立运行形态，而是把前馈式几何模型、MERG3R 的分块合并能力、GlueMap 的稀疏匹配/三角化能力，以及 BAE bundle adjustment 后端缝合成一个可交付 SfM POD 的主流程。
+## 运行方式
 
-## 核心思想
+| 选择 | 配置 / CLI | 行为 |
+| --- | --- | --- |
+| 标准模式 | `--mode standard` | SIFT-first，固定抽稀 center，再运行 VGGSfM |
+| 轻量模式 | `--mode lite` | LoMa-B，SIFT-guided 3/5/5，matching batch=2、extract batch=4、workers=4/4、CUDA cache |
+| 有序输入 | `--input_order ordered` | SIFT 与 prior 允许真实时序召回，默认窗口 ±2 |
+| 乱序输入 | `--input_order unordered` | 禁用 temporal pairs 和 LoMa 序号间隔偏好；VGGSfM 使用 DINO 内部调度顺序 |
+| 有相机初值 | `--prior_transforms_json /path/to/transforms.json` | 导入 Nerfstudio pose / intrinsics，不运行 Pi3X、不生成初始深度 |
+| 纯图片 | 省略 `--prior_transforms_json` | 当前 ShortestPath 子集划分 + Pi3X + weighted iterative Sim3 对齐 |
 
-主流程分为两大阶段：
+默认 `standard + ordered`。所有组合均在 Stage A 提供 DINO 相似度；有序与乱序保持相同的前馈子集划分算法。
+DINO 内部调度顺序只用于 center / owner 选择，不改变图片身份、数据库 ID，也不会给乱序输入添加 temporal pairs。
 
-```text
-输入图片
-  │
-  ▼
-两阶段图片处理
-  ├─ low images  -> 前馈模型粗估计 pose / intrinsics / depth
-  └─ high images -> 稀疏特征、VGGSfM prior tracks、最终 COLMAP 输出
-  │
-  ▼
-Stage A: MERG3R coarse geometry
-  ├─ pi3x 前馈预测局部 depth/pose
-  ├─ MERG3R subset split + global alignment
-  ├─ 生成 BA 前 coarse pose / depth / intrinsics
-  └─ 基于 coarse pose 建立共视 pair graph
-  │
-  ▼
-Stage B: GlueMap-style sparse refinement
-  ├─ SIFT database
-  ├─ VGGSfM prior tracks
-  ├─ prior tracks snap 到 SIFT keypoints
-  ├─ 合并 SIFT + prior track database
-  ├─ 三角化 / track selection / reprojection filtering
-  └─ BAE 或 Ceres bundle adjustment
-  │
-  ▼
-refined_gluemap_aba/  # 最终 refined COLMAP model
-```
+有序模式使用图片路径排序，或 transforms 的 `frames` 列表顺序；该顺序需要符合实际采集时序。
+输入图片需满足当前公共尺寸要求。前馈模式保留 low/high 图片金字塔；先验 pose 模式保留原图工作分辨率。
+先验 pose 是优化初值，BAE 后相机仍会更新；`bae.optimize_intrinsics` 控制内参优化。
 
-Stage A 用前馈模型快速给出全局可用的 coarse 几何；Stage B 不再完全依赖前馈 depth，而是把 coarse pose 作为先验，交给 GlueMap 风格的稀疏特征、prior track 和 BA 流程去生成最终可交付的 SfM 稀疏重建。
+### 轻量模式 CLI（云端 789_room）
 
-## 环境准备
-```bash
-conda env create -f env_base.yaml
-pip install trimesh numba "xformers==0.0.32.post1" "git+https://github.com/pypose/pypose.git"
-cd third_party/gluemap && pip install .
-cd third_party/bae && USE_CUDSS=0 python -m pip install --no-build-isolation -v -e .
-# prepare vggsfm_track weights
-```
-
-## 当前主入口
-
-运行示例：
-
-```bash
-python run_merg3r_gluemap_pipeline.py  \
-  --dataset /kiri/tmp/Courtroom540/images \
-  --output_dir  /kiri/tmp/Courtroom540/output \
-  --prior_match_topology star \
-  --ba_backend bae \
-  --bae_max_num_iterations 20 \
-  --num_refinement_iterations 2  \
-  --bae_optimize_intrinsics \
-  --bae_robust_loss huber \
-  --bae_huber_delta 1.0 \
-  --filter_reproj_error_threshold 1.0 \
-  --neighbors_per_center 12 \
-  --vggsfm_group_strategy projected_overlap \
-  --vggsfm_group_batch_size 3
-
-# test on 1000 frames
-python run_merg3r_gluemap_pipeline.py    \
-  --dataset /kiri/tmp/Courtroom540/images \  
-  --output_dir  /kiri/tmp/Courtroom540/output_fk/ \
-  --subset_size 200 \
-  --overlap 10 \
-  --prior_match_topology star   \
-  --ba_backend bae   \
-  --bae_max_num_iterations 20 \   
-  --num_refinement_iterations 2  \   
-  --bae_optimize_intrinsics    \
-  --bae_robust_loss huber   \
-  --bae_huber_delta 1.0   \
-  --bae_max_observations  2000000 \
-  --filter_reproj_error_threshold 0.5  \
-  --neighbors_per_center 12   \
-  --select_track_min_support 256  \
-  --vggsfm_group_strategy projected_overlap \   
-  --vggsfm_group_batch_size 3 
-```
-
-当前主流程固定使用：
-
-```text
-feed-forward model: pi3x
-camera model      : SIMPLE_PINHOLE
-feature database  : SIFT
-prior query source: ALIKED
-group strategy    : pose
-BA backend        : BAE by default
-```
-
-## 输入要求
-
-`--dataset` 指向图片目录：
-
-```text
-/path/to/images/
-  frame_000000.png
-  frame_000001.png
-  ...
-```
-
-注意：当前 tensor loading 仍要求进入模型的图片尺寸一致。默认开启的 image pyramid 会对图片做 resize/crop，但输入数据最好本身来自同一序列或同一分辨率规范。
-
-## Stage A: 前馈粗几何
-
-代码入口：
-
-```text
-run_merg3r_coarse_stage()
-```
-
-主要步骤：
-
-1. 可选构建两阶段图片金字塔。
-2. 加载 low-resolution 图片。
-3. 用 MERG3R 的 sequence split 方式分块。
-4. 用 `pi3x` 对每个 subset 做前馈推理。
-5. 合并并对齐各 subset 的 pose / depth / intrinsics。
-6. 恢复原始图片顺序。
-7. 将 low-resolution intrinsics 映射到 high-resolution 工作图。
-8. 基于 coarse pose 构建 pair graph。
-9. 保存 `pipeline_stage_a_summary.json`。
-
-Stage A 的结果不直接作为最终 SfM 输出。它主要提供：
-
-- 初始 camera pose；
-- 初始 intrinsics；
-- 原始 dense depth；
-- 用于构建 GlueMap pose groups 的 pair graph；
-- 后续稀疏精修的几何先验。
-
-## 两阶段图片处理
-
-这是后续新增的重要逻辑，位于 [utils/image_pyramid.py](utils/image_pyramid.py)。
-
-默认开启：
-
-```bash
---image_pyramid
-```
-
-作用：
-
-- `low images`：在 CPU 内存生成，DINO/Pi3X 按批搬到 GPU；Stage A
-  前馈结束后释放。
-- `high images`：保留在 CPU 内存，供 SIFT、VGGSfM prior tracking、GlueMap
-  refinement 和最终输出按需使用。
-- low/high 中间图片不落盘；`images/` 仍由 `_save_work_images()` 保存一次，供
-  SIFT/pycolmap 和 group audit 使用。
-- `manifest`：记录原图、low 图、high 图之间的 resize/crop/scale 关系。
-- `scale_intrinsics_with_pyramid_records()`：把 Stage A 得到的 low intrinsics
-  映射到 high 图坐标系。
-
-相关参数：
-
-```bash
---stage1_downscale_n 4
---stage1_multiple 14
---stage2_scale_factor 0
---image_pyramid_workers 16
-```
-
-`--stage2_scale_factor 0` 表示 high 图默认约等于原始尺寸，即使用 `stage1_downscale_n` 作为 low-to-high 放大倍率。
-
-如果要禁用：
-
-```bash
---no-image_pyramid
-```
-
-## Pair Graph
-
-Stage A 后会构建用于 GlueMap pose groups 的 pair graph。
-
-默认主要依赖 pose 邻接：
-
-```bash
---pair_k_pose 25
---pair_pose_rotation_threshold 30.0
-```
-
-思想是：前馈模型已经提供 coarse pose，因此后续稀疏匹配不需要完全盲目地 all-pairs，而是在满足 rotation threshold 的候选中，按 camera center 距离优先选择邻居。`pair_k_pose` 是每帧主动选择的上限；候选不足时不补边，也不要求每个 center 都必须有 pair。
-
-## Stage B: GlueMap/SPV 精修
-
-代码入口：
-
-```text
-utils/gluemap_spv_refine.py::run_gluemap_spv_refinement()
-utils/gluemap_refine_core.py
-```
-
-这里 GlueMap 被当作工具包使用，而不是作为独立 CLI 运行。
-
-主要步骤：
-
-1. 保存 high-resolution work images 到 `<output_dir>/images/`。
-2. 按 pose groups 运行 VGGSfM prior tracking。
-   - tracker coarse fmaps 会优先以 BF16（不支持时 FP16）常驻 GPU，避免每个 pose group 重复从 CPU 搬运；若压缩缓存预计占用超过当前空闲显存的 50%，自动回退到原有 FP32 CPU cache。
-3. 准备 SIFT database。
-4. 统计 SIFT observations 和 prior track observations。
-5. 按观测数量过滤低覆盖帧。
-6. 导出前馈 depth 到 `<output_dir>/pred_depth/`，供后续分析或 dense 后处理使用。
-7. 使用 GlueMap 的 intrinsics averaging 得到 shared `SIMPLE_PINHOLE` intrinsics。
-8. 将 VGGSfM prior tracks snap 到 SIFT keypoints。
-9. 写出 prior track database。
-10. 合并 prior database 和 SIFT database。
-11. 写出 coarse COLMAP reconstruction。
-12. 进入 augmented refinement loop。
-
-默认配置：
-
-```text
-SIFT database mode : sift
-VGGSfM query source: aliked
-tracker input      : 1024
-prior topology     : star
-camera model       : SIMPLE_PINHOLE
-```
-
-## Augmented Refinement Loop
-
-精修循环位于：
-
-```text
-utils/gluemap_refine_core.py::run_merg3r_augmented_refinement_loop()
-```
-
-每一轮大致执行：
-
-```text
-seed reconstruction
-  -> triangulation
-  -> select tracks
-  -> reprojection / angular error filtering
-  -> bundle adjustment
-  -> 下一轮继续用优化后的 pose / intrinsics 作为 seed
-```
-
-关键参数：
-
-```bash
---num_refinement_iterations 3
---tri_min_angle 1.0
---tri_create_max_angle_error 0.5
---select_track_min_support 512
---filter_reproj_error_type angular
---filter_reproj_error_threshold 0.5
---augmented_ba_max_filter_iterations 3
---augmented_ba_normalized_reproj_threshold 1e-2
-```
-
-如需仅在最后一轮减弱 Huber 降权、增强中等残差的拟合力度，例如
-三轮分别使用 `delta=1.0 / 1.0 / 2.0`：
-
-```bash
---num_refinement_iterations 3
---bae_robust_loss huber
---bae_huber_delta 1.0
---final_bae_huber_delta 2.0
-```
-
-## BAE 后端
-
-原 GlueMap / pycolmap 路线默认依赖 Ceres solver；当前主流程默认使用 [third_party/bae](third_party/bae) 作为 PyTorch BA 后端：
-
-```bash
---ba_backend bae
-```
-
-BAE 默认参数：
-
-```bash
---bae_max_num_iterations 20
---bae_optimize_intrinsics
---bae_fix_gauge two_cams
---bae_robust_loss huber
---bae_huber_delta 1.0
-```
-
-当前 BAE 路线的设计取舍：
-
-- 使用真实 sparse tracks 做 refinement。
-- 跳过 GlueMap virtual tracks。
-- 用 `two_cams` gauge fixing 模拟 COLMAP/Ceres 的 gauge 约束语义。
-- 可优化 `SIMPLE_PINHOLE` 的 focal，固定 principal point。
-- 对 real-track residual 使用 Huber robust loss。
-- 中间轮不强制重复 post-BA filter，最终轮才保留有效过滤结果。
-
-如果显式使用 Ceres：
-
-```bash
---ba_backend ceres
-```
-
-Ceres 路线会保留 GlueMap 原本更接近 SPV 的 virtual-track 分支：
-
-- 构建 virtual tracks；
-- 初始化 virtual points；
-- 同时维护 real reconstruction 和 virtual reconstruction；
-- 每轮做 virtual track selection / filtering / BA。
-
-因此 README 里的 `SPV` 指的是 GlueMap 原始 virtual-track 思路；当前默认 BAE 主线实际是 `SP real tracks + BAE BA`。
-
-## 这套项目后来新增/改造的逻辑
-
-相对于原始 MERG3R 或原始 GlueMap，当前主流程主要新增了这些部分：
-
-1. **两阶段图片处理**
-   - low 图给前馈模型；
-   - high 图给稀疏特征、VGGSfM prior 和最终输出；
-   - 显式保存 low/high 对应关系和 intrinsics scale。
-
-2. **前馈粗几何到 GlueMap 的桥接**
-   - 把 MERG3R/PI3X 的 coarse pose、intrinsics、depth 整理为 `Merg3rCoarseState`；
-   - 用 coarse pose 建 pose-aware pair graph；
-   - 让 GlueMap 后端从 coarse reconstruction 启动，跳过原始的每帧构建star图推理阶段。
-
-3. **VGGSfM prior tracks + SIFT snap/merge**
-   - 用 ALIKED query point 生成 prior tracks；
-   - 将 prior observations snap 到 SIFT keypoints；
-   - 合并 `database_vggsfm_prior.db` 与 `database_sift.db`。
-
-4. **BAE 替代 Ceres 作为默认 BA 后端**
-   - BAE 位于 `third_party/bae`；
-   - 主流程默认 `--ba_backend bae`；
-   - 保留 `--ba_backend ceres` 作为对照路径。
-
-5. **低覆盖帧过滤**
-   - 统计 SIFT observations 和 prior observations；
-   - 对低于 `--min_frame_observations` 的帧做过滤；
-   - 避免低观测帧破坏后续三角化和 BA。
-
-6. **Depth 导出与后处理接口**
-   - Stage A 的 depth 会导出到 `pred_depth/`；
-   - 后续的 depth correction、TSDF、LingBot depth refine 等脚本可以基于这些输出继续处理；
-   - 这些 dense/depth 后处理不是 `run_merg3r_gluemap_pipeline.py` 主流程的一部分。
-
-7. **项目结构清理**
-   - GlueMap / BAE 作为 `third_party/` 工具包；
-   - 通用函数逐步移到 `utils/`；
-   - 当前主流程只依赖保留下来的 `pi3x_model` / `vggt_omega` feed-forward 代码，其中主入口固定 `pi3x`。
-
-## 主要输出
-
-一次运行的 `<output_dir>` 典型结构：
-
-```text
-output/
-  pipeline_config.json
-  pipeline_stage_a_summary.json
-  refine_stats.json
-  prior_pose_import.json       # 仅 prior-pose 模式产生
-
-  image_pyramid/               # 仅 feed-forward 模式产生
-    image_pyramid_manifest.json
-
-  images/
-    frame_000000.png
-    frame_000001.png
-    ...
-
-  pred_depth/                  # 仅 feed-forward 模式产生
-    depth_npy/
-    depth_u16/
-    depth_vis/
-
-  database_sift.db
-  database_vggsfm_prior.db
-  database_merged.db
-
-  coarse/
-    cameras.*
-    images.*
-    points3D.*
-
-  refined_gluemap_aba/
-    cameras.*
-    images.*
-    points3D.*
-
-  virtual_gluemap_aba/        # 仅 Ceres / virtual-track 路线可能产生
-```
-
-最终交付的 SfM sparse reconstruction 通常看：
-
-```text
-<output_dir>/refined_gluemap_aba/
-```
-
-只审计 VGGSfM group、同时比较 pose baseline 与 projected-overlap hybrid：
-
-```bash
-python run_merg3r_gluemap_pipeline.py \
-  --dataset <images> \
-  --output_dir <output> \
-  --pair_k_pose 25 \
-  --neighbors_per_center 12 \
-  --export_vggsfm_groups_only \
-  --vggsfm_group_audit_strategy both
-```
-
-该模式在相同 Stage A 结果上输出：
-
-```text
-vggsfm_group_audit/
-  pose_k12/
-  projected_overlap_hybrid_k12/
-    groups.json
-    candidate_scores.json
-    labels.csv
-    contact_sheets/
-    groups/
-```
-
-projected-overlap hybrid 的候选池为 rotation-valid pose pairs 与 DINO
-top-30 的并集；排序使用 low-resolution depth 的有向 round-trip
-reprojection overlap，DINO 只用于候选召回。
-
-正式 refinement 使用 projected-overlap group：
-
-```bash
-python run_merg3r_gluemap_pipeline.py \
-  --dataset <images> \
-  --output_dir <output> \
-  --pair_k_pose 25 \
-  --neighbors_per_center 12 \
-  --vggsfm_group_strategy projected_overlap
-```
-
-不传 `--vggsfm_group_strategy` 时仍使用 `pose`，便于和已有结果对照。
-正式 projected-overlap 路径复用下方四个 `--projected_overlap_*` 参数；
-如果 sequence 阶段未产生 DINO similarity matrix，Stage A 会自动补算一次。
-
-### SIFT-first Center / Group V1
-
-默认 `--vggsfm_schedule_mode legacy` 保留原有 VGGSfM-first、full-center 执行
-顺序。实验模式：
-
-```text
-sift_first_full
-  先构建一次 SIFT DB
-  SIFT pairs = 旧 pose candidates + local temporal pairs
-  所有帧仍作为 center
-
-sift_first_sparse
-  在 sift_first_full 基础上
-  用 verified SIFT inliers + 双向 grid coverage 抽稀 center
-  group = owned frames + adjacent-center bridges + projected-overlap fill
-```
-
-当前质量基线使用 `neighbors_per_center=16`。以下命令使用当前 V1 的默认抽稀阈值，
-可作为标准 sparse 实验的命令行参考：
-
-```bash
-source /opt/conda/bin/activate
-conda activate gluemap-merg3r
-
-python run_merg3r_gluemap_pipeline.py \
-  --dataset /path/to/images \
-  --output_dir /path/to/output_sparse \
-  --prior_match_topology star \
-  --ba_backend bae \
-  --bae_max_num_iterations 20 \
-  --num_refinement_iterations 3 \
-  --bae_optimize_intrinsics \
-  --bae_robust_loss huber \
-  --bae_huber_delta 1.0 \
-  --final_bae_huber_delta 2.0 \
-  --filter_reproj_error_threshold 1.0 \
-  --neighbors_per_center 16 \
-  --vggsfm_group_strategy projected_overlap \
-  --vggsfm_group_batch_size 3 \
-  --vggsfm_schedule_mode sift_first_sparse \
-  --sift_temporal_window 2 \
-  --sift_schedule_grid_size 8 \
-  --sift_schedule_min_inliers_per_cell 2 \
-  --sift_schedule_min_pair_inliers 128 \
-  --sift_schedule_min_grid_coverage 0.20 \
-  --vggsfm_max_center_gap 2
-```
-
-启用 sparse 调度必须同时设置 `--vggsfm_schedule_mode sift_first_sparse` 和
-`--vggsfm_group_strategy projected_overlap`；后面六项显式写出了当前默认值，便于实验
-记录和复现。`sift_first_sparse` 会先构建
-SIFT DB，再根据 verified SIFT 强边选择部分帧作为 VGGSfM center；未被选为 center 的帧
-仍可作为 group neighbor，并继续参加最终注册和 BA。
-
-对于数百帧以上、BAE observation 可能过多的序列，可在相同命令中增加：
-
-```bash
---bae_max_observations 2000000
-```
-
-该参数会在每轮 BAE 前按完整 track 裁剪 observation。启用 cap 后，`final points`
-会同时受到 track length 分布影响，因此不能只根据最终点数判断 sparse 是否提升质量。
-
-当前 sparse V1 仍是实验模式，`legacy` 仍为默认和质量回退路径。720_room 的首轮结果中，
-默认 `min_pair_inliers=128` 获得约 27% 端到端加速，但 P-only angular median/p90
-超过了 3% 退化门槛。下一轮若要测试更保守的 center 抽稀，可仅覆盖：
-
-```bash
---sift_schedule_min_pair_inliers 512
-```
-
-这组 `512` 配置目前只是基于 720_room 阈值 sweep 得到的候选（预计保留 508/720 个
-center），尚未完成正式质量验收，不应替代上面的可复现实测配置。
-
-SIFT-first 模式额外输出 `vggsfm_schedule.json`，包含 pair 来源、verified
-inlier/coverage、阈值 sweep、center/owner 原因和三层 group provenance。
-
-### SIFT + LoMa Prior V1（实验）
-
-通过 `--prior_provider loma` 选择 LoMa-B，默认 provider 仍为 VGGSfM。
-LoMa 路径先完成 SIFT 匹配，使用两套 pair 图：
-
-- SIFT：当前 pose neighbors（含 rotation threshold）并上 temporal pairs，默认时序窗口 ±2。
-- LoMa 候选池：pose pairs ∪ 每图 DINO top-30 ∪ temporal pairs，无向去重。
-  默认 `--loma_pair_selection sift_guided`：保留全部 temporal，每图从剩余候选中
-  最多选择 sufficient / insufficient / untried 各 3 / 5 / 5 个邻居。
-  任一方向选中就执行，某类不足不跨类补齐。使用 `--loma_pair_selection all`
-  可恢复首版全候选匹配，作为对照。
-
-Sufficient 先按双向 SIFT 覆盖率的较小值、内点数、DINO 相似度降序排列；
-insufficient/untried 先按 DINO 相似度，再按覆盖率和内点数排列，不优先选零匹配边。
-逐次选择时，优先选与本帧已保留邻居的序号间隔超过 `sift_temporal_window` 的候选，
-没有此类候选时按原排序补足本类名额。类别按 sufficient → insufficient → untried
-顺序处理，以 temporal 邻居初始化；序号间隔只用于减少相邻重复视图，不保证几何差异。
-排序最终以图像序号打破并列，选择结果可复现。
-
-每张工作图使用原生路径预处理提取一次特征，保留 LoMa-B 默认 2048 个关键点及
-0.1 匹配阈值。固定 feature ID 经过 pycolmap 两视图几何验证后写入 prior DB，
-再使用现有数据库合并、三角化、SelectTrack、几何过滤和 BAE 流程。LoMa 坐标不 snap 到 SIFT。
-VGGSfM 的 group、center、query 与 `prior_match_topology` 参数不控制 LoMa。
-
-2026-09-08 后端筛选修订（SIFT + LoMa/VGGSfM 共用）：三角化默认
-`ignore_two_view_tracks=True`；SelectTrack 对所有来源共同执行原有固定种子随机顺序、
-pair 支持数量筛选，不再无条件保留 SIFT-only tracks。来源仍按真实 feature ID 统计，
-不改变支持阈值、误差过滤顺序、BAE 设置或增加新的 CLI 参数。
-此开关不保证过滤后的所有 track 均至少有 3 个观测。冻结输入的测试与质量结论见
-[track 筛选对照](.ai/plan/track_selection_ablation.md)。
-
-#### 轻量模式 CLI（Ubuntu / RTX 4090）
-
-轻量模式约定为 **LoMa-B + batch + sift-guided 3/5/5 pairs + 忽略两视图成轨 +
-全来源共同 SelectTrack**。这里的“共同筛选”表示 SIFT 和 LoMa tracks 使用同一
-选择器，不是保留所有 tracks。两项后端行为已在代码中生效，无需额外开关；
-SelectTrack 支持阈值保持 512，LoMa 的 PyTorch CPU 内部线程固定为 8。
-这是一组显式 CLI 配置，目前没有单独的 `--lite` 参数；只设置
-`--prior_provider loma` 不会自动启用下面的 batch、workers 和 CUDA cache。
-
-以下命令使用云端 789_room 数据与已有 conda 环境。其他数据请修改 `--dataset`、
-`--prior_transforms_json` 和输出路径；`mkdir` 提前创建日志目录，`pipefail` 保留
-Python 失败时的退出状态。每次对照实验使用独立输出目录。
+在已配置的 Ubuntu / RTX 4090 环境中，从当前整理分支运行：
 
 ```bash
 source /opt/conda/bin/activate && conda activate gluemap-merg3r
 cd /kiri/FeedForwardWithBA
 set -o pipefail
-mkdir -p /kiri/tmp/ffba_789_loma_lite
+mkdir -p /kiri/tmp/ffba_789_lite_cleanup
 
 python -u run_merg3r_gluemap_pipeline.py \
+  --config config.yaml \
   --dataset /kiri/codex_use_data/789_room/image \
   --prior_transforms_json /kiri/codex_use_data/789_room/transforms.json \
-  --output_dir /kiri/tmp/ffba_789_loma_lite \
-  --prior_provider loma \
-  --loma_match_batch_size 2 \
-  --loma_extract_batch_size 4 \
-  --loma_preprocess_workers 4 \
-  --loma_geometry_workers 4 \
-  --loma_feature_cache cuda \
-  --loma_pair_selection sift_guided \
-  --loma_dino_candidates 30 \
-  --loma_sufficient_neighbors 3 \
-  --loma_insufficient_neighbors 5 \
-  --loma_untried_neighbors 5 \
-  --pair_k_pose 25 \
-  --pair_pose_rotation_threshold 30 \
-  --sift_temporal_window 2 \
-  --sift_schedule_min_pair_inliers 128 \
-  --sift_schedule_min_grid_coverage 0.20 \
-  --select_track_min_support 512 \
-  --ba_backend bae \
-  --bae_max_num_iterations 20 \
-  --bae_max_observations 0 \
-  --num_refinement_iterations 3 \
-  --bae_optimize_intrinsics \
-  --bae_robust_loss huber \
-  --bae_huber_delta 1.0 \
-  --final_bae_huber_delta 2.0 \
-  --filter_reproj_error_threshold 1.0 \
-  2>&1 | tee /kiri/tmp/ffba_789_loma_lite/run.log
+  --output_dir /kiri/tmp/ffba_789_lite_cleanup \
+  --input_order ordered \
+  --mode lite \
+  2>&1 | tee /kiri/tmp/ffba_789_lite_cleanup/run.log
 ```
 
-BAE 与重投影过滤参数沿用此前实验基线，不增加 observation cap 或新的 track 限额。
-已有性能与质量结果见下文及 [track 筛选对照](.ai/plan/track_selection_ablation.md)。
-这些历史运行使用匹配列顺序 bug 修复前的数据库；当前分支已修复该问题，修复后的
-完整轻量组合仍待端到端回归，不能把历史耗时或质量结论直接视为本命令的实测结果。
-
-LoMa V1 只支持 BAE，不启用 observation cap；传入正的 `bae_max_observations`
-会报错提示，避免沿用旧测试命令时无意裁剪。内参优化默认开启，可用
-`--no-bae_optimize_intrinsics` 关闭。其余 BAE 和既有过滤参数沿用当前命令配置。
-有深度前馈输入和 `--prior_transforms_json /path/to/transforms.json` 均可使用同一 LoMa pair 规则。
-
-模型从仓库 `third_party/LoMa/src` 加载，依赖见其 `pyproject.toml`；首次加载会使用
-上游的权重下载与缓存机制。特征默认缓存在本次进程的 CPU 内存中，也可显式选择 CUDA。
-输出 `prior_loma_pairs.json`（全候选来源、SIFT 标注、选择方向/原因及已执行边的匹配结果）、
-`prior_loma_stats.json`（分阶段时间、验证图连通性、唯一观测及最终轨长统计）、
-`database_loma_prior.db`，并沿用 `refine_stats.json` 和原有 COLMAP 输出目录。
-
-全候选版本已在 789 图、Ubuntu/4090 上完成用户实测，端到端 2144.90 s，
-尚未达到加速目标，详见 `logs/loma_789_data/`。
-3/5/5 版本的 789 图实测执行 9,331 pairs，prior 644.41 s、端到端 1,442.05 s，
-详见 `logs/ffba_789_loma_355/`；两次运行的 SIFT 输入有差异，不能直接作为严格质量 A/B。
-详细设计见 [LoMa prior V1](.ai/plan/loma_prior_lite_design.md)。
-
-LoMa 执行加速已接入，解析器默认参数仍为 matching batch / extract batch /
-preprocess workers / geometry workers / feature cache = `1 / 1 / 0 / 1 / cpu`。
-上面的轻量模式 CLI 显式设置为 `2 / 4 / 4 / 4 / cuda`。
-
-提取按 detector 输入尺寸分桶，matching 按两端特征形状分桶；尾批直接运行。
-预处理最多保留两个提取 batch，几何验证队列上限为
-`max(2 * loma_match_batch_size, loma_geometry_workers)`，每个 RANSAC 任务内部线程数为 1。
-这些限制控制在途内存，不删 pairs/关键点/观测；LoMa-B、3/5/5 与 BAE 配置沿用当前设置。
-CPU/CUDA cache 都仅在本次 prior 生命周期内使用，CUDA cache 在进入 BAE 前释放。
-LoMa 主流程固定使用 8 个 PyTorch CPU 算子内部线程，在模型加载前设置，阶段退出时
-恢复原值；没有新增 CLI 参数。`execution.torch_threads` 与 `torch_threads_before`
-记录生效值和原值，它们与预处理、几何验证的 worker 数分别计数。
-OOM 会携带阶段、batch 和缓存信息报错，不自动改变配置重试。
-
-`prior_loma_stats.json` 的 `execution` 记录生效配置、实际 batch 分布、cache 字节和队列峰值；
-`memory.stages` 记录各阶段 CUDA allocator 峰值（包含进程中其他存活的分配）。
-`timing.schema_version=2`：`geometric_verification` 是任务累计耗时，可能互相重叠；
-看 `match_and_verify_wall` 和 `total` 判断实际速度，不直接相加 matching 与 geometry。
-新提取路径记录预处理/H2D/detector/descriptor/D2H；默认原生提取只记录整体耗时。
-
-本机已通过 CPU 调度、原生预处理一致性、真实 pycolmap 几何与 DB 衔接测试。
-Ubuntu/4090 已完成 789 图组合试跑：LoMa 线程固定 8、matching batch=2、提取 batch=4、
-workers=4/4、CUDA cache 时，prior 232.79 s、端到端 1106.53 s；详细对比见执行加速设计。
-固定输入的 GPU 数值一致性仍待验证，可在仓库根目录用少量**工作图**做独立检查：
+其他数据请修改输入、先验和输出路径；每次实验使用独立输出目录。
+纯图片标准模式：
 
 ```bash
-PYTHONPATH=. python scripts/check_loma_execution.py \
-  --images_dir /path/to/work_images --num_images 6 \
-  --match_batch_sizes 1 4 8 --extract_batch_sizes 1 2 \
-  --preprocess_workers 4 --output /path/to/loma_execution_check.json
+python -u run_merg3r_gluemap_pipeline.py \
+  --dataset /path/to/images \
+  --output_dir /path/to/output \
+  --input_order ordered \
+  --mode standard
 ```
 
-该脚本固定一份原生特征对照 matching batch 与 CPU/CUDA cache，然后检查提取的
-关键点集合、互为最近邻的描述子及重映射匹配；输出数值差异报告，不替代几何/BAE 质量验收。
-完整方案与分项验证顺序见 [LoMa 执行加速](.ai/plan/loma_execution_acceleration_design.md)。
+## 配置
 
-### Nerfstudio Prior Pose 输入
+CLI 仅保留 `--config`、`--dataset`、`--output_dir`、`--prior_transforms_json`、`--input_order`、`--mode`。
+旧的 `--ba_backend`、`--vggsfm_schedule_mode`、`--loma_match_batch_size` 等参数已移除；请在 YAML 中配置。
 
-传入 `--prior_transforms_json` 后，Nerfstudio `transforms.json` 中的 pose 会替代
-Pi3X/MERG3R coarse pose。它只作为初值，后续仍由 BAE 优化。该模式：
+可以直接编辑 `config.yaml`，也可以通过 `--config experiment.yaml` 提供部分覆盖。
+优先级为仓库默认配置 → 实验 YAML → CLI 的 mode / input_order。
+未知字段、重复键、错误类型和非法范围会在模型加载前报错。
 
-- 以 JSON `frames[]` 顺序作为图片和时序顺序；
-- 直接在原始图片分辨率上运行 SIFT、refinement 和输出 COLMAP model；
-- 跳过 Pi3X、subset alignment、depth 生成与 `pred_depth/` 导出；
-- 只支持 `--ba_backend bae`；
-- VGGSfM 使用 depth-free `sift_pose_dino` group，不支持 `projected_overlap`；LoMa 使用上述独立 pair 图。
-
-789_room sparse 示例：
-
-```bash
-source /opt/conda/bin/activate
-conda activate gluemap-merg3r
-
-python run_merg3r_gluemap_pipeline.py \
-  --dataset /kiri/codex_use_data/789_room/image \
-  --prior_transforms_json /kiri/codex_use_data/789_room/transforms.json \
-  --output_dir /kiri/tmp/ffba_789_prior_sparse \
-  --prior_match_topology star \
-  --ba_backend bae \
-  --bae_max_num_iterations 20 \
-  --bae_max_observations 2000000 \
-  --num_refinement_iterations 3 \
-  --bae_optimize_intrinsics \
-  --bae_robust_loss huber \
-  --bae_huber_delta 1.0 \
-  --final_bae_huber_delta 2.0 \
-  --filter_reproj_error_threshold 1.0 \
-  --neighbors_per_center 16 \
-  --vggsfm_group_strategy sift_pose_dino \
-  --vggsfm_group_batch_size 3 \
-  --vggsfm_schedule_mode sift_first_sparse \
-  --sift_temporal_window 2 \
-  --sift_schedule_min_pair_inliers 128 \
-  --sift_schedule_min_grid_coverage 0.20 \
-  --vggsfm_max_center_gap 2
+```yaml
+# experiment.yaml：只覆盖以下值，其余继承 config.yaml。
+prior:
+  vggsfm:
+    group_strategy: sift_pose_dino
+    group_batch_size: 3
+  loma:
+    match_batch_size: 2
+bae:
+  optimize_intrinsics: true
 ```
 
-输入的 Nerfstudio OpenGL camera-to-world pose 会转换为 OpenCV/COLMAP
-world-to-camera。内参统一为 `fx=fy=mean((fl_x+fl_y)/2)`、`cx=w/2`、`cy=h/2`，
-输出仍使用 shared `SIMPLE_PINHOLE`，并忽略 JSON 中的 distortion 和
-`depth_file_path`。DINO retrieval 使用临时长边 512 的缩略图；VGGSfM 仍使用其内部
-1024×1024 resize/pad，这两者都不会改变原图 SIFT/COLMAP 坐标。
+| 分组 | 内容 |
+| --- | --- |
+| `pipeline` | standard/lite、ordered/unordered |
+| `input` | 图片采样、low/high 分辨率 |
+| `retrieval` | DINO 相似度混合；long_side/batch_size 保留先验 pose 路径的预处理设置，前馈路径仍复用 low images |
+| `initialization.feedforward` | 内参估计、子集大小、重叠和现有划分设置 |
+| `sift` | pose 邻居、旋转阈值、时序窗口、强边的内点和覆盖判据 |
+| `prior.vggsfm` | group 策略、center gap、query、阈值、batch、权重路径 |
+| `prior.loma` | DINO top-k、3/5/5、batch、workers、cache |
+| `refinement` | 三角化、全来源 SelectTrack、过滤和外层迭代 |
+| `bae` | 优化轮数、内参、gauge、Huber 和观测预算 |
+| `runtime` | device、图片 workers、日志 |
 
-运行会额外输出 `prior_pose_import.json`，用于审计 frame 映射、坐标转换、共享内参、
-轨迹范围和 DINO 临时输入尺寸。
+### VGGSfM group
 
-如果需要 PLY，可用 COLMAP 自带 converter 从 `points3D` 转出。
+center 始终采用 SIFT 支持引导的抽稀，group 保留两种选择：
 
-## 常用参数
-
-| 参数 | 默认 | 说明 |
+| `prior.vggsfm.group_strategy` | 有深度 | 无深度 |
 | --- | --- | --- |
-| `--dataset` | required | 输入图片目录 |
-| `--output_dir` | required | 输出目录 |
-| `--prior_transforms_json` | unset | 可选 Nerfstudio transforms.json；启用原图分辨率 prior-pose 模式并跳过 feed-forward/depth |
-| `--prior_dino_long_side` | `512` | prior-pose 模式的临时 DINO retrieval 图片长边，不改变几何工作分辨率 |
-| `--prior_dino_batch_size` | `16` | prior-pose 模式的 DINO inference batch size |
-| `--device` | `cuda` | 推理和 refinement 设备 |
-| `--num_images` | `-1` | 限制图片数量，`-1` 表示全部 |
-| `--subsample` | `1` | 按顺序采样图片 |
-| `--multi_dirs` | off | 递归读取多级图片目录 |
-| `--image_pyramid` | on | 启用 low/high 两阶段图片 |
-| `--stage1_downscale_n` | `4` | low 图相对原图的下采样基数 |
-| `--stage1_multiple` | `14` | low 图裁剪到该倍数 |
-| `--stage2_scale_factor` | `0` | high 图相对 low 图的倍率，`0` 表示使用 `stage1_downscale_n` |
-| `--sequence_type` | `shortest_path` | MERG3R subset 构建方式 |
-| `--subset_size` | `100` | 每个前馈 subset 的图片数 |
-| `--overlap` | `5` | subset 之间的 overlap |
-| `--splitting_type` | `interleave` | subset 内图片组织方式 |
-| `--alignment_type` | `weighted_iterative` | MERG3R subset pose 对齐方式 |
-| `--pair_k_pose` | `25` | 每帧按 coarse pose 选取的邻居数量 |
-| `--pair_pose_rotation_threshold` | `30.0` | pose pair 允许的最大视角差，单位为度 |
-| `--path_tracker` | required in practice | VGGSfM tracker checkpoint |
-| `--neighbors_per_center` | `16` | 每个 VGGSfM group 的邻居上限；V1 固定质量基线为 16 |
-| `--vggsfm_group_strategy` | `pose` | VGGSfM group 策略；`pose`、depth-based `projected_overlap` 或 depth-free `sift_pose_dino` |
-| `--vggsfm_group_batch_size` | `2` | 按 `(group_size, query_points)` 分桶后，每次 VGGSfM forward 的 group 数量；尾桶自动降为较小 batch |
-| `--vggsfm_schedule_mode` | `legacy` | `legacy`、`sift_first_full` 或 `sift_first_sparse` |
-| `--sift_temporal_window` | `2` | SIFT candidate graph 强制加入的时序窗口 |
-| `--sift_schedule_grid_size` | `8` | verified SIFT coverage 网格边数 |
-| `--sift_schedule_min_inliers_per_cell` | `2` | cell 被视为 occupied 的最少 verified inliers |
-| `--sift_schedule_min_pair_inliers` | `128` | valid schedule edge 的最少 verified inliers |
-| `--sift_schedule_min_grid_coverage` | `0.20` | pair 两端最小 grid coverage |
-| `--vggsfm_max_center_gap` | `2` | sparse mode 下 selected centers 最大时序间隔 |
-| `--export_vggsfm_groups_only` | off | Stage A 后按 audit strategy 导出 VGGSfM groups、contact sheets、JSON 和人工标签 CSV，然后跳过 tracker/refinement |
-| `--vggsfm_group_audit_strategy` | `pose` | `pose`、`projected_overlap` 或 `both`；仅影响 group audit 提前退出模式 |
-| `--projected_overlap_dino_candidates` | `30` | 每个 center 加入 projected-overlap 候选池的 DINO retrieval 数量 |
-| `--projected_overlap_samples` | `2048` | 每个 center 用于有向几何投影的 low-res depth 规则网格采样上限 |
-| `--projected_overlap_reproj_threshold` | `4.0` | low-res depth round-trip reprojection 一致性阈值，单位为像素 |
-| `--projected_overlap_conf_quantile` | `0.2` | 丢弃每帧最低比例的 depth-confidence 样本 |
-| `--vggsfm_query_points` | `1024` | prior tracking query 点数 |
-| `--prior_match_topology` | `star` | prior tracks 写入 pair matches 的拓扑 |
-| `--min_frame_observations` | `10` | 低覆盖帧过滤阈值 |
-| `--ba_backend` | `bae` | `bae` 或 `ceres` |
-| `--bae_max_num_iterations` | `20` | BAE 迭代次数 |
-| `--bae_max_observations` | `0` | 每轮进入 BAE 的 real observation 硬上限；`0` 表示禁用，超限时按质量排序原地删除完整 track |
-| `--bae_fix_gauge` | `two_cams` | BAE gauge fixing 策略 |
-| `--bae_robust_loss` | `huber` | BAE robust loss |
-| `--final_bae_huber_delta` | unset | 仅在 augmented refinement 最后一轮使用的 BAE Huber delta；未设置时每轮均使用 `--bae_huber_delta` |
-| `--num_refinement_iterations` | `3` | augmented refinement 外层轮数 |
+| `projected_overlap`（默认） | 深度投影重叠 | fallback 到 `sift_pose_dino` |
+| `sift_pose_dino` | SIFT / pose / DINO | SIFT / pose / DINO |
 
-## 推荐检查点
+两种策略都保留 owned frames、有效的相邻 center bridge、候选补充三层 group。
+输出记录 requested/effective strategy 与 fallback reason；深度数据错配或计算异常不会被当成“缺少深度”吞掉。
 
-运行完成后优先检查：
+### 共同后端与轻量约定
+
+唯一 BA 后端是 BAE，只处理真实 tracks；正式流程已去掉 Ceres BA 和 virtual-track 构建。
+仍使用 PyCOLMAP/GlueMap 的匹配、几何验证、三角化、SelectTrack 和模型读写。
+
+- 三角化固定 `ignore_two_view_tracks=True`，不保证后续过滤后的所有 track 均有至少 3 个观测。
+- SIFT 和 prior 全部参与 SelectTrack，支持阈值默认 512；“共同筛选”不是保留全部 tracks。
+- 默认三轮 refinement，每轮 BAE 优化 20 次；仅最终轮执行原有逐级 post-BA filter。
+- 默认优化内参，Huber delta 为 1，最终轮为 2；前置 angular filter 为 1°。
+- 轻量模式不设置 observation cap，`bae.max_observations` 必须 ≤0；标准模式默认也关闭预算，可按需要配置。
+- LoMa 内部 PyTorch CPU 线程固定 8，退出 prior 阶段时恢复原值。CPU/CUDA cache 均为进程内缓存，在进入 BAE 前释放。
+- LoMa pair 池为 pose ∪ DINO top-30 ∪ temporal（仅有序）；保留 temporal，每图对其余 sufficient/insufficient/untried 候选最多选 3/5/5，任一方向选中即执行。
+
+## 输出
+
+- `resolved_config.yaml`：本次最终配置、顺序语义、实际 group fallback、代码版本与 dirty 状态；用于审计，包含运行元数据，不作为输入覆盖文件。
+- `pipeline_config.json` / `pipeline_stage_a_summary.json` / `pipeline_run_summary.json`：阶段配置、图片名称顺序、计时与输出位置。
+- `refine_stats.json`：SIFT/prior 来源、筛选前后数量、覆盖、优化和计时。
+- `vggsfm_schedule.json` 或 `prior_loma_pairs.json` / `prior_loma_stats.json`：各自调度、pair 与执行明细。
+- `database_sift.db`、prior DB、`database_merged.db`：匹配与合并产物。
+- `refined_gluemap_aba/`：最终 COLMAP 模型；有深度时继续导出 `pred_depth/`。
+
+## 代码结构
 
 ```text
-pipeline_stage_a_summary.json
-refine_stats.json
-refined_gluemap_aba/
+ffba/
+  config.py                 # YAML / CLI / 校验 / 生效配置
+  pipeline.py               # 主流程调度
+  refinement.py             # Stage B：连接匹配与重建
+  types.py                  # Stage A 状态
+  refinement_config.py      # 后端配置适配（默认值来自同一 YAML）
+  initialization/           # 图片、DINO、Pi3X、pose 导入、划分、Sim3 对齐
+  matching/                 # SIFT、center 调度、group、VGGSfM、LoMa
+  reconstruction/           # 数据库、三角化、SelectTrack、过滤、BAE
+  reporting/                # 统计、深度导出、group 可视化
 ```
 
-重点看：
+旧 `algos/` 暂时保留，正式管道不再导入它。旧 `utils` 路径仅保留少量转发，避免历史分析脚本复制实现。
+[旧流程与实验 CLI](docs/legacy_pipeline.md) 仅供历史对照，不能直接用于新入口。
+设计和验证记录见 [整理方案](.ai/plan/pipeline_cleanup_design.md)。
 
-- Stage A 是否覆盖了所有图片；
-- pair graph 是否有 `zero_degree_images`；
-- frame filtering 是否丢掉过多帧；
-- SIFT / prior track observations 是否足够；
-- `vggsfm.neighbor_rank_stats` 中第 13～25 名邻居的通过率和有效 observation；
-- `vggsfm.workload.attempted_query_views` 与 `query_track_stats` 的成轨率、track length；
-- `augmented_refinement.final.real_by_source` 中最终 `p_only` / `mixed` 点数；
-- `augmented_refinement.final.angular_errors_by_track_source` 中最终 P 误差；
-- BAE summary 是否收敛；
-- `refined_gluemap_aba` 中的 registered images 和 points3D 数量是否合理。
+## 环境与验证
 
-## 当前边界
+复用已有 `gluemap-merg3r` GPU 环境。新配置加载需要 `PyYAML`；LoMa 的依赖见
+[third_party/LoMa/pyproject.toml](third_party/LoMa/pyproject.toml)，首次加载按上游机制下载权重。
+VGGSfM 权重位置在 `prior.vggsfm.weights` 配置；GlueMap、BAE、Pi3X 的安装需求与整理前相同。
 
-- `run_merg3r_gluemap_pipeline.py` 是当前主流程。
-- `run_merg3r_bae_pipeline.py` 是较早的 MERG3R + BAE pipeline，不是当前 README 描述的主路径。
-- `eval/`、旧 README 里的评测命令、旧 `run.sh` 参数不作为当前主流程依据。
-- depth correction、TSDF、LingBot depth refine、hybrid point cloud 等属于 BA 后处理链路，可基于主流程输出继续运行，但不属于本 README 的主流程闭环。
+```bash
+python run_merg3r_gluemap_pipeline.py --help
+python -m pytest -q tests
+```
+
+`--help` 不加载 torch 或模型。完整测试需要 torch、pycolmap 与 pygluemap；CPU 主机可运行配置及匹配数据逻辑测试，不能替代 GPU 端到端验收。
+
+当前整理版已通过远程 **106 项测试**及 **5 次 8 图 GPU 全流程验证**，覆盖先验/前馈、两种 prior、有序/乱序、深度 fallback 与多子集对齐。详细产物与结论边界见整理方案；尚未完成 789 图质量 A/B。

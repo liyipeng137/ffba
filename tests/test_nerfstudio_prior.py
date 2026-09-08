@@ -29,6 +29,11 @@ def test_nerfstudio_identity_pose_converts_to_opencv_w2c():
 
 
 def test_prior_loader_uses_json_order_and_shared_centered_intrinsics(tmp_path):
+    import pytest
+    import torch
+
+    if not hasattr(torch, "from_numpy"):
+        pytest.skip("Real torch is required for image tensor loading")
     images_dir = tmp_path / "image"
     images_dir.mkdir()
     for index, value in enumerate((32, 96, 160), start=1):
