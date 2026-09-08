@@ -15,7 +15,7 @@ retrieval:
 initialization:
   feedforward:
     intrinsics_method: moge
-    subset_size: 100
+    subset_size: 120
     overlap: 5
     splitting_type: interleave
 sift:
