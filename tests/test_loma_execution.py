@@ -4,6 +4,7 @@ import ast
 from contextlib import nullcontext
 import json
 from pathlib import Path
+import sys
 import threading
 from types import SimpleNamespace
 
@@ -353,7 +354,27 @@ def test_batched_execution_real_geometry_restores_ids_empty_pairs_and_tails():
     assert not backend.closed  # injected backend belongs to the caller
 
 
-def test_matching_failure_closes_owned_backend_without_retry(monkeypatch):
+@pytest.fixture
+def torch_thread_runtime(monkeypatch):
+    state = {"threads": 64, "changes": []}
+
+    def set_threads(value):
+        state["threads"] = value
+        state["changes"].append(value)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "torch",
+        SimpleNamespace(
+            get_num_threads=lambda: state["threads"], set_num_threads=set_threads
+        ),
+    )
+    return state
+
+
+def test_matching_failure_closes_owned_backend_without_retry(
+    monkeypatch, torch_thread_runtime
+):
     pytest.importorskip("pycolmap")
     backend = BatchBackend()
     monkeypatch.setattr(loma, "LoMaBackend", lambda *_, **__: backend)
@@ -373,3 +394,49 @@ def test_matching_failure_closes_owned_backend_without_retry(monkeypatch):
             match_batch_size=2,
         )
     assert backend.closed and backend.batches == ["failed"]
+    assert torch_thread_runtime["changes"] == [8, 64]
+
+
+@pytest.mark.parametrize("failure", [None, "load", "geometry"])
+def test_owned_prior_limits_threads_before_model_load_and_restores_on_exit(
+    monkeypatch, torch_thread_runtime, failure
+):
+    pytest.importorskip("pycolmap")
+    backend = BatchBackend()
+
+    def create(*args, **kwargs):
+        assert torch_thread_runtime["threads"] == 8
+        if failure == "load":
+            raise RuntimeError("load failure")
+        return backend
+
+    monkeypatch.setattr(loma, "LoMaBackend", create)
+    if failure == "geometry":
+
+        def verify(*args):
+            assert torch_thread_runtime["threads"] == 8
+            raise RuntimeError("geometry failure")
+
+        monkeypatch.setattr(loma, "_verify_pair", verify)
+
+    def run():
+        return loma.run_loma_prior(
+            ["0.png", "1.png"],
+            (480, 640),
+            [backend.intrinsic] * 2,
+            [{"pair": [0, 1], "sift_support": "untried"}],
+            device="cpu",
+            match_batch_size=2,
+            geometry_workers=2,
+        )
+
+    if failure:
+        with pytest.raises(RuntimeError, match=f"{failure} failure"):
+            run()
+    else:
+        result = run()
+        assert result.stats["execution"]["torch_threads"] == 8
+        assert result.stats["execution"]["torch_threads_before"] == 64
+    assert backend.closed == (failure != "load")
+    assert torch_thread_runtime["threads"] == 64
+    assert torch_thread_runtime["changes"] == [8, 64]

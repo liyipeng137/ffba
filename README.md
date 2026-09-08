@@ -593,6 +593,9 @@ LoMa 执行加速已接入，默认参数 `1 / 1 / 0 / 1 / cpu` 保留逐图提�
 `max(2 * loma_match_batch_size, loma_geometry_workers)`，每个 RANSAC 任务内部线程数为 1。
 这些限制控制在途内存，不删 pairs/关键点/观测；LoMa-B、3/5/5 与 BAE 配置沿用当前设置。
 CPU/CUDA cache 都仅在本次 prior 生命周期内使用，CUDA cache 在进入 BAE 前释放。
+LoMa 主流程固定使用 8 个 PyTorch CPU 算子内部线程，在模型加载前设置，阶段退出时
+恢复原值；没有新增 CLI 参数。`execution.torch_threads` 与 `torch_threads_before`
+记录生效值和原值，它们与预处理、几何验证的 worker 数分别计数。
 OOM 会携带阶段、batch 和缓存信息报错，不自动改变配置重试。
 
 `prior_loma_stats.json` 的 `execution` 记录生效配置、实际 batch 分布、cache 字节和队列峰值；
@@ -602,7 +605,9 @@ OOM 会携带阶段、batch 和缓存信息报错，不自动改变配置重试�
 新提取路径记录预处理/H2D/detector/descriptor/D2H；默认原生提取只记录整体耗时。
 
 本机已通过 CPU 调度、原生预处理一致性、真实 pycolmap 几何与 DB 衔接测试。
-GPU 数值及速度尚待 Ubuntu/4090 验证。可先在仓库根目录用少量**工作图**做独立检查：
+Ubuntu/4090 已完成 789 图组合试跑：LoMa 线程固定 8、matching batch=2、提取 batch=4、
+workers=4/4、CUDA cache 时，prior 232.79 s、端到端 1106.53 s；详细对比见执行加速设计。
+固定输入的 GPU 数值一致性仍待验证，可在仓库根目录用少量**工作图**做独立检查：
 
 ```bash
 PYTHONPATH=. python scripts/check_loma_execution.py \

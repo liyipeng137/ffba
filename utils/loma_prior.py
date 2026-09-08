@@ -6,7 +6,7 @@ construction, annotation, geometry verification and DB export also run on CPU.
 
 from collections import Counter
 from dataclasses import dataclass
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from functools import partial
 import importlib
 from pathlib import Path
@@ -651,6 +651,24 @@ class LoMaPriorResult:
         )
 
 
+@contextmanager
+def _loma_cpu_threads():
+    """Bound intra-op CPU work for this sequential prior stage, then restore it."""
+    import torch
+
+    previous = torch.get_num_threads()
+    try:
+        if previous != 8:
+            torch.set_num_threads(8)
+        effective = torch.get_num_threads()
+        print(f"[LOMA-PRIOR] CPU threads: {previous} -> {effective}", flush=True)
+        yield {"torch_threads": effective, "torch_threads_before": previous}
+    finally:
+        if torch.get_num_threads() != previous:
+            torch.set_num_threads(previous)
+        print(f"[LOMA-PRIOR] CPU threads restored: {previous}", flush=True)
+
+
 def run_loma_prior(
     image_paths,
     image_size_hw,
@@ -677,30 +695,35 @@ def run_loma_prior(
     )
     start = time.perf_counter()
     owned = backend is None
-    if owned:
-        try:
-            backend = LoMaBackend(device, feature_cache=feature_cache)
-        except Exception as exc:
-            raise RuntimeError(
-                f"LoMa model loading failed on {device}, cache={feature_cache}: {exc}"
-            ) from exc
-    try:
-        return _run_loma_prior(
-            image_paths,
-            image_size_hw,
-            intrinsics,
-            pair_records,
-            backend,
-            start,
-            match_batch_size,
-            extract_batch_size,
-            preprocess_workers,
-            geometry_workers,
-            feature_cache,
-        )
-    finally:
+    # Injected backends are caller-owned test/experiment runtimes. Production
+    # owns the model and scopes CPU threads before its construction/imports.
+    with _loma_cpu_threads() if owned else nullcontext({}) as thread_settings:
         if owned:
-            backend.close()
+            try:
+                backend = LoMaBackend(device, feature_cache=feature_cache)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"LoMa model loading failed on {device}, cache={feature_cache}: {exc}"
+                ) from exc
+        try:
+            result = _run_loma_prior(
+                image_paths,
+                image_size_hw,
+                intrinsics,
+                pair_records,
+                backend,
+                start,
+                match_batch_size,
+                extract_batch_size,
+                preprocess_workers,
+                geometry_workers,
+                feature_cache,
+            )
+            result.stats["execution"].update(thread_settings)
+            return result
+        finally:
+            if owned:
+                backend.close()
 
 
 def _verify_pair(pair, points0, points1, matches, intrinsic0, intrinsic1, size):

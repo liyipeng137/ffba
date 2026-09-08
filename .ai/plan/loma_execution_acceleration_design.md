@@ -1,8 +1,40 @@
 # LoMa 批处理与执行流水加速设计
 
-状态：已实现，参数可用于 CLI；本地 CPU 检查通过，真实 GPU 数值与加速效果待 Ubuntu/4090 验收。
+状态：已实现并完成 Ubuntu/4090 的两轮 789 图运行；固定输入的 GPU 数值一致性 A/B 仍待验收。
 
 更新时间：2026-09-08
+
+2026-09-08 实测后的执行修订：主流程在整个 LoMa prior 阶段固定 PyTorch intra-op
+线程数为 8，模型构建前设置，在成功或异常退出时恢复原线程数，不新增 CLI 参数。
+依据为远程 64 逻辑 CPU / 13.6 核配额下的 CPU batch 上传准备小测试。
+本次组合实验 matching batch 改为 2，其余沿用提取 batch=4、预处理/几何 workers=4、
+CUDA cache；上传 buffer 实现保持当前版本，以便限定实验因素。
+
+本轮完整运行成功（退出码 0），远程目录 `/kiri/tmp/ffba_789_loma_355_batch2_t8/`。
+相对上一轮 `/kiri/tmp/ffba_789_loma_355_batch/` 的记录：
+
+| 指标 | 上一轮 batch=4 | 本轮 batch=2、LoMa CPU threads=8 |
+| --- | ---: | ---: |
+| LoMa 模型加载 | 32.05 s | 11.32 s |
+| 特征提取 | 106.92 s | 57.23 s |
+| 提取准备 + H2D 计时区间 | 50.95 s | 5.25 s |
+| Matching | 153.61 s | 161.15 s |
+| Matching + geometry 墙钟 | 154.47 s | 164.01 s |
+| Prior 总计 | 293.66 s | 232.79 s |
+| Stage A | 152.05 s | 98.10 s |
+| SIFT 阶段 | 133.76 s | 169.06 s |
+| 后端 refinement | 505.04 s | 539.63 s |
+| 端到端 | 1151.43 s | 1106.53 s |
+
+日志确认线程 `64 -> 8 -> 64`。Matching 实际执行 4702 个双 pair batch 与 1 个尾 pair，
+共 9405 pairs（上一轮 9348）；按 pair 归一的 matching 为 17.13 ms，对照 16.43 ms。
+8 线程下提取准备区间显著下降，本轮 batch=2 未显示 matching 速度优势；两项同时变化，
+不据此单独量化 batch 因果效果。Stage A 不受本次线程作用域影响，其耗时变化也不能计作该改动收益。
+
+本次重新运行 SIFT，matches 为 1,752,322，对照 1,542,334（+13.6%）；最终 495,773 点、
+2,255,088 观测、无掉帧，其中 S-only 351,439 / P-only 144,333 / mixed 1。
+P-only 角度均值为 0.119569°，对照 0.118762°。这些是完整运行的观测结果，不是固定 SIFT、
+固定 selected pairs 的严格质量/速度 A/B。详细统计保存在本地 `logs/ffba_789_loma_355_batch2_t8/`。
 
 关联：[LoMa prior 主设计](loma_prior_lite_design.md)。本方案在现有 3/5/5 pair
 选择后改变执行方式，保留 LoMa-B、2048 关键点、原生检测/描述分辨率、0.1 匹配
@@ -174,5 +206,5 @@ CPU 测试覆盖分桶/尾批/空输入、顺序映射、队列上限、异常�
 - 上游模型权重和算法、SIFT、pair selection、COLMAP 成轨、BAE 保持原实现。
 
 M/C/E/G 均已接入，每项可回到对照设置。运行示例见 README 的 LoMa 小节。
-本机无 Torch/CUDA，定向 CPU 测试通过；尚未运行真实 LoMa GPU 推理、789 端到端
-及 BAE 质量 A/B。CUDA cache、batch 数值和加速幅度均属于待验收项。
+本机无 Torch/CUDA，63 项定向 CPU 测试通过；远程真实 PyTorch 线程恢复检查通过，
+789 图完整运行已完成，结果见文首。固定输入的 GPU 数值一致性与 BAE 质量 A/B 仍待验证。

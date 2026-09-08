@@ -1,6 +1,6 @@
 # SIFT + LoMa 轻量 Prior V1 设计
 
-状态：全候选与 3/5/5 已完成 789 图 GPU 实测；执行加速已实现并通过本地 CPU 检查，GPU 数值/速度待验收
+状态：全候选、3/5/5 与执行加速已完成 789 图 GPU 实测；固定输入的 GPU 数值一致性仍待验收
 更新时间：2026-09-08
 实验分支：`codex/loma-prior-lite`  
 分支起点：`codex/prior-pose-input` / `fedf938`  
