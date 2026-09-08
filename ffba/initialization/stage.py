@@ -395,11 +395,7 @@ def write_stage_a_summary(output_dir, args, state, timing):
         "image_order_source": "transforms_json_frames"
         if args.prior_transforms_json
         else "sorted_image_paths",
-        "source": (
-            "run_merg3r_gluemap_pipeline.py"
-            if feedforward_source
-            else "nerfstudio_prior"
-        ),
+        "source": "run.py" if feedforward_source else "nerfstudio_prior",
         "stage": "merg3r_coarse" if feedforward_source else "prior_pose_initial",
         "status": "stage_a_completed",
         "dataset": args.dataset,

@@ -1,7 +1,7 @@
 # FeedForwardWithBA
 
 使用 Pi3X 前馈重建或已有相机初值，结合 SIFT、VGGSfM / LoMa 和 BAE，生成 COLMAP 稀疏重建。
-正式入口是 [run_merg3r_gluemap_pipeline.py](run_merg3r_gluemap_pipeline.py)，算法与执行参数统一在 [config.yaml](config.yaml)。
+正式入口是 [run.py](run.py)，算法与执行参数统一在 [config.yaml](config.yaml)。
 
 ## 运行方式
 
@@ -31,7 +31,7 @@ cd /kiri/FeedForwardWithBA
 set -o pipefail
 mkdir -p /kiri/tmp/ffba_789_lite_cleanup
 
-python -u run_merg3r_gluemap_pipeline.py \
+python -u run.py \
   --config config.yaml \
   --dataset /kiri/codex_use_data/789_room/image \
   --prior_transforms_json /kiri/codex_use_data/789_room/transforms.json \
@@ -45,7 +45,7 @@ python -u run_merg3r_gluemap_pipeline.py \
 纯图片标准模式：
 
 ```bash
-python -u run_merg3r_gluemap_pipeline.py \
+python -u run.py \
   --dataset /path/to/images \
   --output_dir /path/to/output \
   --input_order ordered \
@@ -88,7 +88,9 @@ bae:
 
 ### VGGSfM group
 
-center 始终采用 SIFT 支持引导的抽稀，group 保留两种选择：
+center 始终采用 SIFT 支持引导的抽稀。默认 `prior.vggsfm.max_center_gap: 3`，相邻 center 的调度位置差最多为 3，中间最多跳过 2 帧；SIFT 支持不足时提前选 center。有序输入按帧序、无序输入按 DINO 内部顺序计数。SIFT 支持充分时约每三帧选一个 center，此参数不影响 LoMa。
+
+group 保留两种选择：
 
 | `prior.vggsfm.group_strategy` | 有深度 | 无深度 |
 | --- | --- | --- |
@@ -146,7 +148,7 @@ ffba/
 VGGSfM 权重位置在 `prior.vggsfm.weights` 配置；GlueMap、BAE、Pi3X 的安装需求与整理前相同。
 
 ```bash
-python run_merg3r_gluemap_pipeline.py --help
+python run.py --help
 python -m pytest -q tests
 ```
 

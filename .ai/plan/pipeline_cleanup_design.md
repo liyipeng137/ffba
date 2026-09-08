@@ -4,12 +4,14 @@
 
 ## 约定
 
+- 正式入口统一为 `run.py`，替换原 `run_merg3r_gluemap_pipeline.py`。
 - CLI 只暴露配置文件、图片、输出、可选 transforms、ordered/unordered、standard/lite。
 - standard 固定 SIFT-first sparse-center VGGSfM；lite 固定 LoMa-B + sift-guided 3/5/5 + batch 2/4、workers 4/4、CUDA cache、内部 torch 线程 8。
 - 两种输入顺序都保留原有 ShortestPath 子集划分、Pi3X 和 weighted iterative 对齐算法。
 - Stage A 无论前馈或导入先验都提供 DINO 相似度。前馈复用现有 low images 的相似度；先验模式仍用临时 512 长边、batch 16 的 retrieval images。
 - ordered 使用输入时序；unordered 不添加 SIFT/LoMa temporal pairs，不使用 LoMa 序号间隔去冗余。
 - 无序 VGGSfM 内部调度使用确定性的 DINO 贪心路径：从相似度总和最大的图片开始，每步选择未访问的最高相似度邻居，平分按稳定图片索引。调度数组不改变 image IDs。
+- 默认 `max_center_gap=3`：相邻 center 的调度位置差最多为 3，中间最多跳过 2 帧，SIFT 支持不足时提前选 center。该参数仅影响 VGGSfM。
 - center 抽稀仍依据上一个 center 的有效 SIFT 边与最大调度间隔；owner 保存真实图片索引，三层 group 沿 selected centers 的调度顺序寻找有效 bridge。
 - group 由配置选择 `projected_overlap` 或 `sift_pose_dino`。请求前者而实际无深度时回退后者；其他错误不吞掉。保存 requested/effective/fallback reason。
 - 只有真实-track BAE；忽略两视图成轨、全来源 SelectTrack、原有过滤阈值、gauge 和 Huber 行为不变。
@@ -52,6 +54,7 @@ BAE 控制器直接调用现有 `bundle_adjustment_bae`，不经过支持 Ceres 
 
 - 本地与远程均通过语法/模块检查；`ruff check ffba` 通过。
 - 最终远程测试：**106 passed**（真实 torch 2.8.0、pycolmap、pygluemap）；只有既有 SWIG 类型弃用提示。
+- 以下 GPU 结果对应入口改名及 center gap 默认值从 2 改为 3 之前的版本；尚未对 gap=3 进行 GPU 质量回归。
 - 真实 RTX 4090 全流程 smoke 共 5 次，均成功，8 张输入全部注册。前四组使用默认数值配置，仅限制输入数量；最后一组额外设 subset_size=4 / overlap=2，实际形成 `[4,4,4]` 三个子集以覆盖跨子集对齐。
 
 | 流程 | 实际 group | 点数 | 观测数 | pipeline 耗时 |

@@ -32,7 +32,7 @@ prior:
     neighbors_per_center: 16
     group_strategy: projected_overlap
     group_batch_size: 2
-    max_center_gap: 2
+    max_center_gap: 3 # 调度位置差最多 3，中间最多跳过 2 帧；SIFT 支持不足时提前选 center。
     dino_candidates: 30
     overlap_samples: 2048
     overlap_reproj_threshold: 4.0

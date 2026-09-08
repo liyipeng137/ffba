@@ -1,4 +1,4 @@
-"""CLI for the formal FFBA pipeline. Algorithm settings live in config.yaml."""
+"""Entry point for the FFBA pipeline. Algorithm settings live in config.yaml."""
 
 from ffba.config import parse_args
 

@@ -153,7 +153,7 @@ def test_depth_fallback_is_explicit(requested, has_depth, effective):
 
 def test_help_does_not_require_torch():
     root = Path(__file__).resolve().parents[1]
-    code = "import sys,runpy; sys.modules['torch']=None; sys.argv=['pipeline','--help']; runpy.run_path('run_merg3r_gluemap_pipeline.py',run_name='__main__')"
+    code = "import sys,runpy; sys.modules['torch']=None; sys.argv=['pipeline','--help']; runpy.run_path('run.py',run_name='__main__')"
     result = subprocess.run(
         [sys.executable, "-c", code], cwd=root, capture_output=True, text=True
     )
