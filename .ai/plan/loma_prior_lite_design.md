@@ -1,5 +1,9 @@
 # SIFT + LoMa 轻量 Prior V1 设计
 
+2026-09-08 后端筛选更新：按用户要求忽略两视图 tracks，并让 SIFT/prior 共同进入
+SelectTrack；此前保留 SIFT、允许两视图的描述作为历史基线。当前规则及冻结输入质量
+对照见 [track 筛选实验](track_selection_ablation.md)。
+
 状态：全候选、3/5/5 与执行加速已完成 789 图 GPU 实测；固定输入的 GPU 数值一致性仍待验收
 更新时间：2026-09-08
 实验分支：`codex/loma-prior-lite`  

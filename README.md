@@ -544,21 +544,69 @@ insufficient/untried 先按 DINO 相似度，再按覆盖率和内点数排列�
 再使用现有数据库合并、三角化、SelectTrack、几何过滤和 BAE 流程。LoMa 坐标不 snap 到 SIFT。
 VGGSfM 的 group、center、query 与 `prior_match_topology` 参数不控制 LoMa。
 
-在已具备主流程及 LoMa 依赖的 GPU 环境中运行：
+2026-09-08 后端筛选修订（SIFT + LoMa/VGGSfM 共用）：三角化默认
+`ignore_two_view_tracks=True`；SelectTrack 对所有来源共同执行原有固定种子随机顺序、
+pair 支持数量筛选，不再无条件保留 SIFT-only tracks。来源仍按真实 feature ID 统计，
+不改变支持阈值、误差过滤顺序、BAE 设置或增加新的 CLI 参数。
+此开关不保证过滤后的所有 track 均至少有 3 个观测。冻结输入的测试与质量结论见
+[track 筛选对照](.ai/plan/track_selection_ablation.md)。
+
+#### 轻量模式 CLI（Ubuntu / RTX 4090）
+
+轻量模式约定为 **LoMa-B + batch + sift-guided 3/5/5 pairs + 忽略两视图成轨 +
+全来源共同 SelectTrack**。这里的“共同筛选”表示 SIFT 和 LoMa tracks 使用同一
+选择器，不是保留所有 tracks。两项后端行为已在代码中生效，无需额外开关；
+SelectTrack 支持阈值保持 512，LoMa 的 PyTorch CPU 内部线程固定为 8。
+这是一组显式 CLI 配置，目前没有单独的 `--lite` 参数；只设置
+`--prior_provider loma` 不会自动启用下面的 batch、workers 和 CUDA cache。
+
+以下命令使用云端 789_room 数据与已有 conda 环境。其他数据请修改 `--dataset`、
+`--prior_transforms_json` 和输出路径；`mkdir` 提前创建日志目录，`pipefail` 保留
+Python 失败时的退出状态。每次对照实验使用独立输出目录。
 
 ```bash
-python run_merg3r_gluemap_pipeline.py \
-  --dataset /path/to/images \
-  --output_dir /path/to/output_loma \
+source /opt/conda/bin/activate && conda activate gluemap-merg3r
+cd /kiri/FeedForwardWithBA
+set -o pipefail
+mkdir -p /kiri/tmp/ffba_789_loma_lite
+
+python -u run_merg3r_gluemap_pipeline.py \
+  --dataset /kiri/codex_use_data/789_room/image \
+  --prior_transforms_json /kiri/codex_use_data/789_room/transforms.json \
+  --output_dir /kiri/tmp/ffba_789_loma_lite \
   --prior_provider loma \
+  --loma_match_batch_size 2 \
+  --loma_extract_batch_size 4 \
+  --loma_preprocess_workers 4 \
+  --loma_geometry_workers 4 \
+  --loma_feature_cache cuda \
   --loma_pair_selection sift_guided \
+  --loma_dino_candidates 30 \
   --loma_sufficient_neighbors 3 \
   --loma_insufficient_neighbors 5 \
   --loma_untried_neighbors 5 \
+  --pair_k_pose 25 \
+  --pair_pose_rotation_threshold 30 \
+  --sift_temporal_window 2 \
+  --sift_schedule_min_pair_inliers 128 \
+  --sift_schedule_min_grid_coverage 0.20 \
+  --select_track_min_support 512 \
   --ba_backend bae \
+  --bae_max_num_iterations 20 \
   --bae_max_observations 0 \
-  --bae_optimize_intrinsics
+  --num_refinement_iterations 3 \
+  --bae_optimize_intrinsics \
+  --bae_robust_loss huber \
+  --bae_huber_delta 1.0 \
+  --final_bae_huber_delta 2.0 \
+  --filter_reproj_error_threshold 1.0 \
+  2>&1 | tee /kiri/tmp/ffba_789_loma_lite/run.log
 ```
+
+BAE 与重投影过滤参数沿用此前实验基线，不增加 observation cap 或新的 track 限额。
+已有性能与质量结果见下文及 [track 筛选对照](.ai/plan/track_selection_ablation.md)。
+这些历史运行使用匹配列顺序 bug 修复前的数据库；当前分支已修复该问题，修复后的
+完整轻量组合仍待端到端回归，不能把历史耗时或质量结论直接视为本命令的实测结果。
 
 LoMa V1 只支持 BAE，不启用 observation cap；传入正的 `bae_max_observations`
 会报错提示，避免沿用旧测试命令时无意裁剪。内参优化默认开启，可用
@@ -577,16 +625,9 @@ LoMa V1 只支持 BAE，不启用 observation cap；传入正的 `bae_max_observ
 详见 `logs/ffba_789_loma_355/`；两次运行的 SIFT 输入有差异，不能直接作为严格质量 A/B。
 详细设计见 [LoMa prior V1](.ai/plan/loma_prior_lite_design.md)。
 
-LoMa 执行加速已接入，默认参数 `1 / 1 / 0 / 1 / cpu` 保留逐图提取、逐对匹配、
-串行几何验证。在原有 LoMa 测试命令后添加以下参数可试跑组合配置：
-
-```bash
-  --loma_match_batch_size 8 \
-  --loma_extract_batch_size 2 \
-  --loma_preprocess_workers 4 \
-  --loma_geometry_workers 4 \
-  --loma_feature_cache cuda
-```
+LoMa 执行加速已接入，解析器默认参数仍为 matching batch / extract batch /
+preprocess workers / geometry workers / feature cache = `1 / 1 / 0 / 1 / cpu`。
+上面的轻量模式 CLI 显式设置为 `2 / 4 / 4 / 4 / cuda`。
 
 提取按 detector 输入尺寸分桶，matching 按两端特征形状分桶；尾批直接运行。
 预处理最多保留两个提取 batch，几何验证队列上限为

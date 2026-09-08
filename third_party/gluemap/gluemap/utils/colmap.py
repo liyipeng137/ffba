@@ -95,6 +95,16 @@ def extract_gt_intrinsics(
     return gt_intrinsics
 
 
+def _remap_matches_to_output_pair(matches, out_id1, out_id2, offset1, offset2):
+    """Apply each source image's feature offset before canonicalizing the pair."""
+    remapped = matches.copy()
+    remapped[:, 0] += offset1
+    remapped[:, 1] += offset2
+    if out_id1 > out_id2:
+        return (out_id2, out_id1), remapped[:, ::-1].copy()
+    return (out_id1, out_id2), remapped
+
+
 def merge_colmap_databases(
     db_path_primary: str,
     db_path_secondary: str,
@@ -273,15 +283,9 @@ def merge_colmap_databases(
         out_id2 = name_to_output_image_id[name2]
         offset1 = primary_offsets.get(name1, 0)
         offset2 = primary_offsets.get(name2, 0)
-        key = (min(out_id1, out_id2), max(out_id1, out_id2))
-        remapped = matches.copy()
-        if offset1 > 0 or offset2 > 0:
-            if out_id1 <= out_id2:
-                remapped[:, 0] += offset1
-                remapped[:, 1] += offset2
-            else:
-                remapped[:, 0] += offset2
-                remapped[:, 1] += offset1
+        key, remapped = _remap_matches_to_output_pair(
+            matches, out_id1, out_id2, offset1, offset2
+        )
         if key not in all_matches:
             all_matches[key] = []
         all_matches[key].append(remapped)
@@ -305,15 +309,9 @@ def merge_colmap_databases(
         out_id2 = name_to_output_image_id[name2]
         offset1 = secondary_offsets.get(name1, 0)
         offset2 = secondary_offsets.get(name2, 0)
-        key = (min(out_id1, out_id2), max(out_id1, out_id2))
-        remapped = matches.copy()
-        if offset1 > 0 or offset2 > 0:
-            if out_id1 <= out_id2:
-                remapped[:, 0] += offset1
-                remapped[:, 1] += offset2
-            else:
-                remapped[:, 0] += offset2
-                remapped[:, 1] += offset1
+        key, remapped = _remap_matches_to_output_pair(
+            matches, out_id1, out_id2, offset1, offset2
+        )
         if key not in all_matches:
             all_matches[key] = []
         all_matches[key].append(remapped)
@@ -345,15 +343,9 @@ def merge_colmap_databases(
                 out_id2 = name_to_output_image_id[name2]
                 offset1 = primary_offsets.get(name1, 0)
                 offset2 = primary_offsets.get(name2, 0)
-                key = (min(out_id1, out_id2), max(out_id1, out_id2))
-                remapped = geom.inlier_matches.copy()
-                if offset1 > 0 or offset2 > 0:
-                    if out_id1 <= out_id2:
-                        remapped[:, 0] += offset1
-                        remapped[:, 1] += offset2
-                    else:
-                        remapped[:, 0] += offset2
-                        remapped[:, 1] += offset1
+                key, remapped = _remap_matches_to_output_pair(
+                    geom.inlier_matches, out_id1, out_id2, offset1, offset2
+                )
                 if key not in all_geometries:
                     all_geometries[key] = ([], geom.config)
                 all_geometries[key][0].append(remapped)
@@ -378,15 +370,9 @@ def merge_colmap_databases(
                 out_id2 = name_to_output_image_id[name2]
                 offset1 = secondary_offsets.get(name1, 0)
                 offset2 = secondary_offsets.get(name2, 0)
-                key = (min(out_id1, out_id2), max(out_id1, out_id2))
-                remapped = geom.inlier_matches.copy()
-                if offset1 > 0 or offset2 > 0:
-                    if out_id1 <= out_id2:
-                        remapped[:, 0] += offset1
-                        remapped[:, 1] += offset2
-                    else:
-                        remapped[:, 0] += offset2
-                        remapped[:, 1] += offset1
+                key, remapped = _remap_matches_to_output_pair(
+                    geom.inlier_matches, out_id1, out_id2, offset1, offset2
+                )
                 if key not in all_geometries:
                     all_geometries[key] = ([], geom.config)
                 all_geometries[key][0].append(remapped)

@@ -3443,14 +3443,17 @@ def run_select_tracks(
 
     s_keypoint_count = build_s_keypoint_count(reconstruction, features)
     before = classify_tracks_by_s_keypoints(reconstruction, s_keypoint_count)
+    # Zero protected feature counts put every source through the existing
+    # seeded-shuffle/pair-support selector. Keep the real counts for auditing.
     pair_count = select_tracks_from_merged(
         reconstruction=reconstruction,
-        sift_count=s_keypoint_count,
+        sift_count={},
         min_num_support_abs=min_num_support_abs,
     )
     after = classify_tracks_by_s_keypoints(reconstruction, s_keypoint_count)
     stats = {
         "enabled": True,
+        "selection_scope": "all_sources",
         "min_num_support_abs": int(min_num_support_abs),
         "before": before,
         "after": after,
@@ -3841,7 +3844,7 @@ def triangulate_from_seed_reconstruction(
     options.triangulation.min_angle = args.tri_min_angle
     options.triangulation.merge_max_reproj_error = 15.0
     options.triangulation.complete_max_reproj_error = 15.0
-    options.triangulation.ignore_two_view_tracks = False
+    options.triangulation.ignore_two_view_tracks = True
     options.triangulation.create_max_angle_error = args.tri_create_max_angle_error
     options.ba_global_max_refinements = 0
     if output_dir.exists():
@@ -4092,6 +4095,7 @@ def run_merg3r_augmented_refinement_loop(
             args,
         )
         iter_stats["triangulation"] = {
+            "ignore_two_view_tracks": True,
             "seconds": time.time() - t0,
             **summarize_reconstruction(reconstruction),
         }

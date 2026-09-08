@@ -17,6 +17,41 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from utils import gluemap_refine_core as ref
 
 
+def test_joint_selection_is_invariant_to_sift_labels():
+    """Real C++ selection must prune redundant SIFT and preserve source audits."""
+    pytest.importorskip("pygluemap")
+    ref._ensure_gluemap_imports()
+
+    class Reconstruction:
+        def __init__(self, swap_sources):
+            self.images = {i: None for i in (1, 2, 3)}
+            self.points3D = {
+                point_id: SimpleNamespace(track=SimpleNamespace(elements=[
+                    SimpleNamespace(image_id=i, point2D_idx=(point_id + 2 * swap_sources) % 4)
+                    for i in self.images
+                ]))
+                for point_id in range(4)
+            }
+
+        def delete_point3D(self, point_id):
+            del self.points3D[point_id]
+
+    features = [{"keypoints": np.zeros((2, 2))} for _ in range(3)]
+    retained = []
+    for swap_sources in (False, True):
+        reconstruction = Reconstruction(swap_sources)
+        stats, pairs = ref.run_select_tracks(
+            reconstruction, features, min_num_support_abs=0, return_pair_count=True,
+        )
+        assert stats["before"] == {"total": 4, "s": 2, "non_s": 2, "mixed": 0}
+        assert stats["after"]["total"] == 1
+        assert stats["after"]["s"] + stats["after"]["non_s"] == 1
+        assert stats["removed_points3D"] == 3
+        assert sorted(pairs.values()) == [1, 1, 1]
+        retained.append(set(reconstruction.points3D))
+    assert retained[0] == retained[1]
+
+
 def test_sift_candidate_pairs_keep_pose_and_add_temporal_recall():
     combined, stats = ref.build_sift_candidate_pairs(
         np.array([[0, 1], [2, 1]], dtype=np.int64),
