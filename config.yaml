@@ -1,0 +1,78 @@
+# Formal defaults. Partial experiment YAML files override these values.
+pipeline:
+  mode: standard
+  input_order: ordered
+input:
+  num_images: -1
+  subsample: 1
+  stage1_downscale_n: 4
+  stage1_multiple: 14
+  stage2_scale_factor: 0
+retrieval:
+  long_side: 512
+  batch_size: 16
+  alpha: 0.7
+initialization:
+  feedforward:
+    intrinsics_method: moge
+    subset_size: 120
+    overlap: 5
+    splitting_type: interleave
+sift:
+  pose_neighbors: 25
+  pose_rotation_threshold: 30.0
+  temporal_window: 2
+  grid_size: 8
+  min_inliers_per_cell: 2
+  min_pair_inliers: 128
+  min_grid_coverage: 0.2
+prior:
+  vggsfm:
+    weights: /root/.cache/torch/hub/checkpoints/vggsfm_v2_tracker.pt
+    neighbors_per_center: 16
+    group_strategy: projected_overlap
+    group_batch_size: 2
+    max_center_gap: 3 # 调度位置差最多 3，中间最多跳过 2 帧；SIFT 支持不足时提前选 center。
+    dino_candidates: 30
+    overlap_samples: 2048
+    overlap_reproj_threshold: 4.0
+    overlap_conf_quantile: 0.2
+    query_points: 1024
+    aliked_detection_threshold: 0.005
+    vis_threshold: 0.5
+    score_threshold: 0.0
+    fine_tracking: false
+    snap_threshold: 1.0
+    keypoint_merge_threshold: 0.001
+  loma:
+    dino_candidates: 30
+    sufficient_neighbors: 3
+    insufficient_neighbors: 5
+    untried_neighbors: 5
+    match_batch_size: 2
+    extract_batch_size: 4
+    preprocess_workers: 4
+    geometry_workers: 4
+    feature_cache: cuda
+refinement:
+  min_frame_observations: 10
+  iterations: 3
+  post_ba_filter_iterations: 3
+  post_ba_normalized_reproj_threshold: 0.01
+  tri_min_angle: 1.0
+  tri_create_max_angle_error: 0.5
+  select_track_min_support: 512
+  filter_reproj_error_type: angular
+  filter_reproj_error_threshold: 1.0
+bae:
+  max_iterations: 20
+  max_observations: 0
+  optimize_intrinsics: true
+  fix_gauge: two_cams
+  robust_loss: huber
+  huber_delta: 1.0
+  final_huber_delta: 2.0
+runtime:
+  image_workers: 16
+  debug_print: true
+  device: cuda
